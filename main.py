@@ -1,7 +1,9 @@
-# This is a sample Python script.
-
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+# VADER - Voice and Data Enhanced Radio
+#
+# This program allows users to connect to an amateur radio transceiver, select a frequency, and transmit or receive signals in voice and data modes. It uses the hamlib library to interface with the radio transceiver hardware.
+#
+# Author: Tim - tritiumosu@gmail.com
+# Date: 2/15/26
 
 # Define variables for controlling an amateur radio transceiver
 frequency = 145800000  # Hz
