@@ -127,6 +127,7 @@ class RadioGUI:
             f = self.radio.get_frequency()
             self.freq_disp.config(text=f"{f:09.4f}")
             self.meter_var.set(self.radio.get_s_meter())
+            print(f"S Meter is {self.meter_var.get()}")
         self.root.after(500, self.update_loop)
 
     def goto_band(self, name):

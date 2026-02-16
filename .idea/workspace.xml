@@ -4,8 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="5ab9b496-ec2a-4621-a890-000402075faa" name="Changes" comment="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python.">
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+    <list default="true" id="5ab9b496-ec2a-4621-a890-000402075faa" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
@@ -20,6 +19,21 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "Tritiumosu"
+  }
+}]]></component>
+  <component name="GithubDefaultAccount">
+    <option name="defaultAccountId" value="fc8827bf-b7b6-4a60-a47d-474f82aff941" />
+  </component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "https://github.com/Tritiumosu/VaDER",
+    "accountId": "fc8827bf-b7b6-4a60-a47d-474f82aff941"
+  }
+}]]></component>
   <component name="McpProjectServerCommands">
     <commands />
     <urls />
@@ -50,7 +64,7 @@
     "node.js.selected.package.eslint": "(autodetect)",
     "node.js.selected.package.tslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "preferences.pluginManager",
+    "settings.editor.selected.configurable": "org.jetbrains.plugins.github.ui.GithubSettingsConfigurable",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -71,7 +85,7 @@
       <updated>1771126170682</updated>
       <workItem from="1771126171723" duration="9806000" />
       <workItem from="1771164331261" duration="1775000" />
-      <workItem from="1771177261604" duration="5590000" />
+      <workItem from="1771177261604" duration="8828000" />
     </task>
     <task id="LOCAL-00001" summary="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python.">
       <option name="closed" value="true" />
@@ -89,7 +103,23 @@
       <option name="project" value="LOCAL" />
       <updated>1771135072899</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="Reworked to be much less stupid. Will now automatically connect to my radio and reads values for frequency, S-meter, etc. to populate a basic GUI. PTT button works correctly, scanning feature implemented to cycle through a given band and look for hot frequencies. Still exceedingly rough, no data mode features included, and lots of work to do.">
+      <option name="closed" value="true" />
+      <created>1771194912435</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1771194912435</updated>
+    </task>
+    <task id="LOCAL-00004" summary="Draft from first test run">
+      <option name="closed" value="true" />
+      <created>1771195091077</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1771195091077</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -98,9 +128,11 @@
   <component name="VcsManagerConfiguration">
     <option name="CLEAR_INITIAL_COMMIT_MESSAGE" value="true" />
     <MESSAGE value="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python." />
-    <option name="LAST_COMMIT_MESSAGE" value="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python." />
+    <MESSAGE value="Reworked to be much less stupid. Will now automatically connect to my radio and reads values for frequency, S-meter, etc. to populate a basic GUI. PTT button works correctly, scanning feature implemented to cycle through a given band and look for hot frequencies. Still exceedingly rough, no data mode features included, and lots of work to do." />
+    <MESSAGE value="Draft from first test run" />
+    <option name="LAST_COMMIT_MESSAGE" value="Draft from first test run" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/VADER$main.coverage" NAME="main Coverage Results" MODIFIED="1771192340484" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VADER$main.coverage" NAME="main Coverage Results" MODIFIED="1771205677775" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
