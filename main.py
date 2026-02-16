@@ -18,7 +18,9 @@ BANDS = {
 # --- Radio Control Class ---
 class Yaesu991AControl:
     def __init__(self, port='/dev/ttyUSB0', baud=38400):
-        self.conn = serial.Serial(port=port, baudrate=baud, timeout=1, stopbits=serial.STOPBITS_ONE)
+        self.port = port
+        self.baud = baud
+        self.conn = None  # don't auto-connect on launch
 
         # CTCSS Tone Mapping (Index 001-050)
         self.tone_map = {
@@ -28,8 +30,40 @@ class Yaesu991AControl:
             # (Add additional tones from the manual as needed)
         }
 
+    def is_connected(self):
+        return self.conn is not None and getattr(self.conn, "is_open", False)
+
+    def connect(self):
+        """Open serial connection. Returns (True, None) on success, (False, error_message) on failure."""
+        if self.is_connected():
+            return True, None
+        try:
+            self.conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                timeout=1,
+                stopbits=serial.STOPBITS_ONE
+            )
+            return True, None
+        except Exception as e:
+            self.conn = None
+            return False, str(e)
+
+    def disconnect(self):
+        """Close serial connection. Safe to call even if already disconnected."""
+        try:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                finally:
+                    self.conn = None
+        except Exception:
+            self.conn = None
+
     def _execute(self, cmd, read=False):
         """Standard Yaesu ASCII CAT execution: [CMD];"""
+        if not self.is_connected():
+            return None
         try:
             self.conn.write(f"{cmd};".encode('ascii'))
             if read:
@@ -71,12 +105,23 @@ class RadioGUI:
         self.root.title("FT-991A Command Center")
         self.root.geometry("500x750")
         self.setup_ui()
+        self.refresh_connection_ui()
         self.update_loop()
 
     def setup_ui(self):
         # Frequency Display
-        self.freq_disp = tk.Label(self.root, text="000.000.000", font=("Consolas", 36), fg="lime", bg="black")
+        self.freq_disp = tk.Label(self.root, text="DISCONNECTED", font=("Consolas", 36), fg="lime", bg="black")
         self.freq_disp.pack(pady=15, fill=tk.X)
+
+        # Connection controls
+        conn_frame = tk.LabelFrame(self.root, text="Connection")
+        conn_frame.pack(padx=20, pady=10, fill=tk.X)
+
+        self.conn_status = tk.Label(conn_frame, text="Status: DISCONNECTED", anchor="w")
+        self.conn_status.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
+
+        self.conn_btn = tk.Button(conn_frame, text="CONNECT", bg="lightgreen", command=self.toggle_connection)
+        self.conn_btn.pack(side=tk.RIGHT, padx=5, pady=5)
 
         # S-Meter Progress Bar
         tk.Label(self.root, text="S-METER").pack()
@@ -88,8 +133,11 @@ class RadioGUI:
         band_frame = tk.LabelFrame(self.root, text="Quick Band Select")
         band_frame.pack(padx=20, pady=10, fill=tk.X)
         for b in BANDS:
-            tk.Button(band_frame, text=b, command=lambda name=b: self.goto_band(name)).pack(side=tk.LEFT, expand=True,
-                                                                                            fill=tk.X, padx=2)
+            tk.Button(
+                band_frame,
+                text=b,
+                command=lambda name=b: self.goto_band(name)
+            ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         # Scanner
         scan_frame = tk.LabelFrame(self.root, text="Scanner Controls")
@@ -121,18 +169,52 @@ class RadioGUI:
         self.log_box = tk.Text(log_frame, height=10, font=("Consolas", 9))
         self.log_box.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
 
+    def refresh_connection_ui(self):
+        connected = self.radio.is_connected()
+        if connected:
+            self.conn_status.config(text=f"Status: CONNECTED ({self.radio.port} @ {self.radio.baud})")
+            self.conn_btn.config(text="DISCONNECT", bg="orange")
+        else:
+            self.conn_status.config(text=f"Status: DISCONNECTED ({self.radio.port} @ {self.radio.baud})")
+            self.conn_btn.config(text="CONNECT", bg="lightgreen")
+            self.meter_var.set(0)
+
+    def toggle_connection(self):
+        if self.radio.is_connected():
+            # Stop scanning before disconnecting to avoid thread using a closed port
+            self.scanning = False
+            self.scan_btn.config(text="START SCAN", bg="lightgray")
+
+            self.radio.disconnect()
+            self.freq_disp.config(text="DISCONNECTED")
+            self.meter_var.set(0)
+            self.refresh_connection_ui()
+            return
+
+        ok, err = self.radio.connect()
+        if not ok:
+            # Show failure in the UI (and keep "disconnected" state)
+            self.conn_status.config(text=f"Status: ERROR ({err})")
+            self.freq_disp.config(text="DISCONNECTED")
+            self.meter_var.set(0)
+            self.refresh_connection_ui()
+            return
+
+        # Connected successfully
+        self.refresh_connection_ui()
+
     def update_loop(self):
-        """Updates frequency and meter if not busy scanning."""
-        if not self.scanning:
+        """Updates frequency and meter if connected and not busy scanning."""
+        if self.radio.is_connected() and not self.scanning:
             f = self.radio.get_frequency()
             self.freq_disp.config(text=f"{f:09.4f}")
             self.meter_var.set(self.radio.get_s_meter())
-            print(f"S Meter is {self.meter_var.get()}")
-        self.root.after(500, self.update_loop)
+        elif not self.radio.is_connected():
+            # Keep a clear disconnected display
+            self.freq_disp.config(text="DISCONNECTED")
+            self.meter_var.set(0)
 
-    def goto_band(self, name):
-        self.radio.set_frequency(BANDS[name]['start'])
-        self.radio.set_mode(BANDS[name]['mode'])
+        self.root.after(500, self.update_loop)
 
     def log_to_file(self, freq, strength, notes):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,6 +229,13 @@ class RadioGUI:
 
     def toggle_scan(self):
         if not self.scanning:
+            if not self.radio.is_connected():
+                # Refuse to scan when disconnected
+                self.conn_status.config(text="Status: DISCONNECTED (click CONNECT to scan)")
+                self.scan_btn.config(text="START SCAN", bg="lightgray")
+                self.scanning = False
+                return
+
             self.scanning = True
             self.scan_btn.config(text="STOP SCAN", bg="orange")
             threading.Thread(target=self.scan_thread, daemon=True).start()
@@ -174,4 +263,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     gui = RadioGUI(root, radio)
     root.mainloop()
-
