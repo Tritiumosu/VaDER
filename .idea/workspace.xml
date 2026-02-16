@@ -7,6 +7,7 @@
     <list default="true" id="5ab9b496-ec2a-4621-a890-000402075faa" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/radio_log.csv" beforeDir="false" afterPath="$PROJECT_DIR$/radio_log.csv" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -14,26 +15,26 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="7" />
+    <option name="cachedIndexableFilesCount" value="8" />
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "Tritiumosu"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;Tritiumosu&quot;
   }
-}]]></component>
+}</component>
   <component name="GithubDefaultAccount">
     <option name="defaultAccountId" value="fc8827bf-b7b6-4a60-a47d-474f82aff941" />
   </component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/Tritiumosu/VaDER",
-    "accountId": "fc8827bf-b7b6-4a60-a47d-474f82aff941"
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/Tritiumosu/VaDER&quot;,
+    &quot;accountId&quot;: &quot;fc8827bf-b7b6-4a60-a47d-474f82aff941&quot;
   }
-}]]></component>
+}</component>
   <component name="McpProjectServerCommands">
     <commands />
     <urls />
@@ -53,6 +54,7 @@
     "Python.main.executor": "Run",
     "RunOnceActivity.MCP Project settings loaded": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
@@ -85,7 +87,8 @@
       <updated>1771126170682</updated>
       <workItem from="1771126171723" duration="9806000" />
       <workItem from="1771164331261" duration="1775000" />
-      <workItem from="1771177261604" duration="8828000" />
+      <workItem from="1771177261604" duration="15879000" />
+      <workItem from="1771247990270" duration="1917000" />
     </task>
     <task id="LOCAL-00001" summary="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python.">
       <option name="closed" value="true" />
@@ -119,7 +122,15 @@
       <option name="project" value="LOCAL" />
       <updated>1771195091077</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="Add output of the S-Meter value during loop; trying to calibrate the S-Meter display, seems artificially high in the GUI.">
+      <option name="closed" value="true" />
+      <created>1771205856804</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1771205856804</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -130,9 +141,10 @@
     <MESSAGE value="Initial commit, first version of roughest of drafts of a shell of the hint of an idea. Slow going due to simultaneously watching Star Trek:TNG and learning how to code with Python." />
     <MESSAGE value="Reworked to be much less stupid. Will now automatically connect to my radio and reads values for frequency, S-meter, etc. to populate a basic GUI. PTT button works correctly, scanning feature implemented to cycle through a given band and look for hot frequencies. Still exceedingly rough, no data mode features included, and lots of work to do." />
     <MESSAGE value="Draft from first test run" />
-    <option name="LAST_COMMIT_MESSAGE" value="Draft from first test run" />
+    <MESSAGE value="Add output of the S-Meter value during loop; trying to calibrate the S-Meter display, seems artificially high in the GUI." />
+    <option name="LAST_COMMIT_MESSAGE" value="Add output of the S-Meter value during loop; trying to calibrate the S-Meter display, seems artificially high in the GUI." />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/VADER$main.coverage" NAME="main Coverage Results" MODIFIED="1771205677775" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VADER$main.coverage" NAME="main Coverage Results" MODIFIED="1771250132135" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
