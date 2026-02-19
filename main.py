@@ -85,9 +85,88 @@ class Yaesu991AControl:
         if mode_str in modes:
             self._execute(f"MD0{modes[mode_str]}")
 
-    def get_s_meter(self):
-        resp = self._execute("RM1", read=True)
+    def get_mode(self):
+        """
+        Read current mode using the Yaesu CAT 'MD' command.
+
+        Common FT-991A response formats seen in the wild include:
+          - Query:  MD0;   Reply: MD0x;   (x is the mode code)
+          - Query:  MD;    Reply: MD0x;   (some firmwares accept MD without the 0)
+
+        Returns currently active mode or None if unknown/unavailable.
+        """
+        code_to_mode = {'1': 'LSB', '2': 'USB', '3': 'CW-U', '4': 'FM', '5': 'AM', '6': 'RTTY-L', '7': 'CW-L', '8': 'DATA-L', '9': 'RTTY-U', 'A': 'DATA-FM', 'C': 'DATA-U','E': 'C4FM'}
+
+        resp = self._execute("MD0", read=True)
+        if not resp:
+            resp = self._execute("MD", read=True)
+        if not resp:
+            return None
+
+        # Expected something like "MD02" or "MD0E"
+        if resp.startswith("MD") and len(resp) >= 4:
+            code = resp[-1].upper()
+            return code_to_mode.get(code)
+
+        return None
+    def get_swr_meter(self):
+        resp = self._execute("RM6", read=True)
         return int(resp[3:6]) if resp and len(resp) >= 6 else 0
+
+    def get_s_meter(self):
+        """
+        Read S-meter using the Yaesu CAT 'SM' command
+        Typical FT-991A behavior:
+          - Query:  SM0;
+          - Reply:  SM0xxx;   where xxx is 000-255
+        """
+        resp = self._execute("SM0", read=True)
+        if not resp:
+            return 0
+
+        # Common case: "SM0" + 3 digits
+        if resp.startswith("SM") and len(resp) >= 6:
+            digits = resp[-3:]
+            if digits.isdigit():
+                return int(digits)
+
+        return 0
+
+    def get_rf_power(self):
+        """
+        Read current RF power level using the Yaesu CAT 'PC' command.
+
+        Typical behavior:
+          - Query:  PC;
+          - Reply:  PCxxx;   where xxx is 005-100 (percent / watts setting depending on rig)
+        """
+        resp = self._execute("PC", read=True)
+        if not resp:
+            return 0
+
+        # Expected: "PC" + 3 digits (e.g., "PC050")
+        if resp.startswith("PC") and len(resp) >= 5:
+            digits = resp[-3:]
+            if digits.isdigit():
+                return int(digits)
+
+        return 0
+
+    def set_rf_power(self, level):
+        """
+        Set RF power level using the Yaesu CAT 'PC' command.
+
+        `level` is clamped to the radio's supported range: 5..100
+        and sent as a 3-digit value (005..100), e.g. "PC050;".
+        """
+        try:
+            level_int = int(level)
+        except (TypeError, ValueError):
+            return False
+
+        level_int = max(5, min(100, level_int))
+        self._execute(f"PC{level_int:03d}")
+        return True
 
     def ptt_on(self):
         self._execute("TX1")
@@ -128,6 +207,58 @@ class RadioGUI:
         self.meter_var = tk.IntVar()
         self.s_meter = ttk.Progressbar(self.root, maximum=255, variable=self.meter_var)
         self.s_meter.pack(padx=30, pady=5, fill=tk.X)
+
+        # RF Power Control
+        pwr_frame = tk.LabelFrame(self.root, text="RF Power (PC)")
+        pwr_frame.pack(padx=20, pady=10, fill=tk.X)
+
+        tk.Label(pwr_frame, text="Level (5-100):").pack(side=tk.LEFT, padx=5)
+
+        self.rf_power_var = tk.IntVar(value=0)
+        self.rf_power_spin = tk.Spinbox(
+            pwr_frame,
+            from_=5,
+            to=100,
+            width=5,
+            textvariable=self.rf_power_var
+        )
+        self.rf_power_spin.pack(side=tk.LEFT, padx=5)
+        # Press either Enter key in the spinbox to apply the RF power value
+        self.rf_power_spin.bind("<Return>", lambda e: self.apply_rf_power())
+        self.rf_power_spin.bind("<KP_Enter>", lambda e: self.apply_rf_power())
+        # Or just use the "Apply" button like a caveman
+        self.rf_power_apply_btn = tk.Button(pwr_frame, text="APPLY", command=self.apply_rf_power)
+        self.rf_power_apply_btn.pack(side=tk.LEFT, padx=5)
+
+        self.rf_power_status = tk.Label(pwr_frame, text="", anchor="w")
+        self.rf_power_status.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+
+        # Mode Control (MD)
+        mode_frame = tk.LabelFrame(self.root, text="Mode (MD)")
+        mode_frame.pack(padx=20, pady=10, fill=tk.X)
+
+        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=5)
+
+        self.mode_var = tk.StringVar(value="USB")
+        self.mode_combo = ttk.Combobox(
+            mode_frame,
+            textvariable=self.mode_var,
+            values=("LSB", "USB", "CW", "FM", "AM", "C4FM"),
+            state="readonly",
+            width=8
+        )
+        self.mode_combo.pack(side=tk.LEFT, padx=5)
+
+        self.mode_apply_btn = tk.Button(mode_frame, text="APPLY", command=self.apply_mode)
+        self.mode_apply_btn.pack(side=tk.LEFT, padx=5)
+
+        self.mode_status = tk.Label(mode_frame, text="", anchor="w")
+        self.mode_status.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+
+        # Apply on Enter as well
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_mode())
+        self.mode_combo.bind("<Return>", lambda e: self.apply_mode())
+        self.mode_combo.bind("<KP_Enter>", lambda e: self.apply_mode())
 
         # Band Selection
         band_frame = tk.LabelFrame(self.root, text="Quick Band Select")
@@ -174,10 +305,21 @@ class RadioGUI:
         if connected:
             self.conn_status.config(text=f"Status: CONNECTED ({self.radio.port} @ {self.radio.baud})")
             self.conn_btn.config(text="DISCONNECT", bg="orange")
+            self.rf_power_apply_btn.config(state=tk.NORMAL)
+            self.rf_power_spin.config(state="normal")
+            self.mode_apply_btn.config(state=tk.NORMAL)
+            self.mode_combo.config(state="readonly")
         else:
             self.conn_status.config(text=f"Status: DISCONNECTED ({self.radio.port} @ {self.radio.baud})")
             self.conn_btn.config(text="CONNECT", bg="lightgreen")
             self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
+            self.rf_power_apply_btn.config(state=tk.DISABLED)
+            self.rf_power_spin.config(state="disabled")
+            self.mode_status.config(text="")
+            self.mode_apply_btn.config(state=tk.DISABLED)
+            self.mode_combo.config(state="disabled")
 
     def toggle_connection(self):
         if self.radio.is_connected():
@@ -188,6 +330,8 @@ class RadioGUI:
             self.radio.disconnect()
             self.freq_disp.config(text="DISCONNECTED")
             self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
             self.refresh_connection_ui()
             return
 
@@ -197,11 +341,56 @@ class RadioGUI:
             self.conn_status.config(text=f"Status: ERROR ({err})")
             self.freq_disp.config(text="DISCONNECTED")
             self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
             self.refresh_connection_ui()
             return
 
         # Connected successfully
         self.refresh_connection_ui()
+        p = self.radio.get_rf_power()
+        self.rf_power_var.set(p)
+        self.rf_power_status.config(text=f"READ {p:03d}")
+        m = self.radio.get_mode()
+        if m:
+            self.mode_var.set(m)
+            self.mode_status.config(text=f"READ {m}")
+
+    def apply_rf_power(self):
+        """Apply RF power from the GUI control via PC command."""
+        if not self.radio.is_connected():
+            self.rf_power_status.config(text="DISCONNECTED")
+            return
+
+        try:
+            desired = int(self.rf_power_var.get())
+        except (TypeError, ValueError):
+            self.rf_power_status.config(text="INVALID")
+            return
+
+        ok = self.radio.set_rf_power(desired)
+        if not ok:
+            self.rf_power_status.config(text="INVALID")
+            return
+
+        # Read back to show the clamped/actual value
+        actual = self.radio.get_rf_power()
+        self.rf_power_var.set(actual)
+        self.rf_power_status.config(text=f"SET {actual:03d}")
+
+    def apply_mode(self):
+        """Apply selected mode via CAT using set_mode()."""
+        if not self.radio.is_connected():
+            self.mode_status.config(text="DISCONNECTED")
+            return
+
+        mode = (self.mode_var.get() or "").strip().upper()
+        if mode not in {"LSB", "USB", "CW", "FM", "AM", "C4FM"}:
+            self.mode_status.config(text="INVALID")
+            return
+
+        self.radio.set_mode(mode)
+        self.mode_status.config(text=f"SET {mode}")
 
     def update_loop(self):
         """Updates frequency and meter if connected and not busy scanning."""
@@ -209,10 +398,30 @@ class RadioGUI:
             f = self.radio.get_frequency()
             self.freq_disp.config(text=f"{f:09.4f}")
             self.meter_var.set(self.radio.get_s_meter())
+
+            # Keep RF power display in sync, but don't fight the user while editing/applying
+            try:
+                if str(self.root.focus_get()) != str(self.rf_power_spin):
+                    self.rf_power_var.set(self.radio.get_rf_power())
+            except Exception:
+                pass
+
+            # Keep Mode display in sync, but don't fight the user while the combobox has focus
+            try:
+                if str(self.root.focus_get()) != str(self.mode_combo):
+                    m = self.radio.get_mode()
+                    if m:
+                        self.mode_var.set(m)
+            except Exception:
+                pass
+
         elif not self.radio.is_connected():
             # Keep a clear disconnected display
             self.freq_disp.config(text="DISCONNECTED")
             self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
+            self.mode_status.config(text="")
 
         self.root.after(500, self.update_loop)
 
