@@ -1,5 +1,6 @@
 import threading
 import serial
+from decimal import Decimal, ROUND_HALF_UP
 
 
 class Yaesu991AControl:
@@ -69,8 +70,13 @@ class Yaesu991AControl:
         return None
 
     def set_frequency(self, mhz):
-        hz = int(float(mhz) * 1_000_000)
+        # Avoid float truncation errors (e.g. 13.9993 instead of 14.0000).
+        hz = int(
+            (Decimal(str(mhz)) * Decimal("1000000"))
+            .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
         self._execute(f"FA{hz:09d}")
+        print("mhz=", mhz, "hz_float=", float(mhz) * 1_000_000) # Temporary code to confirm frequency output via CAT
 
     def get_frequency(self):
         resp = self._execute("FA", read=True)
@@ -80,7 +86,7 @@ class Yaesu991AControl:
         digits = resp[2:]
         if not digits.isdigit():
             return 0.0
-        return float(digits) / 1_000_000
+        return float(Decimal(digits) / Decimal("1000000"))
 
     def set_mode(self, mode_str):
         modes = {"LSB": "1", "USB": "2", "CW": "3", "FM": "4", "AM": "5", "C4FM": "E"}
