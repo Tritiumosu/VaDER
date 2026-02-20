@@ -1,11 +1,12 @@
 #! /usr/bin/python3
-import serial
 import time
 import csv
 import threading
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
+
+from ft991a_cat import Yaesu991AControl
 
 # --- Constants & Band Plans ---
 BANDS = {
@@ -14,165 +15,8 @@ BANDS = {
     '10m': {'start': 28.3, 'end': 29.7, 'step': 0.005, 'mode': 'USB'},
 }
 
-
 # --- Radio Control Class ---
-class Yaesu991AControl:
-    def __init__(self, port='/dev/ttyUSB0', baud=38400):
-        self.port = port
-        self.baud = baud
-        self.conn = None  # don't auto-connect on launch
-
-        # CTCSS Tone Mapping (Index 001-050)
-        self.tone_map = {
-            67.0: "001", 69.3: "002", 71.9: "003", 74.4: "004", 77.0: "005",
-            79.7: "006", 82.5: "007", 85.4: "008", 88.5: "009", 91.5: "010",
-            100.0: "013", 103.5: "014", 123.0: "019", 141.3: "023", 151.4: "025"
-            # (Add additional tones from the manual as needed)
-        }
-
-    def is_connected(self):
-        return self.conn is not None and getattr(self.conn, "is_open", False)
-
-    def connect(self):
-        """Open serial connection. Returns (True, None) on success, (False, error_message) on failure."""
-        if self.is_connected():
-            return True, None
-        try:
-            self.conn = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                timeout=1,
-                stopbits=serial.STOPBITS_ONE
-            )
-            return True, None
-        except Exception as e:
-            self.conn = None
-            return False, str(e)
-
-    def disconnect(self):
-        """Close serial connection. Safe to call even if already disconnected."""
-        try:
-            if self.conn is not None:
-                try:
-                    self.conn.close()
-                finally:
-                    self.conn = None
-        except Exception:
-            self.conn = None
-
-    def _execute(self, cmd, read=False):
-        """Standard Yaesu ASCII CAT execution: [CMD];"""
-        if not self.is_connected():
-            return None
-        try:
-            self.conn.write(f"{cmd};".encode('ascii'))
-            if read:
-                return self.conn.read_until(b';').decode().strip().replace(';', '')
-        except Exception as e:
-            print(f"Serial Error: {e}")
-        return None
-
-    def set_frequency(self, mhz):
-        hz = int(mhz * 1_000_000)
-        self._execute(f"FA{hz:09d}")
-
-    def get_frequency(self):
-        resp = self._execute("FA", read=True)
-        return float(resp[2:]) / 1_000_000 if resp and len(resp) > 2 else 0.0
-
-    def set_mode(self, mode_str):
-        modes = {'LSB': '1', 'USB': '2', 'CW': '3', 'FM': '4', 'AM': '5', 'C4FM': 'E'}
-        if mode_str in modes:
-            self._execute(f"MD0{modes[mode_str]}")
-
-    def get_mode(self):
-        """
-        Read current mode using the Yaesu CAT 'MD' command.
-
-        Common FT-991A response formats seen in the wild include:
-          - Query:  MD0;   Reply: MD0x;   (x is the mode code)
-          - Query:  MD;    Reply: MD0x;   (some firmwares accept MD without the 0)
-
-        Returns currently active mode or None if unknown/unavailable.
-        """
-        code_to_mode = {'1': 'LSB', '2': 'USB', '3': 'CW-U', '4': 'FM', '5': 'AM', '6': 'RTTY-L', '7': 'CW-L', '8': 'DATA-L', '9': 'RTTY-U', 'A': 'DATA-FM', 'C': 'DATA-U','E': 'C4FM'}
-
-        resp = self._execute("MD0", read=True)
-        if not resp:
-            resp = self._execute("MD", read=True)
-        if not resp:
-            return None
-
-        # Expected something like "MD02" or "MD0E"
-        if resp.startswith("MD") and len(resp) >= 4:
-            code = resp[-1].upper()
-            return code_to_mode.get(code)
-
-        return None
-    def get_swr_meter(self):
-        resp = self._execute("RM6", read=True)
-        return int(resp[3:6]) if resp and len(resp) >= 6 else 0
-
-    def get_s_meter(self):
-        """
-        Read S-meter using the Yaesu CAT 'SM' command
-        Typical FT-991A behavior:
-          - Query:  SM0;
-          - Reply:  SM0xxx;   where xxx is 000-255
-        """
-        resp = self._execute("SM0", read=True)
-        if not resp:
-            return 0
-
-        # Common case: "SM0" + 3 digits
-        if resp.startswith("SM") and len(resp) >= 6:
-            digits = resp[-3:]
-            if digits.isdigit():
-                return int(digits)
-
-        return 0
-
-    def get_rf_power(self):
-        """
-        Read current RF power level using the Yaesu CAT 'PC' command.
-
-        Typical behavior:
-          - Query:  PC;
-          - Reply:  PCxxx;   where xxx is 005-100 (percent / watts setting depending on rig)
-        """
-        resp = self._execute("PC", read=True)
-        if not resp:
-            return 0
-
-        # Expected: "PC" + 3 digits (e.g., "PC050")
-        if resp.startswith("PC") and len(resp) >= 5:
-            digits = resp[-3:]
-            if digits.isdigit():
-                return int(digits)
-
-        return 0
-
-    def set_rf_power(self, level):
-        """
-        Set RF power level using the Yaesu CAT 'PC' command.
-
-        `level` is clamped to the radio's supported range: 5..100
-        and sent as a 3-digit value (005..100), e.g. "PC050;".
-        """
-        try:
-            level_int = int(level)
-        except (TypeError, ValueError):
-            return False
-
-        level_int = max(5, min(100, level_int))
-        self._execute(f"PC{level_int:03d}")
-        return True
-
-    def ptt_on(self):
-        self._execute("TX1")
-
-    def ptt_off(self):
-        self._execute("TX0")
+# (moved to ft991a_cat.py)
 
 
 # --- GUI & Features Class ---
@@ -181,6 +25,8 @@ class RadioGUI:
         self.root = root
         self.radio = radio
         self.scanning = False
+        self.active_band = None
+
         self.root.title("FT-991A Command Center")
         self.root.geometry("500x750")
         self.setup_ui()
@@ -436,14 +282,54 @@ class RadioGUI:
     def manual_log(self):
         self.log_to_file(self.radio.get_frequency(), self.radio.get_s_meter(), self.note_entry.get())
 
+    def infer_band_from_freq(self, mhz: float):
+        """Return band name if mhz is inside a defined band plan, else None."""
+        for name, plan in BANDS.items():
+            if plan["start"] <= mhz <= plan["end"]:
+                return name
+        return None
+
+    def goto_band(self, band_name: str):
+        """Set radio to band start + mode, and make it the active scan band."""
+        if band_name not in BANDS:
+            return
+
+        self.active_band = band_name
+        plan = BANDS[band_name]
+
+        if not self.radio.is_connected():
+            self.conn_status.config(text=f"Status: DISCONNECTED (selected {band_name})")
+            return
+
+        # Safety: tune + set mode to the band plan
+        self.radio.set_frequency(plan["start"])
+        self.radio.set_mode(plan["mode"])
+
+        # Update UI state/readback
+        self.mode_var.set(plan["mode"])
+        self.mode_status.config(text=f"SET {plan['mode']} ({band_name})")
+
     def toggle_scan(self):
         if not self.scanning:
             if not self.radio.is_connected():
-                # Refuse to scan when disconnected
                 self.conn_status.config(text="Status: DISCONNECTED (click CONNECT to scan)")
                 self.scan_btn.config(text="START SCAN", bg="lightgray")
                 self.scanning = False
                 return
+
+            # If user hasn't explicitly selected a band, try to infer from current frequency.
+            if not self.active_band:
+                current_f = self.radio.get_frequency()
+                self.active_band = self.infer_band_from_freq(current_f)
+
+            if not self.active_band:
+                self.conn_status.config(text="Status: ERROR (Select a band before scanning)")
+                self.scan_btn.config(text="START SCAN", bg="lightgray")
+                self.scanning = False
+                return
+
+            # Safety: disable PTT during scan to reduce accidental TX risk
+            self.ptt_btn.config(state=tk.DISABLED)
 
             self.scanning = True
             self.scan_btn.config(text="STOP SCAN", bg="orange")
@@ -451,20 +337,94 @@ class RadioGUI:
         else:
             self.scanning = False
             self.scan_btn.config(text="START SCAN", bg="lightgray")
+            self.ptt_btn.config(state=tk.NORMAL)
 
     def scan_thread(self):
+        plan = BANDS.get(self.active_band)
+        if not plan:
+            self.scanning = False
+            return
+
+        start = float(plan["start"])
+        end = float(plan["end"])
+        step = float(plan["step"])
+
+        # Start scanning from current frequency, but hard-clamp into band range.
         curr_f = self.radio.get_frequency()
-        thresh = int(self.thresh_entry.get())
+        if curr_f < start or curr_f > end:
+            curr_f = start
+
+        try:
+            thresh = int(self.thresh_entry.get())
+        except (TypeError, ValueError):
+            thresh = 40
+
         while self.scanning:
+            # Hard safety bound: never tune outside the band plan.
+            if curr_f < start:
+                curr_f = start
+            if curr_f > end:
+                curr_f = start
+
             self.radio.set_frequency(curr_f)
             time.sleep(0.15)
+
             s = self.radio.get_s_meter()
             if s >= thresh:
-                self.log_to_file(curr_f, s, "AUTO-FOUND")
-                time.sleep(3)  # Dwell on signal
-            curr_f += 0.005
-            if curr_f > 148.0: curr_f = 144.0  # Wrap-around example
+                # NOTE: log_to_file updates Tk widgets; ideally queue this to the UI thread.
+                print(f"Found signal at {curr_f} MHz with S-meter {s} on {self.active_band} with threshold{thresh}")
+                self.log_to_file(curr_f, s, f"AUTO-FOUND ({self.active_band})")
+                time.sleep(3)
 
+            curr_f += step
+
+        # When scan stops, re-enable PTT (UI thread would be cleaner, but this is minimal)
+        try:
+            self.root.after(0, lambda: self.ptt_btn.config(state=tk.NORMAL))
+        except Exception:
+            pass
+
+    def toggle_connection(self):
+        if self.radio.is_connected():
+            # Stop scanning before disconnecting
+            self.scanning = False
+            self.scan_btn.config(text="START SCAN", bg="lightgray")
+            self.ptt_btn.config(state=tk.NORMAL)
+
+            self.radio.disconnect()
+            self.freq_disp.config(text="DISCONNECTED")
+            self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
+            self.refresh_connection_ui()
+            return
+
+        ok, err = self.radio.connect()
+        if not ok:
+            self.conn_status.config(text=f"Status: ERROR ({err})")
+            self.freq_disp.config(text="DISCONNECTED")
+            self.meter_var.set(0)
+            self.rf_power_var.set(0)
+            self.rf_power_status.config(text="")
+            self.refresh_connection_ui()
+            return
+
+        self.refresh_connection_ui()
+
+        # Infer active band on connect if possible
+        f = self.radio.get_frequency()
+        inferred = self.infer_band_from_freq(f)
+        if inferred:
+            self.active_band = inferred
+            self.conn_status.config(text=f"Status: CONNECTED ({self.radio.port} @ {self.radio.baud}) [{inferred}]")
+
+        p = self.radio.get_rf_power()
+        self.rf_power_var.set(p)
+        self.rf_power_status.config(text=f"READ {p:03d}")
+        m = self.radio.get_mode()
+        if m:
+            self.mode_var.set(m)
+            self.mode_status.config(text=f"READ {m}")
 
 if __name__ == "__main__":
     # Change '/dev/ttyUSB0' to 'COM3' or similar if on Windows
