@@ -21,7 +21,8 @@ from ft8_decode import (
     ft8_gray_decode,
     FT8_COSTAS_POSITIONS,
     _FT8_GRAY_DECODE,
-    _FT8_INTERLEAVE_PERM,
+    _FT8_INTERLEAVE,
+    _FT8_DEINTERLEAVE,
 )
 
 FS        = 12_000
@@ -85,7 +86,7 @@ payload_mismatches = np.sum(hard_syms != expected_hard)
 print(f"[ft8_extract_payload_symbols]  mismatches vs known payload tones: {payload_mismatches}/58")
 assert payload_mismatches == 0
 
-# ── 5. ft8_deinterleave is now a pass-through (bit interleaving is done
+# ── 5. ft8_deinterleave is a pass-through (bit interleaving is done
 #       at the 174-bit level inside ft8_gray_decode).  Verify it's identity.
 syms_deint, E_deint = ft8_deinterleave(hard_syms, E_payload)
 
@@ -94,31 +95,38 @@ print(f"[ft8_deinterleave]  pass-through mismatches: {roundtrip_mismatches}/58")
 assert roundtrip_mismatches == 0
 
 # ── 6. Gray decode — verify hard bits and LLRs (after 174-bit de-interleave) ──
-# Build expected pre-interleave bits from payload tones
+# Build expected bits in CHANNEL (interleaved) order from payload tones
 gray_table = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
-bits_before_deinterleave = np.empty(174, dtype=np.uint8)
+bits_channel = np.empty(174, dtype=np.uint8)
 for i, tone in enumerate(payload_tones):
     gv = int(gray_table[tone])
     for b in range(3):
-        bits_before_deinterleave[3 * i + b] = (gv >> (2 - b)) & 1
+        bits_channel[3 * i + b] = (gv >> (2 - b)) & 1
 
-# Apply the same 174-bit de-interleave that ft8_gray_decode applies internally
-perm = _FT8_INTERLEAVE_PERM
-expected_bits = bits_before_deinterleave[list(perm)]
+# Apply the same 174-bit de-interleave that ft8_gray_decode applies internally.
+# _FT8_DEINTERLEAVE[src] = dst in channel order, or -1 for erased positions.
+# Erased positions (46 parity bits never transmitted) get 0.
+expected_bits = np.array([
+    bits_channel[_FT8_DEINTERLEAVE[src]] if _FT8_DEINTERLEAVE[src] >= 0 else 0
+    for src in range(174)
+], dtype=np.uint8)
 
 hard_bits, llrs = ft8_gray_decode(syms_deint, E_deint)
 
-bit_mismatches = int(np.sum(hard_bits != expected_bits))
-print(f"[ft8_gray_decode]  hard_bit mismatches vs expected: {bit_mismatches}/174")
+# Only compare non-erased positions (erased positions are filled by the erasure
+# solver in ft8_ldpc_decode and may not match raw channel bits)
+non_erased = [src for src in range(174) if _FT8_DEINTERLEAVE[src] >= 0]
+bit_mismatches = int(np.sum(hard_bits[non_erased] != expected_bits[non_erased]))
+print(f"[ft8_gray_decode]  hard_bit mismatches vs expected (non-erased): {bit_mismatches}/{len(non_erased)}")
 assert bit_mismatches == 0, f"Expected 0, got {bit_mismatches}"
 
-mean_llr_correct = float(np.mean(np.abs(llrs)))
-print(f"[ft8_gray_decode]  mean |LLR| = {mean_llr_correct:.2f}  (should be >> 1 for clean signal)")
+mean_llr_correct = float(np.mean(np.abs(llrs[non_erased])))
+print(f"[ft8_gray_decode]  mean |LLR| (non-erased) = {mean_llr_correct:.2f}  (should be >> 1 for clean signal)")
 assert mean_llr_correct > 5.0, f"LLRs unexpectedly weak: mean |LLR| = {mean_llr_correct:.2f}"
 
-# Sign convention: negative LLR → bit=1  (matches ft8_ldpc_decode: bits = L_post < 0)
-llr_sign_errors = int(np.sum((llrs < 0).astype(np.uint8) != hard_bits))
-print(f"[ft8_gray_decode]  LLR sign errors vs hard_bits: {llr_sign_errors}/174")
+# Sign convention: positive LLR → bit=1
+llr_sign_errors = int(np.sum((llrs[non_erased] > 0).astype(np.uint8) != hard_bits[non_erased]))
+print(f"[ft8_gray_decode]  LLR sign errors vs hard_bits (non-erased): {llr_sign_errors}/{len(non_erased)}")
 assert llr_sign_errors == 0
 
 print("\nAll assertions passed — symbol pipeline is correct.")

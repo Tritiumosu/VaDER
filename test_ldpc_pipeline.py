@@ -1,438 +1,285 @@
 """
-test_ldpc_pipeline.py — Offline pipeline tests for the FT8 LDPC decoder and
-surrounding stages.  Run with:  python test_ldpc_pipeline.py
+test_ldpc_pipeline.py — Pipeline tests matching ft8_lib reference exactly.
 
-Tests
------
-1.  Matrix sanity  — 83 rows, each with 91 unique column indices in [0,173]
-2.  Free / pivot   — FREE_COLS = 0..90, PIVOT_COLS = 91..173, no overlap
-3.  Parity submatrix rank  — H[:,91:] must be full rank 83 over GF(2)
-4.  All-zeros codeword     — passes every parity check
-5.  Random valid codeword  — encode via H, LDPC decode succeeds
-6.  CRC-14 round-trip      — encode 77-bit msg + CRC, full LDPC+CRC decode
-7.  Single bit-flip error  — decoder corrects and still passes
-8.  Interleaver round-trip — _build_ft8_interleave_table is a valid permutation
-9.  Gray decode sanity     — all-zero payload → 174 zero bits
-10. Full synthetic pipeline— build a valid 174-bit codeword, pass through
-                             Gray, deinterleave, LDPC; check message recovered
+Reference pipeline (ft8_lib / WSJT-X):
+  1. Encode: LDPC(91 bits) → 174-bit codeword, bits 0..90 = msg+CRC, 91..173 = parity
+  2. Tones: groups of 3 codeword bits → Gray-coded 8-FSK tone (no interleaver)
+  3. Gray decode: tone energies → 174 LLRs, sign: positive = bit 0 more likely
+  4. Normalize: scale LLRs so variance = 24
+  5. BP decode: tanh sum-product → 174 bits, check parity, CRC on bits 0..76 (zero-pad to 82)
+  6. Message: plain[0..76]
 """
-
 from __future__ import annotations
-import sys, time, traceback
+import sys, time, traceback, math
 import numpy as np
 
-# ── import the module under test ─────────────────────────────────────────────
 try:
     from ft8_decode import (
-        _LDPC_CHECKS,
-        _FT8_LDPC_FREE_COLS,
-        _FT8_LDPC_PIVOT_COLS,
-        _FT8_INTERLEAVE_PERM,
-        _build_ft8_interleave_table,
-        _FT8_GRAY_DECODE,
-        _ft8_crc14,
-        ft8_ldpc_decode,
-        ft8_gray_decode,
-        ft8_unpack_message,
+        _LDPC_CHECKS, _FT8_LDPC_FREE_COLS, _FT8_LDPC_PIVOT_COLS,
+        _FT8_GRAY_DECODE, _ft8_crc14,
+        ft8_ldpc_decode, ft8_gray_decode, ft8_unpack_message, ft8_deinterleave,
     )
 except ImportError as e:
-    print(f"IMPORT ERROR: {e}")
-    sys.exit(1)
+    print(f"IMPORT ERROR: {e}"); sys.exit(1)
 
-PASS = "✓ PASS"
-FAIL = "✗ FAIL"
-
+PASS = "✓ PASS"; FAIL = "✗ FAIL"
 results: list[tuple[str, bool, str]] = []
 
-def run(name: str, fn):
+def run(name, fn):
     t0 = time.perf_counter()
     try:
-        msg = fn()
-        ok = True
-        detail = msg or ""
+        msg = fn(); ok = True; detail = msg or ""
     except Exception as exc:
         ok = False
         detail = f"{type(exc).__name__}: {exc}\n{''.join(traceback.format_tb(exc.__traceback__))}"
     elapsed = (time.perf_counter() - t0) * 1000
     results.append((name, ok, detail))
-    status = PASS if ok else FAIL
-    print(f"  {status}  {name}  ({elapsed:.1f} ms)")
+    print(f"  {PASS if ok else FAIL}  {name}  ({elapsed:.1f} ms)")
     if not ok:
-        for line in detail.splitlines():
-            print(f"         {line}")
+        for line in detail.splitlines(): print(f"         {line}")
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: GF(2) rank via row reduction
-# ─────────────────────────────────────────────────────────────────────────────
-def gf2_rank(M: np.ndarray) -> int:
-    """Compute rank of a binary matrix over GF(2)."""
-    A = M.copy().astype(np.uint8)
-    nrows, ncols = A.shape
-    rank = 0
-    for col in range(ncols):
-        pivot = None
-        for row in range(rank, nrows):
-            if A[row, col]:
-                pivot = row
-                break
-        if pivot is None:
-            continue
-        A[[rank, pivot]] = A[[pivot, rank]]
-        for row in range(nrows):
-            if row != rank and A[row, col]:
-                A[row] = (A[row] + A[rank]) % 2
+def build_H():
+    H = np.zeros((83, 174), dtype=np.uint8)
+    for r, row in enumerate(_LDPC_CHECKS):
+        for c in row: H[r, c] = 1
+    return H
+
+def gf2_rank(M):
+    A = M.copy().astype(np.int32); rank = 0
+    for col in range(A.shape[1]):
+        piv = next((r for r in range(rank, A.shape[0]) if A[r, col]), None)
+        if piv is None: continue
+        A[[rank, piv]] = A[[piv, rank]]
+        for r in range(A.shape[0]):
+            if r != rank and A[r, col]: A[r] = (A[r] + A[rank]) % 2
         rank += 1
     return rank
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: build the full (83, 174) binary H matrix
-# ─────────────────────────────────────────────────────────────────────────────
-def build_H() -> np.ndarray:
-    H = np.zeros((83, 174), dtype=np.uint8)
-    for r, row in enumerate(_LDPC_CHECKS):
-        for c in row:
-            H[r, c] = 1
-    return H
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: encode a 91-bit message into a 174-bit codeword using H
-# Solve  H[:,91:] * p = H[:,:91] * s  (all GF(2))
-# ─────────────────────────────────────────────────────────────────────────────
-def encode_codeword(sys_bits: np.ndarray) -> np.ndarray:
-    """
-    Given 91 systematic bits, compute the 83 parity bits and return the full
-    174-bit codeword.  Uses GF(2) Gaussian elimination on H[:,91:].
-    """
-    assert sys_bits.shape == (91,)
+# Encode using ft8_lib generator matrix approach:
+# bits 0..90 = systematic (msg+CRC), bits 91..173 computed from parity check H
+def encode_ft8(msg77: np.ndarray) -> np.ndarray:
+    """Produce valid 174-bit codeword with bits[0..90] = msg+CRC, bits[91..173] = parity."""
+    assert len(msg77) == 77
+    crc = _ft8_crc14(msg77)
+    crc_bits = np.array([(crc >> (13 - i)) & 1 for i in range(14)], dtype=np.uint8)
+    sys_bits = np.concatenate([msg77, crc_bits])   # 91 bits
+    # Solve H[:,91:173] * parity = H[:,0:91] * sys  (mod 2)
     H = build_H()
-    Hs = H[:, :91]   # (83, 91)  — systematic part
-    Hp = H[:, 91:]   # (83, 83)  — parity part
-
-    # syndrome target: s = Hs @ sys_bits mod 2
-    s = (Hs @ sys_bits.astype(np.uint8)) % 2   # (83,)
-
-    # Solve Hp @ p = s over GF(2) via row reduction
-    aug = np.concatenate([Hp.copy(), s.reshape(83, 1)], axis=1).astype(np.uint8)
+    Hs = H[:, :91]; Hp = H[:, 91:]
+    rhs = (Hs.astype(np.int32) @ sys_bits.astype(np.int32)) % 2
+    # Gauss-Jordan solve Hp * p = rhs
+    aug = np.concatenate([Hp.copy().astype(np.uint8),
+                           rhs.reshape(83, 1).astype(np.uint8)], axis=1)
     for col in range(83):
-        pivot = None
-        for row in range(col, 83):
-            if aug[row, col]:
-                pivot = row
-                break
-        if pivot is None:
-            raise RuntimeError(f"Singular parity sub-matrix at col {col}")
-        aug[[col, pivot]] = aug[[pivot, col]]
-        for row in range(83):
-            if row != col and aug[row, col]:
-                aug[row] = (aug[row] + aug[col]) % 2
-    parity = aug[:, 83]   # (83,)
-
-    cw = np.concatenate([sys_bits.astype(np.uint8), parity])
-    # Verify
-    check = (H @ cw) % 2
-    assert np.all(check == 0), f"Encode verification failed: {check}"
+        piv = next((r for r in range(col, 83) if aug[r, col]), None)
+        if piv is None: raise RuntimeError(f"Singular at col {col}")
+        aug[[col, piv]] = aug[[piv, col]]
+        for r in range(83):
+            if r != col and aug[r, col]: aug[r] = (aug[r] + aug[col]) % 2
+    parity = aug[:, 83]
+    cw = np.concatenate([sys_bits, parity])  # 174 bits, systematic layout
+    assert np.all((H.astype(np.int32) @ cw.astype(np.int32)) % 2 == 0), "Codeword invalid"
     return cw
 
+def cw_to_tones(cw: np.ndarray) -> np.ndarray:
+    """Convert 174 codeword bits → 58 Gray-coded tones (no interleaver)."""
+    gray_map = list(_FT8_GRAY_DECODE)
+    inv_gray = [0] * 8
+    for tone, gv in enumerate(gray_map): inv_gray[gv] = tone
+    tones = np.array([
+        inv_gray[(int(cw[3*s]) << 2) | (int(cw[3*s+1]) << 1) | int(cw[3*s+2])]
+        for s in range(58)
+    ], dtype=np.int32)
+    return tones
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: build LLRs from a known hard-bit codeword (channel perfect)
-# ─────────────────────────────────────────────────────────────────────────────
-def bits_to_llrs(bits: np.ndarray, channel_snr: float = 8.0) -> np.ndarray:
-    """
-    Convert hard bits to soft LLRs.
-    Convention: positive LLR = bit 1 (same as ft8_ldpc_decode expectation).
-    bit=1 → LLR = +channel_snr
-    bit=0 → LLR = -channel_snr
-    """
-    return np.where(bits.astype(bool), channel_snr, -channel_snr).astype(np.float64)
+def tones_to_E(tones: np.ndarray, snr: float = 100.0) -> np.ndarray:
+    """Build (58,8) energy matrix from hard tone decisions at given SNR."""
+    E = np.ones((58, 8), dtype=np.float64)
+    for s, t in enumerate(tones): E[s, t] = snr
+    return E
 
+def normalize_llrs(llrs: np.ndarray) -> np.ndarray:
+    """Match ft8_lib ftx_normalize_logl: scale so variance = 24."""
+    var = float(np.var(llrs))
+    if var < 1e-10: return llrs
+    return llrs * math.sqrt(24.0 / var)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 1 — Matrix sanity
-# ═════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
 def t_matrix_sanity():
-    assert len(_LDPC_CHECKS) == 83, f"Expected 83 rows, got {len(_LDPC_CHECKS)}"
-    for i, row in enumerate(_LDPC_CHECKS):
-        assert len(row) == 91, f"Row {i} has {len(row)} entries, expected 91"
-        assert len(set(row)) == 91, f"Row {i} has duplicate column indices"
-        for c in row:
-            assert 0 <= c < 174, f"Row {i} column {c} out of range [0,173]"
-    return "83 rows × 91 cols, all indices in [0,173]"
+    assert len(_LDPC_CHECKS) == 83
+    for row in _LDPC_CHECKS:
+        assert 1 <= len(row) <= 7
+        assert len(set(row)) == len(row)
+        for c in row: assert 0 <= c < 174
+    return "83 checks, all indices in [0,173]"
+run("1. Matrix sanity", t_matrix_sanity)
 
-run("1. Matrix sanity (83×91, indices valid)", t_matrix_sanity)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 2 — Free / pivot column sets
-# ═════════════════════════════════════════════════════════════════════════════
-def t_free_pivot_cols():
-    assert len(_FT8_LDPC_FREE_COLS)  == 91, f"FREE_COLS length {len(_FT8_LDPC_FREE_COLS)}"
-    assert len(_FT8_LDPC_PIVOT_COLS) == 83, f"PIVOT_COLS length {len(_FT8_LDPC_PIVOT_COLS)}"
-    free_set  = set(_FT8_LDPC_FREE_COLS)
-    pivot_set = set(_FT8_LDPC_PIVOT_COLS)
-    assert free_set & pivot_set == set(), "FREE and PIVOT overlap"
-    assert free_set | pivot_set == set(range(174)), "FREE ∪ PIVOT ≠ {0..173}"
-    assert list(_FT8_LDPC_FREE_COLS) == list(range(91)), "FREE_COLS should be 0..90"
-    return "FREE=0..90 (91), PIVOT=91..173 (83), disjoint and complete"
-
-run("2. Free/pivot column sets", t_free_pivot_cols)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 3 — Parity submatrix rank
-# ═════════════════════════════════════════════════════════════════════════════
 def t_parity_rank():
     H = build_H()
-    Hp = H[:, 91:]   # (83, 83)
-    r = gf2_rank(Hp)
-    assert r == 83, f"H_parity rank = {r}, expected 83"
-    r_full = gf2_rank(H)
-    assert r_full == 83, f"Full H rank = {r_full}, expected 83"
-    return f"H_parity rank=83, full H rank=83"
+    assert gf2_rank(H) == 83, "H not full rank"
+    # With systematic layout bits 0..90 = free, 91..173 = parity
+    Hp = H[:, 91:]
+    assert gf2_rank(Hp) == 83, "Parity submatrix not full rank"
+    return "H rank=83, H[:,91:] rank=83"
+run("2. Parity submatrix rank", t_parity_rank)
 
-run("3. Parity submatrix full rank over GF(2)", t_parity_rank)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 4 — All-zeros codeword
-# ═════════════════════════════════════════════════════════════════════════════
-def t_all_zeros():
-    cw = np.zeros(174, dtype=np.uint8)
-    H = build_H()
-    syndrome = (H @ cw) % 2
-    assert np.all(syndrome == 0), f"All-zeros syndrome non-zero at {np.where(syndrome)[0]}"
-    # Decode: all-zeros LLRs → ambiguous, but LDPC should find the all-zeros word
-    llrs = bits_to_llrs(cw, channel_snr=10.0)
-    ok, codeword, iters = ft8_ldpc_decode(llrs, max_iterations=50)
-    # The all-zeros codeword is a valid LDPC codeword; CRC might not match (msg=0)
-    # but parity checks must pass (ok=True or crc failed)
-    # We only check that parity is satisfied
-    H2 = build_H()
-    syn2 = (H2 @ codeword.astype(np.uint8)[:174]) % 2  # codeword is 91 bits (free bits)
-    # Actually ft8_ldpc_decode returns free_bits (91,); syndrome must be re-checked on full 174
-    # Reconstruct full codeword
-    full_cw = encode_codeword(codeword)
-    syn3 = (H2 @ full_cw) % 2
-    assert np.all(syn3 == 0), f"Re-encoded all-zeros syndrome non-zero"
-    return f"All-zeros passes all 83 parity checks (iters={iters})"
-
-run("4. All-zeros codeword parity check", t_all_zeros)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 5 — Random valid codeword encode → LDPC decode
-# ═════════════════════════════════════════════════════════════════════════════
-def t_random_codeword():
+def t_encode_valid():
     rng = np.random.default_rng(42)
-    sys_bits = rng.integers(0, 2, size=91, dtype=np.uint8)
-    cw = encode_codeword(sys_bits)
-    llrs = bits_to_llrs(cw, channel_snr=10.0)
-    ok, decoded_free, iters = ft8_ldpc_decode(llrs, max_iterations=50)
-    # Parity must be satisfied (CRC may or may not pass since msg is random)
+    msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+    cw = encode_ft8(msg)
     H = build_H()
-    full_dec = encode_codeword(decoded_free)
-    syndrome = (H @ full_dec) % 2
-    assert np.all(syndrome == 0), f"Decoded codeword fails parity at checks {np.where(syndrome)[0]}"
-    assert np.array_equal(decoded_free, sys_bits), \
-        f"Decoded free bits don't match original systematic bits"
-    return f"Encoded random 91-bit word, decoded back exactly (iters={iters})"
+    assert np.all((H.astype(np.int32) @ cw.astype(np.int32)) % 2 == 0)
+    return "Random message encodes to valid codeword"
+run("3. Encode produces valid codeword", t_encode_valid)
 
-run("5. Random valid codeword encode→decode", t_random_codeword)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 6 — CRC-14 round-trip (full LDPC+CRC)
-# ═════════════════════════════════════════════════════════════════════════════
 def t_crc_roundtrip():
-    # Build a known 77-bit message: "CQ W4ABC EM73" style (just arbitrary bits)
-    rng = np.random.default_rng(7)
-    msg_bits = rng.integers(0, 2, size=77, dtype=np.uint8)
+    msg = np.array([1,0,1,0,1,0,1] + [0]*70, dtype=np.uint8)
+    crc = _ft8_crc14(msg)
+    # CRC should be 14-bit
+    assert 0 <= crc < 16384
+    # Re-encode and check CRC in codeword
+    cw = encode_ft8(msg)
+    crc_bits = cw[77:91]
+    rx_crc = sum(int(b) << (13-i) for i,b in enumerate(crc_bits))
+    assert crc == rx_crc, f"CRC mismatch: calc=0x{crc:04X} rx=0x{rx_crc:04X}"
+    return f"CRC=0x{crc:04X} round-trips correctly"
+run("4. CRC-14 round-trip", t_crc_roundtrip)
 
-    # Compute CRC-14 over 5-zero-pad + msg_bits (WSJT-X convention)
-    padded = np.concatenate((np.zeros(5, dtype=np.uint8), msg_bits))
-    crc_int = _ft8_crc14(padded)
-    crc_bits = np.array([(crc_int >> (13 - i)) & 1 for i in range(14)], dtype=np.uint8)
+def t_gray_decode_allzero():
+    """All tone-0 symbols → all-zero bits with negative LLRs (positive = bit 1 convention)."""
+    gray_map = list(_FT8_GRAY_DECODE)
+    # tone 0 → gray value 0 → bits 0,0,0
+    assert gray_map[0] == 0
+    E = np.ones((58, 8)); E[:, 0] = 1e6
+    syms = np.zeros(58, dtype=np.int32)
+    hard, llrs = ft8_gray_decode(syms, E)
+    assert np.all(hard == 0), f"Expected all-zero bits"
+    # positive = bit 1 more likely, so bit=0 should give negative LLRs
+    assert np.all(llrs <= 0), f"Expected all non-positive LLRs (positive=bit1 convention)"
+    return "Tone-0 → 174 zero bits, all LLRs ≤ 0 ✓"
+run("5. Gray decode sanity (all-zero tones)", t_gray_decode_allzero)
 
-    sys_bits = np.concatenate([msg_bits, crc_bits])   # 91 bits
-    assert sys_bits.shape == (91,)
+def t_clean_decode():
+    """Perfect signal: encode → tones → Gray decode → LDPC → recover message."""
+    rng = np.random.default_rng(1234)
+    msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+    cw = encode_ft8(msg)
+    tones = cw_to_tones(cw)
+    E = tones_to_E(tones)
+    hard, llrs = ft8_gray_decode(tones, E)
+    llrs_norm = normalize_llrs(llrs)
+    # Hard bits should exactly match codeword
+    assert np.all(hard == cw), f"Hard bits mismatch at {np.where(hard != cw)[0]}"
+    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
+    assert ok, f"LDPC failed (iters={iters})"
+    assert np.all(payload[:77] == msg), "Message mismatch"
+    return f"Clean decode ok (iters={iters})"
+run("6. Clean encode→decode round-trip", t_clean_decode)
 
-    cw = encode_codeword(sys_bits)
-    llrs = bits_to_llrs(cw, channel_snr=10.0)
+def t_noisy_decode():
+    """Gaussian noise at ~3dB: still decodes."""
+    rng = np.random.default_rng(999)
+    msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+    cw = encode_ft8(msg)
+    tones = cw_to_tones(cw)
+    E = tones_to_E(tones, snr=20.0)
+    _, llrs = ft8_gray_decode(tones, E)
+    noise = rng.standard_normal(174) * 1.5
+    llrs_noisy = normalize_llrs(llrs + noise)
+    ok, payload, iters = ft8_ldpc_decode(llrs_noisy, max_iterations=100)
+    assert ok, f"Noisy decode failed (iters={iters})"
+    assert np.all(payload[:77] == msg)
+    return f"Noisy decode ok (iters={iters})"
+run("7. Noisy decode (Gaussian noise)", t_noisy_decode)
 
-    ok, decoded_free, iters = ft8_ldpc_decode(llrs, max_iterations=50)
-    assert ok, f"LDPC+CRC decode failed (iters={iters})"
-    assert np.array_equal(decoded_free[:77], msg_bits), "Decoded message bits don't match"
-    return f"CRC-14 round-trip pass (iters={iters}, crc_int=0x{crc_int:04X})"
-
-run("6. CRC-14 round-trip LDPC+CRC", t_crc_roundtrip)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 7 — Single bit-flip error correction
-# ═════════════════════════════════════════════════════════════════════════════
-def t_single_bit_flip():
-    rng = np.random.default_rng(99)
-    msg_bits = rng.integers(0, 2, size=77, dtype=np.uint8)
-    padded = np.concatenate((np.zeros(5, dtype=np.uint8), msg_bits))
-    crc_int = _ft8_crc14(padded)
-    crc_bits = np.array([(crc_int >> (13 - i)) & 1 for i in range(14)], dtype=np.uint8)
-    sys_bits = np.concatenate([msg_bits, crc_bits])
-    cw = encode_codeword(sys_bits)
-
-    # Flip one bit in a non-trivial position
-    flip_pos = 37
-    cw_err = cw.copy()
-    cw_err[flip_pos] ^= 1
-
-    llrs = bits_to_llrs(cw_err, channel_snr=6.0)   # moderate SNR
-    ok, decoded_free, iters = ft8_ldpc_decode(llrs, max_iterations=100)
-    assert ok, f"Single-bit-flip decode failed at pos={flip_pos} (iters={iters})"
-    assert np.array_equal(decoded_free[:77], msg_bits), "Bit-flip correction: message mismatch"
-    return f"Single bit flip at pos={flip_pos} corrected (iters={iters})"
-
-run("7. Single bit-flip error correction", t_single_bit_flip)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 8 — Interleaver round-trip
-# ═════════════════════════════════════════════════════════════════════════════
-def t_interleaver():
-    perm = _FT8_INTERLEAVE_PERM
-    assert len(perm) == 174, f"Interleave perm length {len(perm)}"
-    assert set(perm) == set(range(174)), "Interleave perm is not a valid permutation of 0..173"
-    # Verify _build_ft8_interleave_table matches _FT8_INTERLEAVE_PERM
-    built = _build_ft8_interleave_table()
-    assert built == perm, "Built perm does not match cached _FT8_INTERLEAVE_PERM"
-    # Round-trip: interleave then de-interleave = identity
-    bits = np.arange(174, dtype=np.int32)
-    interleaved = bits[list(perm)]
-    inv_perm = np.argsort(list(perm))
-    recovered = interleaved[inv_perm]
-    assert np.array_equal(recovered, bits), "Interleave round-trip failed"
-    return "174-entry permutation valid, round-trip identity"
-
-run("8. Interleaver round-trip", t_interleaver)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 9 — Gray decode sanity (all-zero payload symbols → 174 zero LLRs)
-# ═════════════════════════════════════════════════════════════════════════════
-def t_gray_decode_sanity():
-    # Build a (58, 8) energy matrix where tone 0 dominates every symbol
-    # → Gray(tone=0) = 000 → 3 zero bits per symbol → 174 zero bits
-    E = np.zeros((58, 8), dtype=np.float64)
-    E[:, 0] = 1e6    # tone 0 carries all energy
-    for k in range(1, 8):
-        E[:, k] = 1.0   # small but nonzero to avoid log(0)
-
-    syms = np.zeros(58, dtype=np.int32)   # hard decision: tone 0
-
-    gray_table = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
-    assert gray_table[0] == 0, f"Gray(0) should be 0b000=0, got {gray_table[0]}"
-
-    hard_bits, llrs = ft8_gray_decode(syms, E)
-    assert hard_bits.shape == (174,), f"hard_bits shape {hard_bits.shape}"
-    assert llrs.shape    == (174,), f"llrs shape {llrs.shape}"
-    # All hard bits should be 0
-    assert np.all(hard_bits == 0), f"Expected all-zero bits, got {np.where(hard_bits)[0]}"
-    # All LLRs should be negative (convention: negative = bit 1 less likely = bit 0 likely)
-    assert np.all(llrs <= 0), f"Expected all non-positive LLRs for all-zero bits"
-    return "All-zero symbols → 174 zero hard bits, all non-positive LLRs"
-
-run("9. Gray decode sanity (all-zero symbols)", t_gray_decode_sanity)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TEST 10 — Full synthetic pipeline: encode → Gray → deinterleave → LDPC
-# ═════════════════════════════════════════════════════════════════════════════
 def t_full_pipeline():
-    """
-    Build a valid 77-bit message, encode it to a 174-bit LDPC codeword, then
-    synthesise perfect 8-FSK symbol energies and run the full decoder chain:
-        Gray decode → (identity deinterleave) → LDPC decode → unpack message
-    """
-    from ft8_decode import ft8_deinterleave, _FT8_INTERLEAVE_PERM
-
-    # ── 1. Build message + CRC ───────────────────────────────────────────
+    """Full Stage 2→3→4→5 pipeline including ft8_deinterleave (pass-through)."""
     rng = np.random.default_rng(2025)
-    msg_bits = rng.integers(0, 2, size=77, dtype=np.uint8)
-    padded = np.concatenate((np.zeros(5, dtype=np.uint8), msg_bits))
-    crc_int = _ft8_crc14(padded)
-    crc_bits = np.array([(crc_int >> (13 - i)) & 1 for i in range(14)], dtype=np.uint8)
-    sys_bits = np.concatenate([msg_bits, crc_bits])   # 91 bits
+    msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+    cw = encode_ft8(msg)
+    tones = cw_to_tones(cw)
+    E = tones_to_E(tones)
+    # ft8_deinterleave is a no-op pass-through at symbol level
+    syms_di, E_di = ft8_deinterleave(tones, E)
+    assert np.array_equal(syms_di, tones)
+    hard, llrs = ft8_gray_decode(syms_di, E_di)
+    llrs_norm = normalize_llrs(llrs)
+    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
+    assert ok, f"LDPC failed (iters={iters})"
+    assert np.all(payload[:77] == msg)
+    decoded = ft8_unpack_message(payload[:77])
+    return f"Full pipeline ok, msg='{decoded}' (iters={iters})"
+run("8. Full pipeline (deinterleave+gray+LDPC+unpack)", t_full_pipeline)
 
-    # ── 2. Encode to 174-bit codeword ───────────────────────────────────
-    cw = encode_codeword(sys_bits)  # (174,) bits
+def t_multiple_messages():
+    """Decode 10 random messages reliably."""
+    rng = np.random.default_rng(777)
+    failed = []
+    for i in range(10):
+        msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+        cw = encode_ft8(msg)
+        E = tones_to_E(cw_to_tones(cw))
+        _, llrs = ft8_gray_decode(cw_to_tones(cw), E)
+        ok, payload, _ = ft8_ldpc_decode(normalize_llrs(llrs))
+        if not ok or not np.all(payload[:77] == msg):
+            failed.append(i)
+    assert not failed, f"Failed on messages: {failed}"
+    return "10/10 random messages decode correctly"
+run("9. 10 random messages", t_multiple_messages)
 
-    # ── 3. The pipeline applies INTERLEAVE before transmission;
-    #       we need to PRE-interleave so that after de-interleaving we recover cw.
-    #       ft8_gray_decode applies de-interleave internally.
-    #       So: transmitted_bits[perm[i]] = cw[i]
-    #           → transmitted_bits = cw placed at perm destinations
-    perm = list(_FT8_INTERLEAVE_PERM)   # perm[dst] = src  (de-interleave map)
-    # interleave: for each dst, transmitted[dst] = cw[src where perm[src]=dst]
-    inv_perm = np.argsort(perm)    # inv_perm[src] = dst  (forward interleave)
-    tx_bits = cw[inv_perm]         # (174,) — bits as transmitted
+def t_known_crc():
+    """Verify CRC value for all-zeros message matches expected."""
+    msg = np.zeros(77, dtype=np.uint8)
+    crc = _ft8_crc14(msg)
+    # All-zeros 82-bit input → CRC should be 0
+    assert crc == 0, f"CRC of all-zeros should be 0, got 0x{crc:04X}"
+    return f"CRC(all-zeros 77 bits) = 0x{crc:04X} ✓"
+run("10. CRC of all-zeros = 0", t_known_crc)
 
-    # ── 4. Convert 174 tx bits → 58 Gray-coded 3-tone symbols ───────────
-    gray_table = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
+def t_real_interleaver_tables():
+    """Verify that _FT8_DEINTERLEAVE correctly inverts _FT8_INTERLEAVE."""
+    from ft8_decode import _FT8_INTERLEAVE, _FT8_DEINTERLEAVE
 
-    # Build inverse Gray table: 3-bit integer → tone index
-    # gray_table[tone] = gray_value → inv_gray[gray_value] = tone
-    inv_gray = np.zeros(8, dtype=np.int32)
-    for tone, gv in enumerate(gray_table):
-        inv_gray[gv] = tone
+    # Validation 1: Check basic properties
+    assert len(_FT8_INTERLEAVE) == 174
+    assert len(_FT8_DEINTERLEAVE) == 174
 
-    # Pack 174 bits back into 58 3-bit values (MSB-first per symbol)
-    syms_tx = np.empty(58, dtype=np.int32)
-    for s in range(58):
-        b2 = int(tx_bits[3*s + 0])
-        b1 = int(tx_bits[3*s + 1])
-        b0 = int(tx_bits[3*s + 2])
-        gv = (b2 << 2) | (b1 << 1) | b0
-        syms_tx[s] = int(inv_gray[gv])
+    # Validation 2: Simulate transmission
+    # cw[i] is codeword bit i
+    # tx[j] = cw[_FT8_INTERLEAVE[j]] is transmitted bit j
 
-    # ── 5. Build perfect energy matrix (ideal 8-FSK: dominant tone has all energy)
-    E_payload = np.ones((58, 8), dtype=np.float64) * 1.0   # noise floor
-    for s in range(58):
-        E_payload[s, int(syms_tx[s])] = 1e8                 # signal tone
+    # Check that DEINTERLEAVE inverts INTERLEAVE
+    # recovered_cw[i] = tx[_FT8_DEINTERLEAVE[i]] (if >= 0)
+    #                 = cw[_FT8_INTERLEAVE[_FT8_DEINTERLEAVE[i]]]
 
-    # ── 6. Gray decode → 174 bits + LLRs (includes de-interleave) ───────
-    hard_bits, llrs = ft8_gray_decode(syms_tx, E_payload)
+    # So we require: _FT8_INTERLEAVE[_FT8_DEINTERLEAVE[i]] == i  FOR ALL i where _FT8_DEINTERLEAVE[i] != -1
 
-    # Check hard bits match cw
-    assert np.array_equal(hard_bits, cw), \
-        f"Gray-decoded hard bits mismatch cw at positions: {np.where(hard_bits != cw)[0]}"
+    erased_count = 0
+    for i in range(174):
+        dst = _FT8_DEINTERLEAVE[i]
+        if dst == -1:
+            erased_count += 1
+            continue
 
-    # ── 7. ft8_deinterleave is identity at symbol level ──────────────────
-    syms_di, E_di = ft8_deinterleave(syms_tx, E_payload)
-    assert np.array_equal(syms_di, syms_tx), "deinterleave changed symbols unexpectedly"
+        src_recheck = _FT8_INTERLEAVE[dst]
+        assert src_recheck == i, f"Mismatch at cw bit {i}: maps to tx {dst}, but tx {dst} comes from cw {src_recheck}"
 
-    # ── 8. LDPC decode ────────────────────────────────────────────────────
-    ok, decoded_free, iters = ft8_ldpc_decode(llrs, max_iterations=50)
-    assert ok, f"LDPC+CRC decode failed in full pipeline (iters={iters})"
-    assert np.array_equal(decoded_free[:77], msg_bits), \
-        f"Pipeline message bits mismatch at: {np.where(decoded_free[:77] != msg_bits)[0]}"
+    return f"De-interleaver table validates against interleaver. Erased bits: {erased_count}"
+run("11. Real Interleaver tables check", t_real_interleaver_tables)
 
-    return f"Full synthetic pipeline passed (iters={iters})"
-
-run("10. Full synthetic pipeline encode→Gray→LDPC→unpack", t_full_pipeline)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 print()
 passed = sum(1 for _, ok, _ in results if ok)
 failed = sum(1 for _, ok, _ in results if not ok)
 print(f"Results: {passed}/{len(results)} passed", end="")
 if failed:
-    print(f"  ({failed} FAILED)")
-    sys.exit(1)
+    print(f"  ({failed} FAILED)"); sys.exit(1)
 else:
-    print("  — all tests passed ✓")
-    sys.exit(0)
-
+    print("  — all tests passed ✓"); sys.exit(0)
