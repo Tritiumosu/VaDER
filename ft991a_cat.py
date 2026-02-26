@@ -9,12 +9,14 @@ class Yaesu991AControl:
 
     This module intentionally contains NO GUI code.
     """
-    def __init__(self, port="/dev/ttyUSB0", baud=38400, timeout=1):
+    def __init__(self, port="/dev/ttyUSB0", baud=38400, timeout=1, stopbits=1):
         self.port = port
         self.baud = baud
         self.timeout = timeout
         self.conn = None  # don't auto-connect on launch
         self._io_lock = threading.Lock()
+        self._stopbits = float(stopbits)
+        self._stopbits_serial = None  # resolved in connect(); also settable by GUI
 
         # CTCSS Tone Mapping (Index 001-050) - unused by GUI for now, but kept here.
         self.tone_map = {
@@ -31,11 +33,23 @@ class Yaesu991AControl:
         if self.is_connected():
             return True, None
         try:
+            # Resolve stop bits: prefer the pre-mapped constant set by the GUI
+            # (_stopbits_serial), fall back to converting the float _stopbits value.
+            if self._stopbits_serial is not None:
+                sb = self._stopbits_serial
+            else:
+                _sb_map = {
+                    1: serial.STOPBITS_ONE,
+                    1.5: serial.STOPBITS_ONE_POINT_FIVE,
+                    2: serial.STOPBITS_TWO,
+                }
+                sb = _sb_map.get(float(self._stopbits), serial.STOPBITS_ONE)
+
             self.conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baud,
                 timeout=self.timeout,
-                stopbits=serial.STOPBITS_ONE
+                stopbits=sb,
             )
             return True, None
         except Exception as e:
