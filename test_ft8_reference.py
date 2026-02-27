@@ -226,22 +226,34 @@ run("7. LLR normalization to variance=24 (ftx_normalize_logl)", t_normalization_
 
 def t_ft8lib_crc_bit_order():
     """Verify CRC is computed on 77 bits zero-padded to 82 bits (WSJT-X/ft8_lib convention).
-    From ft8_lib ftx_add_crc: 'CRC calculated on source-encoded message, zero-extended from 77 to 82 bits'."""
+    From ft8_lib ftx_add_crc: 'CRC calculated on source-encoded message, zero-extended from 77 to 82 bits'.
+    ft8_lib uses byte-at-a-time XOR into the top 8 bits of the 14-bit register."""
     msg = np.array([1,1,0,1,0,0,1,1,0,1] + [0]*67, dtype=np.uint8)
     crc = _ft8_crc14(msg)
-    # Re-compute manually for 82 bits (77 msg + 5 zeros)
+    # Re-compute manually using ft8_lib ftx_compute_crc algorithm (byte-at-a-time)
     padded = np.concatenate([msg[:77], np.zeros(5, dtype=np.uint8)])
     assert len(padded) == 82
-    crc2 = 0
+    # Pack 82 bits into bytes (MSB-first)
+    n_bytes = (82 + 7) // 8  # = 11 bytes
+    msg_bytes = np.zeros(n_bytes, dtype=np.uint8)
+    for i in range(82):
+        msg_bytes[i // 8] |= int(padded[i]) << (7 - i % 8)
+    # CRC-14, poly 0x2757: XOR each byte into top 8 bits, then shift 8 times
     POLY = 0x2757
-    for bit in padded:
-        top = (crc2 >> 13) & 1
-        crc2 = ((crc2 << 1) & 0x3FFF) | int(bit)
-        if top:
-            crc2 ^= POLY
+    TOP  = 1 << 13  # bit 13
+    crc2 = 0
+    idx_byte = 0
+    for idx_bit in range(82):
+        if idx_bit % 8 == 0:
+            crc2 ^= int(msg_bytes[idx_byte]) << (14 - 8)  # XOR into top 8 bits
+            idx_byte += 1
+        if crc2 & TOP:
+            crc2 = ((crc2 << 1) ^ POLY) & 0xFFFF
+        else:
+            crc2 = (crc2 << 1) & 0xFFFF
     crc2 &= 0x3FFF
     assert crc == crc2, f"CRC mismatch: _ft8_crc14={crc:04X}, manual={crc2:04X}"
-    return f"CRC computed on 82 bits (77+5zeros) matches manual computation 0x{crc:04X} ✓"
+    return f"CRC computed on 82 bits (77+5zeros) matches ft8_lib byte-at-a-time 0x{crc:04X} ✓"
 run("8. CRC over 77+5=82 zero-padded bits (ft8_lib ftx_add_crc)", t_ft8lib_crc_bit_order)
 
 

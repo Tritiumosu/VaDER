@@ -1,5 +1,5 @@
 import numpy as np, sys
-from ft8_decode import ft8_unpack_message, _unpack_grid_15, _bits_to_int
+from ft8_decode import ft8_unpack_message, _unpack_grid, _bits_to_int
 
 def ibits(v, l): return [(v >> (l-1-i)) & 1 for i in range(l)]
 
@@ -20,7 +20,7 @@ def pk(call):
 
 c1=pk('W4ABC'); c2=pk('K9XYZ'); g73=32765
 print(f"c1={c1}, c2={c2}, g73={g73}")
-print(f"_unpack_grid_15(32765) = {_unpack_grid_15(32765)}")
+print(f"_unpack_grid(32404, 0) = {_unpack_grid(32404, 0)}")  # 73
 
 bits = np.array(ibits(c1,28)+[0]+ibits(c2,28)+[0]+ibits(g73,15)+[0]+ibits(0,3), dtype=np.uint8)
 print(f"bits length = {len(bits)}")
