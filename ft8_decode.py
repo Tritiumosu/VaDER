@@ -214,10 +214,6 @@ _AP_LLR_MAGNITUDE: float = 50.0
 # adding AP passes would waste time without improving decodes.
 _AP_PARITY_ERROR_THRESHOLD: int = 8
 
-def _ap(bit_val_pairs: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
-    """Pass-through helper to clarify intent when building AP tuples."""
-    return bit_val_pairs
-
 # Common AP tuples (n28a encoding helpers)
 _AP_BITS_I3_1 = ((74, 0), (75, 0), (76, 1))   # i3 = 001
 _AP_BITS_I3_2 = ((74, 0), (75, 1), (76, 0))   # i3 = 010
