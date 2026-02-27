@@ -13,13 +13,24 @@ Usage:
 The decoder is UTC-aligned: decodes fire at the end of each 15-second FT8 slot
 (i.e. at :00, :15, :30, :45 past the minute).
 
+Debug output (shown unless --quiet):
+  [seed]  detected candidate frequencies with SNR score
+  [sync]  sync-search candidates (time offset, frequency, Costas score)
+  [cand]  per-candidate Costas match count
+  [ldpc]  LDPC decode result (OK / FAIL / CRC mismatch)
+  [msg]   decoded message text
+  [audio] per-slot RMS level of captured audio
+
 Ctrl-C to stop.
 """
 import argparse
 import configparser
+import math
 import os
 import sys
 import time
+
+import numpy as np
 
 from digi_input import SoundCardAudioSource
 from ft8_decode import FT8ConsoleDecoder, format_ft8_message
@@ -63,6 +74,8 @@ def _parse_args():
                    help="upper FT8 audio frequency bound in Hz (default: 3200)")
     p.add_argument("--quiet", action="store_true",
                    help="suppress per-candidate debug output; show decoded messages only")
+    p.add_argument("--debug-audio", action="store_true",
+                   help="print per-slot audio RMS level and chunk statistics")
     return p.parse_args()
 
 
@@ -112,6 +125,7 @@ def main() -> None:
     print(f"  Capture fs   : {args.fs} Hz")
     print(f"  FT8 band     : {args.fmin:.0f} – {args.fmax:.0f} Hz")
     print(f"  Debug output : {'OFF (--quiet)' if args.quiet else 'ON'}")
+    print(f"  Audio diag   : {'ON (--debug-audio)' if args.debug_audio else 'OFF'}")
     print(f"  Ctrl-C to stop\n")
 
     # Build decoder
@@ -149,10 +163,45 @@ def main() -> None:
 
     last_slot_announce = 0.0
 
+    # Audio diagnostics: accumulate RMS per 15-second slot window
+    _slot_samples: list[np.ndarray] = []
+    _last_slot_boundary = 0.0
+
+    def _current_slot_boundary() -> float:
+        t = _dt.datetime.now(_dt.timezone.utc).timestamp()
+        return math.floor(t / 15.0) * 15.0
+
     try:
         for chunk in src.chunks(timeout_s=0.5):
             # Feed the decoder
             decoder.feed(fs=chunk.fs, samples=chunk.samples, t0_monotonic=chunk.t0)
+
+            # Accumulate audio for RMS diagnostics
+            if args.debug_audio:
+                _slot_samples.append(np.asarray(chunk.samples, dtype=np.float32))
+                boundary = _current_slot_boundary()
+                if boundary != _last_slot_boundary and _last_slot_boundary != 0.0:
+                    # A new slot boundary just passed — report stats for completed slot
+                    if _slot_samples:
+                        combined = np.concatenate(_slot_samples)
+                        rms = float(np.sqrt(np.mean(combined ** 2)))
+                        peak = float(np.max(np.abs(combined)))
+                        rms_db = 20.0 * math.log10(rms + 1e-9)
+                        peak_db = 20.0 * math.log10(peak + 1e-9)
+                        n_chunks = len(_slot_samples)
+                        utc_s = _dt.datetime.fromtimestamp(
+                            _last_slot_boundary,
+                            tz=_dt.timezone.utc,
+                        ).strftime("%H:%M:%S")
+                        print(
+                            f"\n  [audio] slot {utc_s}Z  "
+                            f"rms={rms_db:+.1f} dBFS  "
+                            f"peak={peak_db:+.1f} dBFS  "
+                            f"chunks={n_chunks}",
+                            flush=True,
+                        )
+                    _slot_samples = []
+                _last_slot_boundary = boundary
 
             # Print a "next slot in Xs" heartbeat once per second
             now = time.monotonic()

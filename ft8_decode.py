@@ -1072,6 +1072,10 @@ class UTC15sFramer:
     The first frame emitted may be partial (audio started mid-slot).
     """
 
+    # Tolerance (seconds) for treating _t0_utc as exactly on a slot boundary.
+    # 1 ms covers accumulated float64 arithmetic drift across many slots.
+    _BOUNDARY_TOLERANCE_S: float = 1e-3
+
     def __init__(self, fs_proc: int, frame_s: float = 15.0) -> None:
         self.fs = int(fs_proc)
         self.frame_s = float(frame_s)
@@ -1111,7 +1115,27 @@ class UTC15sFramer:
             self._t0_utc = t0_utc
         self._buf = np.concatenate([self._buf, x])
         out: list[tuple[float, np.ndarray, bool]] = []
-        while len(self._buf) >= self.frame_n:
+        while True:
+            # Advance _t0_utc to the next slot boundary, discarding any
+            # pre-boundary audio.  This ensures every emitted frame starts
+            # exactly at a UTC 15-second boundary so that FT8 signals (which
+            # also start at those boundaries) appear at t ≈ 0 in the frame,
+            # within the sync-search window.
+            offset_in_slot = float(self._t0_utc) % self.frame_s
+            tol = self._BOUNDARY_TOLERANCE_S
+            if offset_in_slot < tol or offset_in_slot > self.frame_s - tol:
+                pre_n = 0   # already on (or within tolerance of) a boundary
+            else:
+                pre_n = int(round((self.frame_s - offset_in_slot) * self.fs))
+
+            if len(self._buf) < pre_n + self.frame_n:
+                break
+
+            # Discard samples that precede the slot boundary
+            if pre_n > 0:
+                self._buf = self._buf[pre_n:]
+                self._t0_utc = float(self._t0_utc) + (self.frame_s - offset_in_slot)
+
             frame = self._buf[: self.frame_n].copy()
             self._buf = self._buf[self.frame_n:]
             slot_start = self._slot_start_epoch(float(self._t0_utc))
@@ -1345,14 +1369,17 @@ class FT8ConsoleDecoder:
         _T0_MIN = -0.50
         _T0_MAX = 15.0 - FT8_TX_DURATION_S   # ≈ +2.36 s
 
-        # Detect candidate seed frequencies
+        # Detect candidate seed frequencies (top 10 of 20 to keep sync search fast)
         candidates = self._detector.detect(frame, top_n=20)
-        seed_freqs = [f for f, _ in candidates[:10]]
+        seed_items = candidates[:10]
+        seed_freqs = [f for f, _ in seed_items]
 
         if self._debug:
             print(
                 f"[FT8] slot {utc}Z  seeds={len(seed_freqs)}", flush=True
             )
+            for f0, score in seed_items:
+                print(f"  [seed] {f0:7.1f} Hz  score={score:+5.1f} dB", flush=True)
 
         sync_cands = self._sync.search(
             frame,
@@ -1362,6 +1389,21 @@ class FT8ConsoleDecoder:
             max_candidates=5,
         )
 
+        if self._debug:
+            print(
+                f"[FT8] slot {utc}Z  {len(sync_cands)} sync candidate(s)",
+                flush=True,
+            )
+            for t0_s, f0_hz, score in sync_cands:
+                tag = "  (outside t window)" if (
+                    float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX
+                ) else ""
+                print(
+                    f"  [sync] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
+                    f"  score={score:+5.1f} dB{tag}",
+                    flush=True,
+                )
+
         seen_msg: set[str] = set()
         for t0_s, f0_hz, _score in sync_cands:
             if float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX:
@@ -1369,7 +1411,19 @@ class FT8ConsoleDecoder:
 
             E79 = self._extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
             costas_m, _, _ = _costas_score(E79)
+            if self._debug:
+                print(
+                    f"  [cand] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
+                    f"  costas={costas_m}/21",
+                    flush=True,
+                )
             if costas_m < self._min_costas_matches:
+                if self._debug:
+                    print(
+                        f"    -> costas {costas_m} < {self._min_costas_matches}"
+                        f" threshold -- skip",
+                        flush=True,
+                    )
                 continue
 
             E_payload, hard_syms = ft8_extract_payload_symbols(E79)
@@ -1380,10 +1434,36 @@ class FT8ConsoleDecoder:
                 ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
             ok, payload, iters = ft8_ldpc_decode(ch_llrs)
+            if self._debug:
+                if ok:
+                    print(f"    [ldpc] OK  ({iters} iters)", flush=True)
+                else:
+                    parity_errs = _ldpc_check(payload)
+                    if parity_errs == 0:
+                        # LDPC converged but CRC failed
+                        rx_crc_bits = payload[77:91]
+                        rx_crc = int(
+                            sum(int(b) << (13 - i)
+                                for i, b in enumerate(rx_crc_bits))
+                        )
+                        calc_crc = _ft8_crc14(payload[:77])
+                        print(
+                            f"    [ldpc] LDPC OK ({iters} iters) -- CRC mismatch"
+                            f"  rx=0x{rx_crc:04X}  calc=0x{calc_crc:04X}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"    [ldpc] FAIL  {parity_errs} parity errors"
+                            f"  ({iters} iters)",
+                            flush=True,
+                        )
             if not ok:
                 continue
 
             message = ft8_unpack_message(payload[:77])
+            if self._debug:
+                print(f"    [msg]  '{message}'", flush=True)
             if message in seen_msg:
                 continue
             seen_msg.add(message)
@@ -1393,7 +1473,7 @@ class FT8ConsoleDecoder:
             if self._debug:
                 print(
                     f"[FT8] {utc} DECODE f0={f0_hz:.1f}Hz t0={t0_s:+.2f}s "
-                    f"snr≈{snr_db:+.1f}dB iters={iters} '{message}'",
+                    f"snr={snr_db:+.1f}dB iters={iters} '{message}'",
                     flush=True,
                 )
 
