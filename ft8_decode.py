@@ -193,6 +193,50 @@ for _m, _row in enumerate(_BP_Nm):
         _BP_Mn[_n].append(_m)
 del _m, _row, _n
 
+# ---------------------------------------------------------------------------
+# A priori (AP) decode constants.
+# WSJT-X ft8b.f90 performs multiple BP passes with known structural bits clamped
+# to high-confidence LLRs, substantially improving convergence on marginal signals.
+# LLR convention: positive → bit = 1 more likely.
+# Bits 74-76 (MSB first) encode the i3 message type field in the 77-bit payload.
+# Bits 0-27 encode the first callsign n28a (MSB first).
+#   n28a=0 → DE   (bits 0-27 all 0)
+#   n28a=2 → CQ   (bits 0-25=0, bit 26=1, bit 27=0)
+# Bit 28 = ipa (portable/rover flag for n28a)
+# ---------------------------------------------------------------------------
+# AP LLR magnitude: applied after normalization to variance=24 (ftx_normalize_logl),
+# where the typical channel LLR magnitude for a correct decision is ~sqrt(24) ≈ 4.9.
+# A value of 50 (~10 sigma) acts as a near-certain prior for the constrained bits.
+_AP_LLR_MAGNITUDE: float = 50.0
+
+# Threshold: only run AP passes when baseline LDPC had this many or fewer parity
+# errors.  Signals with many parity errors are likely noise, not near-miss signals;
+# adding AP passes would waste time without improving decodes.
+_AP_PARITY_ERROR_THRESHOLD: int = 8
+
+# Common AP tuples (n28a encoding helpers)
+_AP_BITS_I3_1 = ((74, 0), (75, 0), (76, 1))   # i3 = 001
+_AP_BITS_I3_2 = ((74, 0), (75, 1), (76, 0))   # i3 = 010
+_AP_BITS_I3_0 = ((74, 0), (75, 0), (76, 0))   # i3 = 000
+# n28a=2 (CQ): 28-bit MSB-first encoding of 2 = ...00000010
+_AP_BITS_N28A_CQ = tuple((i, 0) for i in range(26)) + ((26, 1), (27, 0))   # type: ignore[assignment]
+# n28a=0 (DE): all 28 bits zero
+_AP_BITS_N28A_DE = tuple((i, 0) for i in range(28))   # type: ignore[assignment]
+
+# Each entry: (pass_name, tuple_of_(bit_index, bit_value) pairs)
+# Applied only to the 91 systematic bits (indices 0–90); must satisfy 0 ≤ bit_idx < 91.
+_AP_PASSES: tuple[tuple[str, tuple[tuple[int, int], ...]], ...] = (
+    # Generic message-type passes (3 known bits each – safe, low false-positive risk)
+    ("i3=1",     _AP_BITS_I3_1),
+    ("i3=2",     _AP_BITS_I3_2),
+    # CQ + standard type-1 (32 known bits: n28a=CQ, ipa=0, i3=1 – common on FT8 bands)
+    ("CQ+i3=1",  _AP_BITS_N28A_CQ + ((28, 0),) + _AP_BITS_I3_1),   # type: ignore[operator]
+    # DE + standard type-1 (32 known bits: n28a=DE, ipa=0, i3=1)
+    ("DE+i3=1",  _AP_BITS_N28A_DE + ((28, 0),) + _AP_BITS_I3_1),   # type: ignore[operator]
+    # Free-text / special sub-types (3 known bits)
+    ("i3=0",     _AP_BITS_I3_0),
+)
+
 
 def _compute_ft8_ldpc_free_cols() -> tuple[tuple[int, ...], tuple[int, ...]]:
     """GF(2) Gaussian elimination → free (systematic) and pivot (parity) columns."""
@@ -486,6 +530,7 @@ def ft8_ldpc_decode(
     llrs: np.ndarray,
     *,
     max_iterations: int = 50,
+    ap_assignments: Optional[tuple[tuple[int, int], ...]] = None,
 ) -> tuple[bool, np.ndarray, int, int]:
     """
     Sum-product LDPC decoder for the FT8 (174, 91) code.
@@ -510,6 +555,12 @@ def ft8_ldpc_decode(
     The −2·atanh sign is correct for the ft8_lib positive-means-1 LLR
     convention (verified empirically against the reference LDPC matrix).
 
+    ap_assignments: optional sequence of (bit_index, bit_value) pairs for
+    a priori information.  Each pair boosts codeword[bit_index] by
+    ±_AP_LLR_MAGNITUDE before BP begins (positive sign if bit_value=1,
+    negative if bit_value=0).  Only indices 0–90 (systematic bits) are
+    accepted; this matches the WSJT-X ft8b.f90 AP decode approach.
+
     Returns (success, payload[0:91], iterations_used, best_parity_errors).
     success=True only when all 83 parity checks pass AND CRC-14 matches.
     best_parity_errors is the minimum number of unsatisfied parity checks seen
@@ -518,6 +569,14 @@ def ft8_ldpc_decode(
     codeword = np.asarray(llrs, dtype=np.float64)
     if codeword.shape != (174,):
         raise ValueError(f"Expected (174,) LLRs, got {codeword.shape}")
+
+    # Apply a priori LLR boosts for known structural bits (e.g. i3 field).
+    # Only modify a copy so the caller's array is unchanged.
+    if ap_assignments:
+        codeword = codeword.copy()
+        for bit_idx, bit_val in ap_assignments:
+            if 0 <= bit_idx < 91:
+                codeword[bit_idx] += _AP_LLR_MAGNITUDE if bit_val else -_AP_LLR_MAGNITUDE
 
     N = 174
     CLAMP = 0.9999
@@ -1013,7 +1072,17 @@ def decode_wav(
                 if var > 1e-10:
                     ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
-                ok, payload, iters, _ = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
+                ok, payload, iters, _base_errs = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
+                # If baseline fails with very few parity errors (≤ 8 = near-miss real
+                # signal), try the most impactful AP passes only.
+                if not ok and _base_errs <= _AP_PARITY_ERROR_THRESHOLD:
+                    for _ap_name, _ap_bits in _AP_PASSES:
+                        ok, payload, iters, _ = ft8_ldpc_decode(
+                            ch_llrs, max_iterations=max_iterations,
+                            ap_assignments=_ap_bits,
+                        )
+                        if ok:
+                            break
                 if not ok:
                     continue
 
@@ -1320,7 +1389,7 @@ class FT8ConsoleDecoder:
         self.fmax_hz = float(fmax_hz)
         self._on_decode = on_decode
 
-        self._q: queue.Queue = queue.Queue(maxsize=32)
+        self._q: queue.Queue = queue.Queue(maxsize=200)  # 200 × 100 ms = 20 s buffer
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -1436,9 +1505,22 @@ class FT8ConsoleDecoder:
                 ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
             ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)
+            ap_pass_name = "none"
+            # If baseline fails with few parity errors (near-miss real signal),
+            # try AP passes for common message types.  Skip if too many errors
+            # (likely noise — AP won't help and would waste time).
+            if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
+                for _ap_name, _ap_bits in _AP_PASSES:
+                    ok, payload, iters, best_errors = ft8_ldpc_decode(
+                        ch_llrs, ap_assignments=_ap_bits
+                    )
+                    if ok:
+                        ap_pass_name = _ap_name
+                        break
             if self._debug:
                 if ok:
-                    print(f"    [ldpc] OK  ({iters} iters)", flush=True)
+                    ap_tag = f" ap={ap_pass_name}" if ap_pass_name != "none" else ""
+                    print(f"    [ldpc] OK  ({iters} iters{ap_tag})", flush=True)
                 else:
                     if best_errors == 0:
                         # LDPC converged but CRC failed

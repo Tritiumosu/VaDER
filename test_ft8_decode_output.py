@@ -13,6 +13,10 @@ Tests:
   8. decode_wav results — all messages have non-empty utc_time, message fields
   9. decode_wav results — known CQ message appears in live_ft8_traffic_2.wav
  10. decode_wav — standard message format (CALL1 CALL2 report) appears in results
+ 11. decode_wav with live_ft8_audio_sample_3.wav — produces decodable messages
+ 12. decode_wav sample_3 — all result fields are valid
+ 13. decode_wav sample_3 — CQ message appears
+ 14. decode_wav sample_3 — format_ft8_message produces valid lines for all results
 
 Run:  python test_ft8_decode_output.py
 """
@@ -142,41 +146,45 @@ run("6. format_ft8_message — SNR with sign prefix", t_snr_field_width)
 
 _WAV2 = os.path.join(os.path.dirname(__file__), "live_ft8_traffic_2.wav")
 
+# Decode once at module load time (shared by tests 7-10).
+# If the file is missing, _WAV2_RESULTS will be None and each test raises
+# FileNotFoundError with a clear message rather than failing silently.
+_WAV2_RESULTS: list | None = None
+if os.path.exists(_WAV2):
+    _WAV2_RESULTS = decode_wav(_WAV2)
+
 
 def t_decode_wav_produces_messages() -> str:
     """decode_wav on live_ft8_traffic_2.wav must return at least one message."""
-    if not os.path.exists(_WAV2):
+    if _WAV2_RESULTS is None:
         raise FileNotFoundError(f"Test file not found: {_WAV2}")
-    results_wav = decode_wav(_WAV2)
-    assert len(results_wav) > 0, "No messages decoded from live_ft8_traffic_2.wav"
-    return f"Decoded {len(results_wav)} messages from live_ft8_traffic_2.wav"
+    assert len(_WAV2_RESULTS) > 0, "No messages decoded from live_ft8_traffic_2.wav"
+    return f"Decoded {len(_WAV2_RESULTS)} messages from live_ft8_traffic_2.wav"
 
 run("7. decode_wav with live_ft8_traffic_2.wav — produces messages", t_decode_wav_produces_messages)
 
 
 def t_decode_wav_result_fields() -> str:
     """All FT8DecodeResult fields must be non-empty / valid types."""
-    if not os.path.exists(_WAV2):
+    if _WAV2_RESULTS is None:
         raise FileNotFoundError(f"Test file not found: {_WAV2}")
-    results_wav = decode_wav(_WAV2)
-    assert len(results_wav) > 0
-    for r in results_wav:
+    assert len(_WAV2_RESULTS) > 0
+    for r in _WAV2_RESULTS:
         assert isinstance(r.utc_time, str) and r.utc_time, f"Bad utc_time: {r.utc_time!r}"
         assert isinstance(r.strength_db, float), f"Bad strength_db type: {type(r.strength_db)}"
         assert isinstance(r.frequency_hz, float) and r.frequency_hz > 0, f"Bad freq: {r.frequency_hz}"
         assert isinstance(r.message, str) and r.message, f"Bad message: {r.message!r}"
-    return f"All {len(results_wav)} results have valid fields"
+    return f"All {len(_WAV2_RESULTS)} results have valid fields"
 
 run("8. decode_wav results — all fields are valid", t_decode_wav_result_fields)
 
 
 def t_decode_wav_has_cq() -> str:
     """At least one CQ message must be present in live_ft8_traffic_2.wav."""
-    if not os.path.exists(_WAV2):
+    if _WAV2_RESULTS is None:
         raise FileNotFoundError(f"Test file not found: {_WAV2}")
-    results_wav = decode_wav(_WAV2)
-    cq_msgs = [r for r in results_wav if r.message.startswith("CQ ")]
-    assert cq_msgs, f"No CQ messages found among: {[r.message for r in results_wav[:5]]}"
+    cq_msgs = [r for r in _WAV2_RESULTS if r.message.startswith("CQ ")]
+    assert cq_msgs, f"No CQ messages found among: {[r.message for r in _WAV2_RESULTS[:5]]}"
     return f"Found {len(cq_msgs)} CQ message(s): {cq_msgs[0].message!r}"
 
 run("9. decode_wav — CQ message appears in live_ft8_traffic_2.wav", t_decode_wav_has_cq)
@@ -184,11 +192,10 @@ run("9. decode_wav — CQ message appears in live_ft8_traffic_2.wav", t_decode_w
 
 def t_decode_wav_format_output() -> str:
     """format_ft8_message applied to decode_wav results produces standard FT8 lines."""
-    if not os.path.exists(_WAV2):
+    if _WAV2_RESULTS is None:
         raise FileNotFoundError(f"Test file not found: {_WAV2}")
-    results_wav = decode_wav(_WAV2)
-    assert len(results_wav) > 0
-    for r in results_wav:
+    assert len(_WAV2_RESULTS) > 0
+    for r in _WAV2_RESULTS:
         line = format_ft8_message(r.utc_time, r.strength_db, r.frequency_hz, r.message)
         parts = line.split()
         # Must have at least 4 parts: utc, snr, freq, message_start
@@ -199,13 +206,81 @@ def t_decode_wav_format_output() -> str:
         assert snr_str[1:].isdigit(), f"SNR non-digit after sign: {snr_str!r}"
         # Freq field (parts[2]) must contain '.'
         assert "." in parts[2], f"Freq missing decimal: {parts[2]!r}"
-    return f"format_ft8_message produces valid lines for all {len(results_wav)} results"
+    return f"format_ft8_message produces valid lines for all {len(_WAV2_RESULTS)} results"
 
 run("10. decode_wav — format_ft8_message produces valid lines for all results",
     t_decode_wav_format_output)
 
 
 # ---------------------------------------------------------------------------
+# decode_wav tests using live_ft8_audio_sample_3.wav
+# ---------------------------------------------------------------------------
+
+_WAV3 = os.path.join(os.path.dirname(__file__), "live_ft8_audio_sample_3.wav")
+
+# Decode sample_3 once at module load time (shared by tests 11-14).
+# If the file is missing, _WAV3_RESULTS will be None and each test raises
+# FileNotFoundError with a clear message rather than failing silently.
+_WAV3_RESULTS: list | None = None
+if os.path.exists(_WAV3):
+    _WAV3_RESULTS = decode_wav(_WAV3)
+
+
+def t_decode_wav3_produces_messages() -> str:
+    """decode_wav on live_ft8_audio_sample_3.wav must return at least one message."""
+    if _WAV3_RESULTS is None:
+        raise FileNotFoundError(f"Test file not found: {_WAV3}")
+    assert len(_WAV3_RESULTS) > 0, "No messages decoded from live_ft8_audio_sample_3.wav"
+    return f"Decoded {len(_WAV3_RESULTS)} messages from live_ft8_audio_sample_3.wav"
+
+run("11. decode_wav with live_ft8_audio_sample_3.wav — produces messages",
+    t_decode_wav3_produces_messages)
+
+
+def t_decode_wav3_result_fields() -> str:
+    """All FT8DecodeResult fields from sample_3 must be non-empty / valid types."""
+    if _WAV3_RESULTS is None:
+        raise FileNotFoundError(f"Test file not found: {_WAV3}")
+    assert len(_WAV3_RESULTS) > 0
+    for r in _WAV3_RESULTS:
+        assert isinstance(r.utc_time, str) and r.utc_time, f"Bad utc_time: {r.utc_time!r}"
+        assert isinstance(r.strength_db, float), f"Bad strength_db type: {type(r.strength_db)}"
+        assert isinstance(r.frequency_hz, float) and r.frequency_hz > 0, f"Bad freq: {r.frequency_hz}"
+        assert isinstance(r.message, str) and r.message, f"Bad message: {r.message!r}"
+    return f"All {len(_WAV3_RESULTS)} results have valid fields"
+
+run("12. decode_wav sample_3 — all result fields are valid", t_decode_wav3_result_fields)
+
+
+def t_decode_wav3_has_cq() -> str:
+    """At least one CQ message must be present in live_ft8_audio_sample_3.wav."""
+    if _WAV3_RESULTS is None:
+        raise FileNotFoundError(f"Test file not found: {_WAV3}")
+    cq_msgs = [r for r in _WAV3_RESULTS if r.message.startswith("CQ ")]
+    assert cq_msgs, f"No CQ messages found among: {[r.message for r in _WAV3_RESULTS[:5]]}"
+    return f"Found {len(cq_msgs)} CQ message(s): {cq_msgs[0].message!r}"
+
+run("13. decode_wav sample_3 — CQ message appears", t_decode_wav3_has_cq)
+
+
+def t_decode_wav3_format_output() -> str:
+    """format_ft8_message on sample_3 results produces valid standard FT8 lines."""
+    if _WAV3_RESULTS is None:
+        raise FileNotFoundError(f"Test file not found: {_WAV3}")
+    assert len(_WAV3_RESULTS) > 0
+    for r in _WAV3_RESULTS:
+        line = format_ft8_message(r.utc_time, r.strength_db, r.frequency_hz, r.message)
+        parts = line.split()
+        assert len(parts) >= 4, f"Malformed output line: {line!r}"
+        snr_str = parts[1]
+        assert snr_str[0] in ("+", "-"), f"SNR has no sign: {snr_str!r} in {line!r}"
+        assert snr_str[1:].isdigit(), f"SNR non-digit after sign: {snr_str!r}"
+        assert "." in parts[2], f"Freq missing decimal: {parts[2]!r}"
+    return f"format_ft8_message produces valid lines for all {len(_WAV3_RESULTS)} sample_3 results"
+
+run("14. decode_wav sample_3 — format_ft8_message produces valid lines for all results",
+    t_decode_wav3_format_output)
+
 print()
 passed = sum(1 for _, ok, _ in results if ok)
 failed = sum(1 for _, ok, _ in results if not ok)
