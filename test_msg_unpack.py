@@ -2,16 +2,20 @@
 Stage 5 message unpacker tests.
 
 We construct known 77-bit message payloads by hand (following the FT8
-bit-packing spec from pack77.f90) and verify ft8_unpack_message() produces
-the expected human-readable string.
+bit-packing spec from ft8_lib message.c) and verify ft8_unpack_message()
+produces the expected human-readable string.
 
 Tests:
   1. Standard type-1: callsign + callsign + grid
   2. Standard type-1: callsign + callsign + signal report
   3. Standard type-1: CQ + callsign + grid
-  4. Free text (i3=1): 'CQ DX' and similar
-  5. Telemetry (i3=4): hex payload
-  6. Round-trip: pack a known callsign integer, unpack, verify
+  4. CQ DX directed call
+  5. RRR acknowledgement
+  6. 73 final exchange
+  7. Free text (i3=0, n3=0)
+  8. Telemetry (i3=0, n3=4)
+  9. Callsign pack/unpack round-trip
+  10. Grid pack/unpack round-trip
 """
 import numpy as np
 import sys, os
@@ -20,7 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ft8_decode import (
     ft8_unpack_message,
     _unpack_callsign_28,
-    _unpack_grid_15,
+    _unpack_grid,
 )
 
 
@@ -33,129 +37,119 @@ def _int_to_bits(val: int, length: int) -> list[int]:
 
 
 def _pack_callsign_28(call: str) -> int:
-    """Pack a standard callsign into 28 bits (inverse of _unpack_callsign_28)."""
-    NBASE = 37 * 36 * 10 * 27 * 27 * 27   # 262177560
-
-    C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # c0: no space
-    C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # c1: space allowed
-    C27 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+    """Pack a standard callsign into a 28-bit integer (ft8_lib convention)."""
+    # ft8_lib constants
+    NTOKENS = 2063592
+    MAX22   = 4194304
+    C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # ALPHANUM_SPACE (space=0)
+    C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # ALPHANUM
+    C27 = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"            # LETTERS_SPACE (space=0)
     C10 = "0123456789"
 
     call = call.upper().strip()
 
     # Special tokens
-    if call == 'DE':    return NBASE
-    if call == 'QRZ':   return NBASE + 1
-    if call == 'CQ':    return NBASE + 2
+    if call == 'DE':    return 0
+    if call == 'QRZ':   return 1
+    if call == 'CQ':    return 2
     if call.startswith('CQ '):
         suffix = call[3:].strip()
         if suffix.isdigit() and len(suffix) <= 3:
-            return NBASE + 3 + int(suffix)
-        # 4-char alpha suffix (e.g. 'DX')
+            return 3 + int(suffix)
+        # alpha suffix (up to 4 chars A-Z)
         suffix = (suffix + '    ')[:4]
         m = 0
         for ch in suffix:
-            idx = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ '.index(ch) if ch in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ ' else 26
+            idx = C27.index(ch) if ch in C27 else 0
             m = m * 27 + idx
-        return NBASE + 3 + 1000 + m
+        return 1003 + m
 
-    # Standard callsign: find digit, split into prefix(2) + digit + suffix(3)
+    # Standard callsign: place digit at c6[2] (ft8_lib convention)
     digit_pos = next((i for i, ch in enumerate(call) if ch.isdigit()), -1)
-    if digit_pos < 0:
-        prefix, digit_c, suffix = '', '0', call[:3]
+    if digit_pos == 2 and len(call) <= 6:
+        c6 = (call + '      ')[:6]
+    elif digit_pos == 1 and len(call) <= 5:
+        c6 = ' ' + (call + '     ')[:5]
     else:
-        prefix, digit_c, suffix = call[:digit_pos], call[digit_pos], call[digit_pos+1:]
+        c6 = ' ' + (call + '     ')[:5]  # best-effort
 
-    # c0 must be in C36 (no space) — pad prefix to 2 using space for c1 only
-    prefix2 = (prefix + '  ')[:2]
-    suffix3  = (suffix  + '   ')[:3]
+    def i37(ch): return C37.index(ch) if ch in C37 else 0
+    def i36(ch): return C36.index(ch) if ch in C36 else 0
+    def i27(ch): return C27.index(ch) if ch in C27 else 0
+    def i10(ch): return C10.index(ch) if ch in C10 else 0
 
-    def idx36(ch): return C36.index(ch) if ch in C36 else 0
-    def idx37(ch): return C37.index(ch) if ch in C37 else 0
-    def idx27(ch): return C27.index(ch) if ch in C27 else 26
-    def idx10(ch): return C10.index(ch) if ch in C10 else 0
-
-    c = list(prefix2 + digit_c + suffix3)
-    n = idx36(c[0])
-    n = n * 37 + idx37(c[1])
-    n = n * 10 + idx10(c[2])
-    n = n * 27 + idx27(c[3])
-    n = n * 27 + idx27(c[4])
-    n = n * 27 + idx27(c[5])
-    return n
+    n = (i37(c6[0]) * 36 * 10 * 27 * 27 * 27 +
+         i36(c6[1]) * 10 * 27 * 27 * 27 +
+         i10(c6[2]) * 27 * 27 * 27 +
+         i27(c6[3]) * 27 * 27 +
+         i27(c6[4]) * 27 +
+         i27(c6[5]))
+    return NTOKENS + MAX22 + n
 
 
 
 def _pack_grid_15(grid: str) -> int:
-    """Pack a 4-char Maidenhead grid square or special token into 15 bits."""
+    """Pack a 4-char Maidenhead grid, report, or special token into 15 bits (ft8_lib convention).
+
+    Returns (igrid4, ir) where igrid4 is the 15-bit value and ir is the 1-bit R-flag.
+    For convenience, callers can unpack the tuple.
+    """
+    MAXGRID4 = 32400  # = 18*18*10*10
     grid = grid.upper().strip()
 
-    # Special tokens — checked BEFORE integer parse to avoid treating '73' as a report
-    if grid == 'RRR':  return 32767
-    if grid == 'RR73': return 32766
-    if grid == '73':   return 32765
+    if grid == 'RRR':  return MAXGRID4 + 2, 0
+    if grid == 'RR73': return MAXGRID4 + 3, 0
+    if grid == '73':   return MAXGRID4 + 4, 0
 
-    # Signal report e.g. '-15', '+05', '-24'..'+09'
-    # Only treat as report if the string looks like a signed/unsigned small integer
+    # Signal report: e.g. '+04', '-12', 'R+04'
     import re as _re
-    if _re.fullmatch(r'[+-]?\d{1,2}', grid):
+    ir = 0
+    s = grid
+    if s.startswith('R') and len(s) > 1 and s[1] in '+-0123456789':
+        ir = 1; s = s[1:]
+    if _re.fullmatch(r'[+-]?\d{1,2}', s):
         try:
-            db = int(grid)
-            # Valid FT8 signal report range is -24..+9 dB (encoded as n+35, 0..62)
-            return max(0, min(61, db + 35))
+            dd = int(s)
+            irpt = dd + 35
+            return MAXGRID4 + irpt, ir
         except ValueError:
             pass
 
-    if len(grid) < 4:
-        return 0
+    # Standard 4-letter grid
+    _GL = 'ABCDEFGHIJKLMNOPQR'
+    if len(grid) >= 4 and grid[0] in _GL and grid[1] in _GL and grid[2].isdigit() and grid[3].isdigit():
+        igrid4 = (_GL.index(grid[0]) * 18 + _GL.index(grid[1])) * 100 + int(grid[2]) * 10 + int(grid[3])
+        return igrid4, 0
 
-    G = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    _GRID_LETTERS = 'ABCDEFGHIJKLMNOPQR'
-    g1 = _GRID_LETTERS.index(grid[0]) if grid[0] in _GRID_LETTERS else 0
-    g2 = _GRID_LETTERS.index(grid[1]) if grid[1] in _GRID_LETTERS else 0
-    g3 = int(grid[2]) if grid[2].isdigit() else 0
-    g4 = int(grid[3]) if grid[3].isdigit() else 0
-
-    igrid = ((g1 * 18 + g2) * 10 + g3) * 10 + g4
-    return igrid + 63
+    return MAXGRID4 + 1, 0  # blank
 
 
 def _build_type1_bits(call1: str, r1: int, call2: str, r2: int,
-                       grid: str, n3: int = 0, i3: int = 0) -> np.ndarray:
+                       grid: str, i3: int = 1) -> np.ndarray:
     """
-    Build a 77-bit type-1 message bit array.
+    Build a 77-bit standard FT8 message bit array (ft8_lib convention).
 
-    FT8 77-bit layout (MSB-first, bits 0-76):
-      [0:28]   = call1 (28 bits)
-      [28]     = r1 flag (1 bit)
-      [29:57]  = call2 (28 bits)
-      [57]     = r2 flag (1 bit)
-      [58:73]  = grid/report (15 bits)
-      [73:74]  = spare (1 bit, set 0)  -- not n3; n3 is encoded in grid field
-      [74:77]  = i3 (3 bits)
-    Total = 28+1+28+1+15+1+3 = 77 bits.
-
-    For i3=0 the sub-type n3 is packed into the top 3 bits of the 15-bit
-    grid/report field, making the grid itself only 12 bits. For simplicity
-    we pack n3 into the grid integer's upper bits here.
+    77-bit layout (MSB-first, bits 0-76):
+      [0:28]   = n28a (28-bit callsign 1)
+      [28]     = ipa  (1 bit: /R or /P flag)
+      [29:57]  = n28b (28-bit callsign 2)
+      [57]     = ipb  (1 bit: /R or /P flag)
+      [58]     = ir   (1 bit: R-prefix on grid/report)
+      [59:74]  = igrid4 (15-bit grid/report value)
+      [74:77]  = i3   (3 bits; 1=standard, 2=standard+/P)
+    Total = 28+1+28+1+1+15+3 = 77 bits.
     """
-    c1 = _pack_callsign_28(call1)
-    c2 = _pack_callsign_28(call2)
-    g  = _pack_grid_15(grid)
-
-    # For i3=0: pack n3 into the upper 3 bits of the 15-bit grid field
-    # grid_field = (n3 << 12) | (g & 0x0FFF)  -- but g from _pack_grid_15
-    # is already the full 15-bit value; to keep it simple we leave n3=0
-    # for standard messages (grid uses all 15 bits when n3=0).
-    grid_field = g  # n3=0 means grid occupies all 15 bits
+    c1n = _pack_callsign_28(call1)
+    c2n = _pack_callsign_28(call2)
+    igrid4, ir = _pack_grid_15(grid)
 
     bits = (
-        _int_to_bits(c1, 28) +
+        _int_to_bits(c1n, 28) +
         [r1 & 1] +
-        _int_to_bits(c2, 28) +
+        _int_to_bits(c2n, 28) +
         [r2 & 1] +
-        _int_to_bits(grid_field, 15) +
-        [0] +                            # 1 spare bit
+        [ir & 1] +
+        _int_to_bits(igrid4, 15) +
         _int_to_bits(i3, 3)
     )
     assert len(bits) == 77, f"Expected 77 bits, got {len(bits)}"
@@ -231,7 +225,7 @@ print("  Test 6 PASSED")
 print("\nTest 7: free text (i3=1)")
 
 def _pack_free_text(text: str) -> np.ndarray:
-    """Pack up to 13 chars of free text into 71 bits using base-42 (i3=1 message)."""
+    """Pack up to 13 chars of free text into 71 bits using base-42 (i3=0,n3=0 message)."""
     _FT = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"   # 42 chars
     text = (text.upper() + ' ' * 13)[:13]
     n = 0
@@ -239,7 +233,8 @@ def _pack_free_text(text: str) -> np.ndarray:
         idx = _FT.index(ch) if ch in _FT else 0
         n = n * 42 + idx
     bits71 = _int_to_bits(n, 71)
-    bits77 = bits71 + [0, 0, 0] + _int_to_bits(1, 3)   # spare=0, i3=1
+    # i3=0, n3=0: bits[71:74]=000 (n3), bits[74:77]=000 (i3)
+    bits77 = bits71 + [0, 0, 0] + _int_to_bits(0, 3)   # n3=000, i3=000
     return np.array(bits77[:77], dtype=np.uint8)
 
 text_in = 'CQ W4ABC    '
@@ -256,7 +251,7 @@ print("\nTest 8: telemetry (i3=4)")
 
 telem_val = 0x12345678ABCDEF
 bits8 = np.array(
-    _int_to_bits(telem_val, 71) + _int_to_bits(0, 3) + _int_to_bits(4, 3),
+    _int_to_bits(telem_val, 71) + _int_to_bits(4, 3) + _int_to_bits(0, 3),
     dtype=np.uint8
 )
 msg8 = ft8_unpack_message(bits8)
@@ -280,9 +275,9 @@ print("  Test 9 PASSED")
 print("\nTest 10: grid pack/unpack round-trip")
 
 for grid in ['EN52', 'EM73', 'QF56', 'IO91', 'RRR', 'RR73', '73']:
-    n    = _pack_grid_15(grid)
-    back = _unpack_grid_15(n)
-    print(f"  '{grid}' → {n} → '{back}'")
+    igrid4, ir = _pack_grid_15(grid)
+    back = _unpack_grid(igrid4, ir)
+    print(f"  '{grid}' → igrid4={igrid4} ir={ir} → '{back}'")
     assert back == grid, f"Round-trip mismatch: '{grid}' → '{back}'"
 print("  Test 10 PASSED")
 

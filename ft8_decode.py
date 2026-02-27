@@ -589,17 +589,28 @@ def ft8_ldpc_decode(
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 8  Message Unpacker (77 bits → human string)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Reference: WSJT-X pack77.f90 / unpack77.f90 and ft8_lib pack77.cpp.
+# Reference: ft8_lib message.c (ftx_message_decode / pack28 / unpack28).
 #
-# 77-bit layout (i3 field at bits 74-76):
-#   i3=0  Standard QSO/CQ: [28 c1][1 R1][28 c2][1 R2][15 grid][1 spare][3 i3]
-#   i3=1  Free text:        [71 text][3 spare][3 i3]
-#   i3=2  EU VHF contest:   same layout as i3=0
-#   i3=3  ARRL Field Day:   [28 c1][1 R][28 c2][1 R][13 exch][3 spare][3 i3]
-#   i3=4  Telemetry:        [71 payload][3 spare][3 i3]
+# 77-bit layout — i3 field at bits 74-76:
+#   i3=1 or 2  Standard QSO/CQ: [28 n28a][1 ipa][28 n28b][1 ipb][1 ir][15 igrid4][3 i3]
+#   i3=0       sub-type via n3 (bits 71-73):
+#                n3=0: Free text [71 text][3 n3=000][3 i3=000]
+#                n3=1: DXpedition  n3=2: EU-VHF  n3=3: ARRL FD  n3=4: Telemetry
+#   i3=3       Non-standard call (58-bit hash pair)
+#   i3=4       WWROF contest
+#
+# ft8_lib constants (message.c):
+_NTOKENS: int = 2063592   # special tokens (DE/QRZ/CQ/CQ nnn/CQ a[bcd])
+_MAX22: int = 4194304     # 22-bit hash space (2^22)
+# Standard callsigns start at _NTOKENS + _MAX22 = 6257896
+_MAXGRID4: int = 32400    # = 18*18*10*10; values >= this are special/reports
 
-_C42 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/+-."
-_FREETEXT_CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
+# Character tables matching ft8_lib charn() / nchar():
+_C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # ALPHANUM_SPACE (37 chars, space=0)
+_C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # ALPHANUM (36 chars)
+_C27 = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"            # LETTERS_SPACE (27 chars, space=0)
+_C10 = "0123456789"
+_FREETEXT_CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"  # FULL (42 chars)
 _GRID_LETTERS = "ABCDEFGHIJKLMNOPQR"
 
 
@@ -610,67 +621,90 @@ def _bits_to_int(bits: np.ndarray, start: int, length: int) -> int:
     return val
 
 
-def _unpack_callsign_28(n: int) -> str:
-    """Decode a 28-bit packed standard callsign (ft8_lib / WSJT-X convention)."""
-    NBASE = 37 * 36 * 10 * 27 * 27 * 27   # 262 177 560
-    if n >= NBASE:
-        r = n - NBASE
-        if r == 0: return 'DE'
-        if r == 1: return 'QRZ'
-        if r == 2: return 'CQ'
-        if 3 <= r <= 1002:
-            return f'CQ {r - 3:03d}'
-        m = r - 1003
-        suffix = ''
-        for _ in range(4):
-            suffix = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ '[m % 27] + suffix
-            m //= 27
-        return f'CQ {suffix.strip()}'
-    C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    C27 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ "
-    C10 = "0123456789"
-    n, c5 = divmod(n, 27); c5 = C27[c5]
-    n, c4 = divmod(n, 27); c4 = C27[c4]
-    n, c3 = divmod(n, 27); c3 = C27[c3]
-    n, c2 = divmod(n, 10); c2 = C10[c2]
-    n, c1 = divmod(n, 37); c1 = C37[c1]
-    c0 = C36[n] if n < 36 else '?'
-    return (c0 + c1 + c2 + c3 + c4 + c5).replace(' ', '').strip() or '?'
+def _unpack_callsign_28(n28: int, ip: int = 0, i3: int = 1) -> str:
+    """
+    Decode a 28-bit packed callsign number to a string.
+
+    Matches ft8_lib unpack28() exactly:
+      n28 < _NTOKENS              → special token (DE/QRZ/CQ/CQ nnn/CQ a[bcd])
+      _NTOKENS ≤ n28 < _NTOKENS+_MAX22  → 22-bit hash (shown as <hash>)
+      n28 ≥ _NTOKENS+_MAX22      → standard callsign (decoded with character tables)
+
+    ip=1 appends '/R' (i3=1) or '/P' (i3=2) to indicate portable/rover operation.
+    """
+    if n28 < _NTOKENS:
+        if n28 == 0: return 'DE'
+        if n28 == 1: return 'QRZ'
+        if n28 == 2: return 'CQ'
+        if n28 <= 1002:
+            return f'CQ {n28 - 3:03d}'
+        if n28 <= 532443:
+            m = n28 - 1003
+            suffix = ''
+            for _ in range(4):
+                suffix = _C27[m % 27] + suffix
+                m //= 27
+            return f'CQ {suffix.strip()}'
+        return f'<token{n28}>'
+    if n28 < _NTOKENS + _MAX22:
+        return f'<{n28 - _NTOKENS:06X}>'
+    # Standard callsign
+    n = n28 - _NTOKENS - _MAX22
+    c5 = _C27[n % 27]; n //= 27
+    c4 = _C27[n % 27]; n //= 27
+    c3 = _C27[n % 27]; n //= 27
+    c2 = _C10[n % 10]; n //= 10
+    c1 = _C36[n % 36]; n //= 36
+    c0 = _C37[n] if n < 37 else '?'
+    call = (c0 + c1 + c2 + c3 + c4 + c5).strip()
+    if ip:
+        call += '/R' if i3 == 1 else '/P'
+    return call or '?'
 
 
-def _unpack_grid_15(n: int) -> str:
-    """Decode a 15-bit grid/report field."""
-    if n <= 62:
-        if n == 62: return 'RRR'
-        db = n - 35
-        return f'{db:+03d}'
-    if n == 32767: return 'RRR'
-    if n == 32766: return 'RR73'
-    if n == 32765: return '73'
-    if n == 32764: return 'RRR'
-    igrid = n - 63
-    if igrid < 0 or igrid >= 18 * 18 * 10 * 10:
-        return f'?{n}'
-    igrid, g4 = divmod(igrid, 10)
-    igrid, g3 = divmod(igrid, 10)
-    igrid, g2 = divmod(igrid, 18)
-    g1 = igrid
-    return _GRID_LETTERS[g1] + _GRID_LETTERS[g2] + str(g3) + str(g4)
+def _unpack_grid(igrid4: int, ir: int = 0) -> str:
+    """
+    Decode a 15-bit igrid4 value (plus 1-bit ir flag) to a grid/report string.
+
+    Matches ft8_lib unpackgrid():
+      igrid4 < 32400 : 4-letter Maidenhead locator, prefixed 'R' if ir=1
+      32402 / 32403 / 32404 : RRR / RR73 / 73
+      32405+ : signal report dB (dd = igrid4 − 32400 − 35), prefixed 'R' if ir=1
+      32400 / 32401 : blank (two-callsign-only message)
+    """
+    if igrid4 >= _MAXGRID4:
+        special = {_MAXGRID4 + 2: 'RRR', _MAXGRID4 + 3: 'RR73', _MAXGRID4 + 4: '73'}
+        if igrid4 in special:
+            return special[igrid4]
+        if igrid4 > _MAXGRID4 + 4:
+            dd = igrid4 - _MAXGRID4 - 35
+            report = f'{dd:+03d}'
+            return ('R' + report) if ir else report
+        return ''  # blank (32400 or 32401)
+    ig = igrid4
+    g4 = ig % 10; ig //= 10
+    g3 = ig % 10; ig //= 10
+    g2 = ig % 18; g1 = ig // 18
+    grid = _GRID_LETTERS[g1] + _GRID_LETTERS[g2] + str(g3) + str(g4)
+    return ('R' + grid) if ir else grid
 
 
-def _unpack_type1(bits: np.ndarray) -> str:
-    c1 = _unpack_callsign_28(_bits_to_int(bits, 0, 28))
-    r1 = int(bits[28])
-    c2 = _unpack_callsign_28(_bits_to_int(bits, 29, 28))
-    r2 = int(bits[57])
-    grid = _unpack_grid_15(_bits_to_int(bits, 58, 15))
-    if r1: c1 = 'R' + c1
-    if r2: c2 = 'R' + c2
-    return f'{c1} {c2} {grid}'
+def _unpack_type1(bits: np.ndarray, i3: int = 1) -> str:
+    """Decode a standard FT8 message (i3=1 or i3=2) from 77 bits."""
+    n28a = _bits_to_int(bits, 0, 28)
+    ipa  = int(bits[28])
+    n28b = _bits_to_int(bits, 29, 28)
+    ipb  = int(bits[57])
+    ir   = int(bits[58])
+    igrid4 = _bits_to_int(bits, 59, 15)   # bits 59-73
+    c1 = _unpack_callsign_28(n28a, ipa, i3)
+    c2 = _unpack_callsign_28(n28b, ipb, i3)
+    extra = _unpack_grid(igrid4, ir)
+    return f'{c1} {c2} {extra}'.strip()
 
 
 def _unpack_free_text(bits: np.ndarray) -> str:
+    """Decode 71-bit free text using 42-character alphabet (ft8_lib FT8_CHAR_TABLE_FULL)."""
     n = _bits_to_int(bits, 0, 71)
     chars = []
     for _ in range(13):
@@ -679,16 +713,8 @@ def _unpack_free_text(bits: np.ndarray) -> str:
     return ''.join(reversed(chars)).strip()
 
 
-def _unpack_compound_call_58(bits: np.ndarray, start: int) -> str:
-    n = _bits_to_int(bits, start, 58)
-    chars = []
-    for _ in range(11):
-        n, r = divmod(n, 42)
-        chars.append(_C42[r] if r < len(_C42) else '?')
-    return ''.join(reversed(chars)).strip()
-
-
 def _unpack_telemetry(bits: np.ndarray) -> str:
+    """Decode 71-bit telemetry payload as hex string."""
     return f'TELEMETRY:{_bits_to_int(bits, 0, 71):018X}'
 
 
@@ -702,32 +728,40 @@ def ft8_unpack_message(msg_bits: np.ndarray) -> str:
 
     Returns
     -------
-    str  e.g. 'W4ABC K9XYZ EN52', 'CQ W4ABC EM73', 'TELEMETRY:...'
+    str  e.g. 'W4ABC K9XYZ EN52', 'CQ W4ABC EM73', 'CQ DX5ABC +04'
     """
     msg_bits = np.asarray(msg_bits, dtype=np.uint8)
     if msg_bits.shape != (77,):
         return f'?bad_len={len(msg_bits)}'
     i3 = _bits_to_int(msg_bits, 74, 3)
+    if i3 == 1 or i3 == 2:
+        # Standard message: two callsigns + grid/report
+        return _unpack_type1(msg_bits, i3)
     if i3 == 0:
-        return _unpack_type1(msg_bits)
-    elif i3 == 1:
-        return _unpack_free_text(msg_bits)
-    elif i3 == 2:
-        return 'EU-VHF ' + _unpack_type1(msg_bits)
-    elif i3 == 3:
-        c1 = _unpack_callsign_28(_bits_to_int(msg_bits, 0, 28))
-        r1 = int(msg_bits[28])
-        c2 = _unpack_callsign_28(_bits_to_int(msg_bits, 29, 28))
-        r2 = int(msg_bits[57])
-        exch = _bits_to_int(msg_bits, 58, 13)
-        if r1: c1 = 'R' + c1
-        if r2: c2 = 'R' + c2
-        return f'FD {c1} {c2} {exch}'
-    elif i3 == 4:
-        return _unpack_telemetry(msg_bits)
-    else:
+        # Sub-type determined by n3 field (bits 71-73)
+        n3 = _bits_to_int(msg_bits, 71, 3)
+        if n3 == 0:
+            return _unpack_free_text(msg_bits)
+        if n3 == 1:
+            return 'DXPEDITION ' + _unpack_type1(msg_bits, i3=1)
+        if n3 == 2:
+            return 'EU-VHF ' + _unpack_type1(msg_bits, i3=2)
+        if n3 == 3:
+            # ARRL Field Day: [28 c1][1 R][28 c2][1 R][13 exch][3 n3][3 i3]
+            c1 = _unpack_callsign_28(_bits_to_int(msg_bits, 0, 28))
+            c2 = _unpack_callsign_28(_bits_to_int(msg_bits, 29, 28))
+            exch = _bits_to_int(msg_bits, 58, 13)
+            return f'FD {c1} {c2} {exch}'
+        if n3 == 4:
+            return _unpack_telemetry(msg_bits)
+        return f'?i3=0,n3={n3}'
+    if i3 == 3:
+        # Non-standard call (58-bit hash pair)
         raw = _bits_to_int(msg_bits, 0, 77)
-        return f'?i3={i3}:{raw:020X}'
+        return f'NONSTD:{raw:021X}'
+    # i3=4 (WWROF) and others
+    raw = _bits_to_int(msg_bits, 0, 77)
+    return f'?i3={i3}:{raw:021X}'
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
