@@ -77,7 +77,7 @@ def full_pipeline(cw, sig=100.0, noise=1.0):
     # Pass channel LLRs directly to LDPC decoder — no deinterleaving needed
     # because _LDPC_CHECKS indices are already in transmission order (ft8_lib
     # kFTX_LDPC_Nm, 0-based).
-    return ft8_ldpc_decode(ch_llrs)
+    return ft8_ldpc_decode(ch_llrs)[:3]
 
 results = []
 
@@ -99,7 +99,7 @@ msg1 = rng.integers(0, 2, size=77, dtype=np.uint8)
 cw1  = encode_ft8(msg1)
 cw_llrs = np.where(cw1==0, -10.0, 10.0).astype(np.float64)
 cw_llrs[128:] = 0.0
-ok2, pl2, it2 = ft8_ldpc_decode(cw_llrs)
+ok2, pl2, it2, _ = ft8_ldpc_decode(cw_llrs)
 p = PASS if ok2 and np.all(pl2[:77] == msg1) else FAIL
 results.append(p)
 print(f"[{p}] Direct codeword LLRs (erased 128-173)  ok={ok2} iters={it2}")
