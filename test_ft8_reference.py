@@ -301,9 +301,12 @@ run("10. _LDPC_CHECKS matches ft8_lib kFTX_LDPC_Nm (0-based)", t_ldpc_matrix_fro
 def t_ap_decode_i3_known():
     """AP decode: knowing i3=1 (3 bits) marginally helps for borderline signals."""
     from ft8_decode import _AP_PASSES, _AP_LLR_MAGNITUDE
-    # Verify the AP magnitude is positive and reasonable
+    # AP magnitude must be large relative to typical channel LLR (~sqrt(24) ≈ 4.9)
+    # to act as a strong prior; at least 2× is required to be meaningful.
     assert _AP_LLR_MAGNITUDE > 0, "AP magnitude must be positive"
-    assert _AP_LLR_MAGNITUDE >= 10.0, f"AP magnitude {_AP_LLR_MAGNITUDE} too small"
+    assert _AP_LLR_MAGNITUDE >= 10.0, (
+        f"AP magnitude {_AP_LLR_MAGNITUDE} too small (need ≥ 2× typical channel LLR ~4.9)"
+    )
     # Verify AP passes list has expected entries
     names = [name for name, _ in _AP_PASSES]
     assert "i3=1" in names, f"'i3=1' AP pass missing from {names}"
@@ -343,7 +346,8 @@ def t_ap_decode_cq_improves_near_miss():
     assert cq_bits_dict.get(26) == 1, "CQ AP bit 26 should be 1 (n28a=2)"
     assert cq_bits_dict.get(27) == 0, "CQ AP bit 27 should be 0 (n28a=2)"
     assert cq_bits_dict.get(76) == 1, "CQ AP bit 76 should be 1 (i3 LSB=1 for type 1)"
-    # Simulate a CQ-type message at borderline SNR and count AP improvement
+    # Simulate a CQ-type message at borderline SNR (sig=4, noise_scale=2.2 chosen
+    # to produce ~70-80% baseline decode rate, creating near-miss cases for AP).
     rng = np.random.default_rng(12345)
     successes_baseline = 0
     successes_cq_ap = 0
@@ -355,9 +359,9 @@ def t_ap_decode_cq_improves_near_miss():
         msg[26] = 1; msg[27] = 0; msg[28] = 0; msg[74] = 0; msg[75] = 0; msg[76] = 1
         cw = encode_ft8(msg)
         tones = cw_to_tones_ft8lib(cw)
-        E = tones_to_E(tones, sig=4.0, noise=1.0)  # borderline SNR
+        E = tones_to_E(tones, sig=4.0, noise=1.0)
         _, llrs = ft8_gray_decode(np.argmax(E, axis=1), E)
-        noise = rng.standard_normal(174) * 2.2
+        noise = rng.standard_normal(174) * 2.2   # borderline SNR (~70-80% baseline rate)
         llrs_noisy = normalize_llrs(llrs + noise)
         ok_base, _, _, _ = ft8_ldpc_decode(llrs_noisy, max_iterations=50)
         ok_cq, _, _, _ = ft8_ldpc_decode(llrs_noisy, max_iterations=50, ap_assignments=cq_ap)
@@ -373,7 +377,6 @@ def t_ap_decode_cq_improves_near_miss():
         f"improvement: +{improvement} decodes ✓"
     )
 run("12. AP decode: CQ+i3=1 pass improves near-miss decodes (WSJT-X AP strategy)", t_ap_decode_cq_improves_near_miss)
-
 
 print()
 passed = sum(1 for _, ok, _ in results if ok)

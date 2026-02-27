@@ -204,7 +204,15 @@ del _m, _row, _n
 #   n28a=2 → CQ   (bits 0-25=0, bit 26=1, bit 27=0)
 # Bit 28 = ipa (portable/rover flag for n28a)
 # ---------------------------------------------------------------------------
-_AP_LLR_MAGNITUDE: float = 50.0   # strong prior in normalized (var=24) LLR domain
+# AP LLR magnitude: applied after normalization to variance=24 (ftx_normalize_logl),
+# where the typical channel LLR magnitude for a correct decision is ~sqrt(24) ≈ 4.9.
+# A value of 50 (~10 sigma) acts as a near-certain prior for the constrained bits.
+_AP_LLR_MAGNITUDE: float = 50.0
+
+# Threshold: only run AP passes when baseline LDPC had this many or fewer parity
+# errors.  Signals with many parity errors are likely noise, not near-miss signals;
+# adding AP passes would waste time without improving decodes.
+_AP_PARITY_ERROR_THRESHOLD: int = 8
 
 def _ap(bit_val_pairs: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
     """Pass-through helper to clarify intent when building AP tuples."""
@@ -1071,7 +1079,7 @@ def decode_wav(
                 ok, payload, iters, _base_errs = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
                 # If baseline fails with very few parity errors (≤ 8 = near-miss real
                 # signal), try the most impactful AP passes only.
-                if not ok and _base_errs <= 8:
+                if not ok and _base_errs <= _AP_PARITY_ERROR_THRESHOLD:
                     for _ap_name, _ap_bits in _AP_PASSES:
                         ok, payload, iters, _ = ft8_ldpc_decode(
                             ch_llrs, max_iterations=max_iterations,
@@ -1505,7 +1513,7 @@ class FT8ConsoleDecoder:
             # If baseline fails with few parity errors (near-miss real signal),
             # try AP passes for common message types.  Skip if too many errors
             # (likely noise — AP won't help and would waste time).
-            if not ok and best_errors <= 8:
+            if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
                 for _ap_name, _ap_bits in _AP_PASSES:
                     ok, payload, iters, best_errors = ft8_ldpc_decode(
                         ch_llrs, ap_assignments=_ap_bits
