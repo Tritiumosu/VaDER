@@ -1,6 +1,11 @@
 """
-test_pipeline_e2e.py  — End-to-end pipeline test with real TX interleaver.
-Tests the full encode -> interleave -> Gray -> normalise -> deinterleave -> BP path.
+test_pipeline_e2e.py  — End-to-end pipeline test matching ft8_lib reference.
+Tests the full encode -> Gray -> normalise -> BP path without interleaving.
+
+Reference: ft8_lib bp_decode() takes channel LLRs directly (no deinterleave).
+The _LDPC_CHECKS matrix uses column indices in transmission order (ft8_lib
+kFTX_LDPC_Nm, 0-based), so no permutation is needed between Gray decode and
+LDPC decode.
 Run:  python test_pipeline_e2e.py
 """
 import sys, math, numpy as np
@@ -8,7 +13,7 @@ sys.path.insert(0, '.')
 from ft8_decode import (
     _LDPC_CHECKS, _FT8_GRAY_DECODE, _ft8_crc14,
     ft8_gray_decode, ft8_ldpc_decode, ft8_unpack_message,
-    _ldpc_check, _FT8_BIT_REV7_TABLE,
+    _ldpc_check,
 )
 
 PASS = "PASS"; FAIL = "FAIL"
@@ -45,11 +50,11 @@ _gray_fwd = [0]*8
 for _tone, _gv in enumerate(_FT8_GRAY_DECODE): _gray_fwd[_gv] = _tone
 
 def encode_to_tones(cw):
-    """codeword -> TX-interleaved bits -> 58 Gray-coded tones"""
-    tx = np.array([cw[_FT8_BIT_REV7_TABLE[i]] for i in range(174)], dtype=np.uint8)
+    """codeword -> 58 Gray-coded tones (ft8_lib convention: no interleaver).
+    Codeword bits 3*s, 3*s+1, 3*s+2 are read sequentially for tone s."""
     tones = []
     for s in range(58):
-        gv = (int(tx[3*s])<<2) | (int(tx[3*s+1])<<1) | int(tx[3*s+2])
+        gv = (int(cw[3*s])<<2) | (int(cw[3*s+1])<<1) | int(cw[3*s+2])
         tones.append(_gray_fwd[gv])
     return np.array(tones, dtype=np.int32)
 
@@ -59,32 +64,36 @@ def tones_to_E(tones, sig=100.0, noise=1.0):
     return E
 
 def full_pipeline(cw, sig=100.0, noise=1.0):
-    """Encode codeword -> simulate channel -> decode. Returns (ok, payload, iters)."""
+    """Encode codeword -> simulate channel -> decode. Returns (ok, payload, iters).
+    Matches ft8_lib: no interleaver in encoder, no deinterleave before bp_decode."""
     tones = encode_to_tones(cw)
     E = tones_to_E(tones, sig=sig, noise=noise)
     syms = np.argmax(E, axis=1)
     _, ch_llrs = ft8_gray_decode(syms, E)
-    # normalise all 174 channel LLRs to variance=24
+    # normalise all 174 channel LLRs to variance=24 (ft8_lib ftx_normalize_logl)
     var = float(np.var(ch_llrs))
     if var > 1e-10:
         ch_llrs = ch_llrs * math.sqrt(24.0 / var)
-    # de-interleave
-    cw_llrs = np.zeros(174, dtype=np.float64)
-    for i in range(174):
-        cw_llrs[_FT8_BIT_REV7_TABLE[i]] = ch_llrs[i]
-    return ft8_ldpc_decode(cw_llrs)
+    # Pass channel LLRs directly to LDPC decoder — no deinterleaving needed
+    # because _LDPC_CHECKS indices are already in transmission order (ft8_lib
+    # kFTX_LDPC_Nm, 0-based).
+    return ft8_ldpc_decode(ch_llrs)
 
 results = []
 
-# ── Test 1: All-zeros codeword ─────────────────────────────────────────────
-msg0 = np.zeros(77, dtype=np.uint8)
+# ── Test 1: Simple known codeword (non-zero message) ──────────────────────
+# Note: all-zeros message is rejected by ft8_lib bp_decode (plain_sum==0 check),
+# matching the reference behavior. Use a non-trivial message instead.
+msg0 = np.array([1,0,1,0,0,1,1,0]*9 + [1,0,1,0,1], dtype=np.uint8)[:77]
 cw0  = encode_ft8(msg0)
 ok, pl, it = full_pipeline(cw0)
 p = PASS if ok and np.all(pl[:77] == msg0) else FAIL
 results.append(p)
-print(f"[{p}] All-zeros codeword  ok={ok} iters={it}")
+print(f"[{p}] Known non-zero codeword  ok={ok} iters={it}")
 
-# ── Test 2: Direct codeword LLRs (no interleaver) ──────────────────────────
+# ── Test 2: Direct codeword LLRs (ft8_lib convention, no interleaver) ─────────
+# Pass LLRs directly corresponding to codeword bit values. Positions 128..173
+# are set to 0 (erased/uninformative); the BP decoder infers them from the checks.
 rng = np.random.default_rng(42)
 msg1 = rng.integers(0, 2, size=77, dtype=np.uint8)
 cw1  = encode_ft8(msg1)
