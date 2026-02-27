@@ -1181,48 +1181,32 @@ def ft8_extract_payload_symbols(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Stage 2a — Pull the 58 payload symbol rows out of the full (79, 8) energy
-    matrix and apply the tone-index correction determined during sync.
+    matrix.
+
+    Matches ft8_lib ft8_extract_symbol() / ft8_decode.cpp:
+      The payload energies are extracted directly at the already-found (t0, f0).
+      No column reordering is applied here.  The 'shift' and 'inverted'
+      parameters from the Costas check are used only during sync candidate
+      evaluation; they do NOT modify the energy matrix for decoding.
+      (ft8_lib never applies a tone-index permutation to E_payload.)
 
     Parameters
     ----------
     E79      : (79, 8) energy matrix from FT8SymbolEnergyExtractor.extract_all_79()
-    shift    : tone-index shift from Costas check (0..7)
-    inverted : whether tones are frequency-inverted (k -> 7-k)
+    shift    : unused — kept for API compatibility; not applied to E_payload
+    inverted : unused — kept for API compatibility; not applied to E_payload
 
     Returns
     -------
-    E_payload : (58, 8)  — energy matrix for the 58 payload symbols, tone-axis
-                           corrected for shift and inversion.
-    hard_syms : (58,)    — hard-decision tone index (0..7) for each payload symbol,
-                           after shift/inversion correction.
-
-    Tone correction
-    ---------------
-    During sync we found that the received tone index ``r`` maps to the true
-    FT8 tone ``t`` as:
-        if not inverted:  t = (r - shift) % 8
-        if inverted:      t = 7 - ((r - shift) % 8)   (equivalent to 7-r then shift)
-    We reorder the energy columns so that column k of E_payload corresponds to
-    true FT8 tone k, making downstream Gray decoding straightforward.
+    E_payload : (58, 8)  — raw energy matrix for the 58 payload symbols
+    hard_syms : (58,)    — hard-decision tone index (0..7) per payload symbol
     """
     E79 = np.asarray(E79, dtype=np.float64)
     if E79.shape != (79, 8):
         raise ValueError(f"E79 must be shape (79, 8), got {E79.shape}")
 
-    # Extract the 58 payload rows
-    E_raw = E79[list(FT8_PAYLOAD_POSITIONS), :]   # (58, 8)
-
-    # Build a column-permutation that maps received tone index → true FT8 tone
-    # received column r  →  true tone t
-    perm = np.empty(8, dtype=np.intp)
-    for r in range(8):
-        if inverted:
-            t = (7 - r - shift) % 8
-        else:
-            t = (r - shift) % 8
-        perm[t] = r   # column perm[t] of E_raw is true tone t
-
-    E_payload = E_raw[:, perm]                     # (58, 8), columns = true tone 0..7
+    # Extract the 58 payload rows — no column permutation (reference behaviour)
+    E_payload = E79[list(FT8_PAYLOAD_POSITIONS), :].copy()   # (58, 8)
     hard_syms = np.argmax(E_payload, axis=1).astype(np.int32)  # (58,)
 
     return E_payload, hard_syms
@@ -2215,25 +2199,34 @@ class FT8ConsoleDecoder:
                     # differences are used — no per-symbol normalisation.
                     hard_bits_ch, channel_llrs = ft8_gray_decode(syms_interleaved, E_interleaved)
 
+                    # ── Stage 2b: Bit de-interleave — ft8_lib decode.cpp ─────────────
+                    # channel_llrs[i] is the LLR for transmitted bit i (0..173).
+                    # The LDPC check matrix _LDPC_CHECKS uses codeword bit indices.
+                    # Reference mapping (ft8_lib):
+                    #   codeword_llr[bit_rev7(i)] = channel_llr[i]  for i in 0..173
+                    # Codeword positions not targeted by any bit_rev7(i) (i.e. 128..173,
+                    # which are always-erased parity bits) remain 0 (erased).
+                    codeword_llrs = np.zeros(174, dtype=np.float64)
+                    for i in range(174):
+                        codeword_llrs[_FT8_BIT_REV7_TABLE[i]] = channel_llrs[i]
+
                     # ── Stage 3b: Normalise — ft8_lib ftx_normalize_logl ─────────────
-                    # Scale ALL 174 channel LLRs so variance = 24.  This matches
+                    # Scale ALL 174 codeword LLRs so variance = 24.  This matches
                     # ft8_lib ftx_normalize_logl() called before bp_decode().
-                    llr_var = float(np.var(channel_llrs))
+                    llr_var = float(np.var(codeword_llrs))
                     if llr_var > 1e-10:
-                        channel_llrs = channel_llrs * math.sqrt(24.0 / llr_var)
+                        codeword_llrs = codeword_llrs * math.sqrt(24.0 / llr_var)
 
                     if self._debug:
-                        llr_mag_mean = float(np.mean(np.abs(channel_llrs)))
+                        llr_mag_mean = float(np.mean(np.abs(codeword_llrs)))
                         print(
-                             f"{utc}  llrs mean_|LLR|={llr_mag_mean:.2f}",
+                             f"{utc}  llrs (deint) mean_|LLR|={llr_mag_mean:.2f}",
                              flush=True,
                         )
 
                     # ── Stage 4: LDPC decode → 91 bits ───────────────────────
-                    # Pass channel LLRs directly to bp_decode (ft8_lib convention:
-                    # no deinterleaving needed because _LDPC_CHECKS column indices
-                    # are already in transmission order, matching ft8_lib kFTX_LDPC_Nm).
-                    ldpc_ok, codeword, ldpc_iters = ft8_ldpc_decode(channel_llrs)
+                    # codeword_llrs are now in codeword order, matching _LDPC_CHECKS.
+                    ldpc_ok, codeword, ldpc_iters = ft8_ldpc_decode(codeword_llrs)
 
                     if self._debug or ldpc_ok:
                         status = "PASS" if ldpc_ok else "FAIL"
