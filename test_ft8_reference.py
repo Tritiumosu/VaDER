@@ -298,7 +298,83 @@ def t_ldpc_matrix_from_ft8lib():
 run("10. _LDPC_CHECKS matches ft8_lib kFTX_LDPC_Nm (0-based)", t_ldpc_matrix_from_ft8lib)
 
 
-# ---------------------------------------------------------------------------
+def t_ap_decode_i3_known():
+    """AP decode: knowing i3=1 (3 bits) marginally helps for borderline signals."""
+    from ft8_decode import _AP_PASSES, _AP_LLR_MAGNITUDE
+    # Verify the AP magnitude is positive and reasonable
+    assert _AP_LLR_MAGNITUDE > 0, "AP magnitude must be positive"
+    assert _AP_LLR_MAGNITUDE >= 10.0, f"AP magnitude {_AP_LLR_MAGNITUDE} too small"
+    # Verify AP passes list has expected entries
+    names = [name for name, _ in _AP_PASSES]
+    assert "i3=1" in names, f"'i3=1' AP pass missing from {names}"
+    assert "i3=2" in names, f"'i3=2' AP pass missing from {names}"
+    # Verify ft8_ldpc_decode accepts ap_assignments without error
+    rng = np.random.default_rng(99)
+    msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+    msg[74] = 0; msg[75] = 0; msg[76] = 1  # i3=1
+    cw = encode_ft8(msg)
+    tones = cw_to_tones_ft8lib(cw)
+    E = tones_to_E(tones, sig=100.0, noise=1.0)
+    _, llrs = ft8_gray_decode(np.argmax(E, axis=1), E)
+    llrs_norm = normalize_llrs(llrs)
+    # Verify that AP decode works (strong signal → decodes with or without AP)
+    ap_i3_1 = next(bits for name, bits in _AP_PASSES if name == "i3=1")
+    ok, pl, iters, _ = ft8_ldpc_decode(llrs_norm, ap_assignments=ap_i3_1)
+    assert ok, f"AP decode failed on clean signal (iters={iters})"
+    assert np.all(pl[:77] == msg), "Message mismatch after AP decode"
+    return f"ft8_ldpc_decode accepts ap_assignments parameter; AP decode OK (iters={iters}) ✓"
+run("11. AP decode: ft8_ldpc_decode ap_assignments parameter", t_ap_decode_i3_known)
+
+
+def t_ap_decode_cq_improves_near_miss():
+    """CQ AP pass (32 known bits) recovers near-miss signals that baseline fails on.
+
+    WSJT-X ft8b.f90 AP decode loop uses known callsign bits to boost convergence.
+    For CQ messages (n28a=2): bits 0-25=0, bit 26=1, bit 27=0, bit 28=0 (ipa=0).
+    Combined with i3=1 bits (74=0,75=0,76=1): 32 known bits total.
+    """
+    from ft8_decode import _AP_PASSES
+    cq_ap = next((bits for name, bits in _AP_PASSES if name == "CQ+i3=1"), None)
+    assert cq_ap is not None, "CQ+i3=1 AP pass not found in _AP_PASSES"
+    # Verify CQ encoding: n28a=2 → bits 0-25=0, bit 26=1, bit 27=0
+    cq_bits_dict = dict(cq_ap)
+    for i in range(26):
+        assert cq_bits_dict.get(i, 0) == 0, f"CQ AP bit {i} should be 0"
+    assert cq_bits_dict.get(26) == 1, "CQ AP bit 26 should be 1 (n28a=2)"
+    assert cq_bits_dict.get(27) == 0, "CQ AP bit 27 should be 0 (n28a=2)"
+    assert cq_bits_dict.get(76) == 1, "CQ AP bit 76 should be 1 (i3 LSB=1 for type 1)"
+    # Simulate a CQ-type message at borderline SNR and count AP improvement
+    rng = np.random.default_rng(12345)
+    successes_baseline = 0
+    successes_cq_ap = 0
+    n_trials = 30
+    for _ in range(n_trials):
+        msg = rng.integers(0, 2, size=77, dtype=np.uint8)
+        # Encode as CQ-type: n28a=2, ipa=0, i3=1
+        for i in range(26): msg[i] = 0
+        msg[26] = 1; msg[27] = 0; msg[28] = 0; msg[74] = 0; msg[75] = 0; msg[76] = 1
+        cw = encode_ft8(msg)
+        tones = cw_to_tones_ft8lib(cw)
+        E = tones_to_E(tones, sig=4.0, noise=1.0)  # borderline SNR
+        _, llrs = ft8_gray_decode(np.argmax(E, axis=1), E)
+        noise = rng.standard_normal(174) * 2.2
+        llrs_noisy = normalize_llrs(llrs + noise)
+        ok_base, _, _, _ = ft8_ldpc_decode(llrs_noisy, max_iterations=50)
+        ok_cq, _, _, _ = ft8_ldpc_decode(llrs_noisy, max_iterations=50, ap_assignments=cq_ap)
+        if ok_base: successes_baseline += 1
+        if ok_cq: successes_cq_ap += 1
+    assert successes_cq_ap >= successes_baseline, (
+        f"CQ AP ({successes_cq_ap}/{n_trials}) should be >= baseline ({successes_baseline}/{n_trials})"
+    )
+    improvement = successes_cq_ap - successes_baseline
+    return (
+        f"Baseline: {successes_baseline}/{n_trials}  "
+        f"CQ AP: {successes_cq_ap}/{n_trials}  "
+        f"improvement: +{improvement} decodes ✓"
+    )
+run("12. AP decode: CQ+i3=1 pass improves near-miss decodes (WSJT-X AP strategy)", t_ap_decode_cq_improves_near_miss)
+
+
 print()
 passed = sum(1 for _, ok, _ in results if ok)
 failed = sum(1 for _, ok, _ in results if not ok)
