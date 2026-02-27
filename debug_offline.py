@@ -40,7 +40,7 @@ def run_debug():
 
     # 3. LDPC Decode
     # Try Normal
-    ok, payload, iters = ft8_ldpc_decode(codeword_llrs, max_iterations=200)
+    ok, payload, iters, _ = ft8_ldpc_decode(codeword_llrs, max_iterations=200)
     print(f"Normal Decode: OK={ok} Iters={iters}")
     if ok:
         msg = ft8_unpack_message(payload[:77])
@@ -48,7 +48,7 @@ def run_debug():
 
     # Try LLR Sign Flip
     print("\n--- Trying Sign Flip ---")
-    ok, payload, iters = ft8_ldpc_decode(-codeword_llrs, max_iterations=200)
+    ok, payload, iters, _ = ft8_ldpc_decode(-codeword_llrs, max_iterations=200)
     print(f"Inverted Decode: OK={ok} Iters={iters}")
     if ok:
         msg = ft8_unpack_message(payload[:77])
@@ -71,7 +71,7 @@ def run_debug():
     codeword_llrs_sw[mask] = llrs_swapped[deint_map[mask]]
 
     print("\n--- Trying Bit Order Swap (LSB-first) ---")
-    ok, payload, iters = ft8_ldpc_decode(codeword_llrs_sw, max_iterations=200)
+    ok, payload, iters, _ = ft8_ldpc_decode(codeword_llrs_sw, max_iterations=200)
     print(f"Swap Decode: OK={ok} Iters={iters}")
     if ok:
         msg = ft8_unpack_message(payload[:77])
@@ -79,7 +79,7 @@ def run_debug():
 
      # Try Bit Order Swap AND Invert
     print("\n--- Trying Bit Order Swap + Invert ---")
-    ok, payload, iters = ft8_ldpc_decode(-codeword_llrs_sw, max_iterations=200)
+    ok, payload, iters, _ = ft8_ldpc_decode(-codeword_llrs_sw, max_iterations=200)
     print(f"Swap+Inv Decode: OK={ok} Iters={iters}")
     if ok:
         msg = ft8_unpack_message(payload[:77])

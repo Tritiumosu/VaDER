@@ -486,7 +486,7 @@ def ft8_ldpc_decode(
     llrs: np.ndarray,
     *,
     max_iterations: int = 50,
-) -> tuple[bool, np.ndarray, int]:
+) -> tuple[bool, np.ndarray, int, int]:
     """
     Sum-product LDPC decoder for the FT8 (174, 91) code.
 
@@ -510,8 +510,10 @@ def ft8_ldpc_decode(
     The −2·atanh sign is correct for the ft8_lib positive-means-1 LLR
     convention (verified empirically against the reference LDPC matrix).
 
-    Returns (success, payload[0:91], iterations_used).
+    Returns (success, payload[0:91], iterations_used, best_parity_errors).
     success=True only when all 83 parity checks pass AND CRC-14 matches.
+    best_parity_errors is the minimum number of unsatisfied parity checks seen
+    across all iterations (0 means LDPC converged; >0 means it did not).
     """
     codeword = np.asarray(llrs, dtype=np.float64)
     if codeword.shape != (174,):
@@ -576,14 +578,14 @@ def ft8_ldpc_decode(
     payload = plain[:91].copy()
 
     if best_errors > 0:
-        return False, payload, iterations_used
+        return False, payload, iterations_used, best_errors
 
     # CRC-14 verification
     msg_bits = payload[:77]
     rx_crc_bits = payload[77:91]
     rx_crc = int(sum(int(b) << (13 - i) for i, b in enumerate(rx_crc_bits)))
     calc_crc = _ft8_crc14(msg_bits)
-    return (calc_crc == rx_crc), payload, iterations_used
+    return (calc_crc == rx_crc), payload, iterations_used, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1011,7 +1013,7 @@ def decode_wav(
                 if var > 1e-10:
                     ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
-                ok, payload, iters = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
+                ok, payload, iters, _ = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
                 if not ok:
                     continue
 
@@ -1433,13 +1435,12 @@ class FT8ConsoleDecoder:
             if var > 1e-10:
                 ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
-            ok, payload, iters = ft8_ldpc_decode(ch_llrs)
+            ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)
             if self._debug:
                 if ok:
                     print(f"    [ldpc] OK  ({iters} iters)", flush=True)
                 else:
-                    parity_errs = _ldpc_check(payload)
-                    if parity_errs == 0:
+                    if best_errors == 0:
                         # LDPC converged but CRC failed
                         rx_crc_bits = payload[77:91]
                         rx_crc = int(
@@ -1454,7 +1455,7 @@ class FT8ConsoleDecoder:
                         )
                     else:
                         print(
-                            f"    [ldpc] FAIL  {parity_errs} parity errors"
+                            f"    [ldpc] FAIL  {best_errors} parity errors"
                             f"  ({iters} iters)",
                             flush=True,
                         )
@@ -1507,4 +1508,10 @@ class FT8ConsoleDecoder:
                     continue
                 if self._debug:
                     print(f"[FT8] slot {utc}Z — decoding", flush=True)
-                self._decode_frame(frame, utc)
+                try:
+                    self._decode_frame(frame, utc)
+                except Exception as exc:
+                    print(
+                        f"[FT8] slot {utc}Z decode error: {exc!r}",
+                        flush=True,
+                    )

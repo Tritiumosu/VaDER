@@ -177,7 +177,7 @@ def t_clean_decode():
     llrs_norm = normalize_llrs(llrs)
     # Hard bits should exactly match codeword
     assert np.all(hard == cw), f"Hard bits mismatch at {np.where(hard != cw)[0]}"
-    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
+    ok, payload, iters, _ = ft8_ldpc_decode(llrs_norm)
     assert ok, f"LDPC failed (iters={iters})"
     assert np.all(payload[:77] == msg), "Message mismatch"
     return f"Clean decode ok (iters={iters})"
@@ -193,7 +193,7 @@ def t_noisy_decode():
     _, llrs = ft8_gray_decode(tones, E)
     noise = rng.standard_normal(174) * 1.5
     llrs_noisy = normalize_llrs(llrs + noise)
-    ok, payload, iters = ft8_ldpc_decode(llrs_noisy, max_iterations=100)
+    ok, payload, iters, _ = ft8_ldpc_decode(llrs_noisy, max_iterations=100)
     assert ok, f"Noisy decode failed (iters={iters})"
     assert np.all(payload[:77] == msg)
     return f"Noisy decode ok (iters={iters})"
@@ -211,7 +211,7 @@ def t_full_pipeline():
     assert np.array_equal(syms_di, tones)
     hard, llrs = ft8_gray_decode(syms_di, E_di)
     llrs_norm = normalize_llrs(llrs)
-    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
+    ok, payload, iters, _ = ft8_ldpc_decode(llrs_norm)
     assert ok, f"LDPC failed (iters={iters})"
     assert np.all(payload[:77] == msg)
     decoded = ft8_unpack_message(payload[:77])
@@ -227,7 +227,7 @@ def t_multiple_messages():
         cw = encode_ft8(msg)
         E = tones_to_E(cw_to_tones(cw))
         _, llrs = ft8_gray_decode(cw_to_tones(cw), E)
-        ok, payload, _ = ft8_ldpc_decode(normalize_llrs(llrs))
+        ok, payload, _, _ = ft8_ldpc_decode(normalize_llrs(llrs))
         if not ok or not np.all(payload[:77] == msg):
             failed.append(i)
     assert not failed, f"Failed on messages: {failed}"

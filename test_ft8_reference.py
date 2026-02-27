@@ -160,8 +160,8 @@ def t_no_interleaver_needed():
     _, ch_llrs = ft8_gray_decode(syms, E)
     llrs_norm = normalize_llrs(ch_llrs)
     # ft8_lib decoder: pass channel LLRs directly to bp_decode (no deinterleave)
-    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
-    assert ok, f"LDPC decode failed (iters={iters})"
+    ok, payload, iters, _ = ft8_ldpc_decode(llrs_norm)
+    assert ok, f"LDPC failed (iters={iters})"
     assert np.all(payload[:77] == msg), "Message mismatch"
     return f"ft8_lib pipeline (no interleaver) decodes correctly (iters={iters}) ✓"
 run("4. ft8_lib pipeline: no interleaver/deinterleaver needed", t_no_interleaver_needed)
@@ -178,7 +178,7 @@ def t_sum_product_not_min_sum():
     E = tones_to_E(tones, sig=1000.0, noise=1.0)
     _, ch_llrs = ft8_gray_decode(np.argmax(E, axis=1), E)
     llrs_norm = normalize_llrs(ch_llrs)
-    ok, payload, iters = ft8_ldpc_decode(llrs_norm)
+    ok, payload, iters, _ = ft8_ldpc_decode(llrs_norm)
     assert ok, f"Failed on clean signal (iters={iters})"
     # Very clean signals should converge in iteration 0 (hard decision already correct)
     assert iters <= 5, f"Too many iterations for clean signal: {iters} (expected ≤ 5)"
@@ -269,7 +269,7 @@ def t_full_pipeline_multiple():
         tones = cw_to_tones_ft8lib(cw)
         E = tones_to_E(tones, sig=100.0, noise=1.0)
         _, ch_llrs = ft8_gray_decode(np.argmax(E, axis=1), E)
-        ok, pl, _ = ft8_ldpc_decode(normalize_llrs(ch_llrs))
+        ok, pl, _, _ = ft8_ldpc_decode(normalize_llrs(ch_llrs))
         if not ok or not np.all(pl[:77] == msg):
             failed.append(i)
     assert not failed, f"Failed on messages: {failed}"
