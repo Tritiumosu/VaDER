@@ -1492,52 +1492,53 @@ def ft8_ldpc_decode(
     max_iterations: int = 50,
 ) -> tuple[bool, np.ndarray, int]:
     """
-    Stage 4 — Min-sum belief-propagation LDPC decoder matching ft8_lib bp_decode().
+    Stage 4 — Sum-product belief-propagation LDPC decoder matching ft8_lib bp_decode().
 
-    Uses the min-sum algorithm, which is what ft8_lib / WSJT-X implements.
+    Implements the sum-product algorithm (tanh rule) exactly as ft8_lib bp_decode():
 
-    Input convention (ft8_lib / this pipeline):
+      V→C: toc[m][n_idx] = tanh(-Tnm / 2)
+           Tnm = llrs[n] + sum of all C→V to n except from check m (extrinsic)
+      C→V: tov[n][m_idx] = -2 * atanh(prod of toc for check m except variable n)
+      Hard: plain[n] = 1 if (llrs[n] + sum(tov[n])) > 0 else 0
+
+    Input convention (matching ft8_lib bp_decode and ft8_extract_symbol):
         llrs[n] > 0  →  bit n more likely 1
         llrs[n] < 0  →  bit n more likely 0
-
-    Internally converts to the standard LDPC convention:
-        L[n] > 0  →  bit n more likely 0   (L = -llrs)
-    so the even-parity XOR=0 check equation is satisfied when the product of
-    all incoming L signs equals +1 — the condition the min-sum sign rule uses.
 
     Returns (success, plain174[:91], iterations_used).
     success is True only when all 83 parity checks pass AND CRC-14 matches.
     """
-    llrs_in = np.asarray(llrs, dtype=np.float64)
-    assert llrs_in.shape == (174,), f"Expected (174,) LLRs, got {llrs_in.shape}"
-
-    # Standard LDPC convention: positive = bit 0 more likely.
-    L = -llrs_in
+    codeword = np.asarray(llrs, dtype=np.float64)  # called 'codeword' in ft8_lib bp_decode signature
+    assert codeword.shape == (174,), f"Expected (174,) LLRs, got {codeword.shape}"
 
     N = 174
 
-    # Precompute edge adjacency for O(1) message passing:
-    # edges_of_n[n] = list of (m, n_idx) where n_idx = position of n in _BP_Nm[m]
-    edges_of_n = [[] for _ in range(N)]
-    for m, row in enumerate(_BP_Nm):
-        for n_idx, n in enumerate(row):
-            edges_of_n[n].append((m, n_idx))
-
-    # r[m][n_idx] — C→V message from check m to variable _BP_Nm[m][n_idx]
-    r = [[0.0] * len(row) for row in _BP_Nm]
+    # FT8 (174,91) LDPC: each variable node connects to exactly 3 check nodes.
+    # tov[n][j] — C→V message to variable n from its j-th check (j in 0..2)
+    # toc[m][k] — V→C message from the k-th variable in check m
+    tov = [[0.0, 0.0, 0.0] for _ in range(N)]
+    toc = [[0.0] * len(row) for row in _BP_Nm]
 
     plain = np.zeros(N, dtype=np.uint8)
     min_errors = 83
     best_plain = plain.copy()
     iterations_used = max_iterations
 
+    # Tanh clamped to avoid atanh(±1) singularity.
+    # Matches ft8_lib fast_tanh saturation at ±4.97 (tanh(4.97) ≈ 0.9999).
+    _TANH_CLAMP = 0.9999
+
     for iteration in range(max_iterations):
-        # ── Hard decision: positive L → bit 0 ────────────────────────────
+        # ── Hard decision: plain[n] = 1 if total > 0 (positive = bit 1) ──
+        plain_sum = 0
         for n in range(N):
-            total = L[n]
-            for (m, n_idx) in edges_of_n[n]:
-                total += r[m][n_idx]
-            plain[n] = 0 if total > 0 else 1
+            total = codeword[n] + tov[n][0] + tov[n][1] + tov[n][2]
+            plain[n] = 1 if total > 0 else 0
+            plain_sum += int(plain[n])
+
+        if plain_sum == 0:
+            # All-zeros is a prohibited codeword; stop early (matches ft8_lib)
+            break
 
         errors = _ldpc_check(plain)
         if errors < min_errors:
@@ -1547,35 +1548,27 @@ def ft8_ldpc_decode(
                 iterations_used = iteration
                 break
 
-        # ── V→C: extrinsic L for each edge (m, n_idx) ────────────────────
-        # q[m][n_idx] = L[n] + sum of all C→V to n except from check m
-        q = [[0.0] * len(row) for row in _BP_Nm]
+        # ── V→C: toc[m][n_idx] = tanh(-Tnm / 2) ─────────────────────────
+        # Tnm = codeword[n] + sum of C→V to n from all checks except m
         for m, row in enumerate(_BP_Nm):
             for n_idx, n in enumerate(row):
-                extrinsic = L[n]
-                for (m2, n_idx2) in edges_of_n[n]:
-                    if m2 != m:
-                        extrinsic += r[m2][n_idx2]
-                q[m][n_idx] = extrinsic
+                Tnm = codeword[n]
+                for j in range(3):
+                    if _BP_Mn[n][j] != m:
+                        Tnm += tov[n][j]
+                toc[m][n_idx] = math.tanh(-Tnm / 2.0)
 
-        # ── C→V: min-sum update ──────────────────────────────────────────
-        for m, row in enumerate(_BP_Nm):
-            deg = len(row)
-            signs = [1 if q[m][k] >= 0 else -1 for k in range(deg)]
-            mags  = [abs(q[m][k]) for k in range(deg)]
-            sign_all = 1
-            for s in signs:
-                sign_all *= s
-            min1 = math.inf; min2 = math.inf; min1_idx = 0
-            for k, mg in enumerate(mags):
-                if mg <= min1:
-                    min2 = min1; min1 = mg; min1_idx = k
-                elif mg < min2:
-                    min2 = mg
-            for n_idx in range(deg):
-                out_sign = sign_all * signs[n_idx]   # product of all OTHER signs
-                out_mag  = min1 if n_idx != min1_idx else min2
-                r[m][n_idx] = float(out_sign) * out_mag
+        # ── C→V: tov[n][m_idx] = -2 * atanh(product of toc except this var) ─
+        for n in range(N):
+            for m_idx in range(3):
+                m = _BP_Mn[n][m_idx]
+                prod = 1.0
+                for n_idx, nv in enumerate(_BP_Nm[m]):
+                    if nv != n:
+                        prod *= toc[m][n_idx]
+                # Clamp before atanh to avoid singularity
+                prod = max(-_TANH_CLAMP, min(_TANH_CLAMP, prod))
+                tov[n][m_idx] = -2.0 * math.atanh(prod)
 
     plain = best_plain
     payload = plain[:91].copy()
@@ -2223,33 +2216,24 @@ class FT8ConsoleDecoder:
                     hard_bits_ch, channel_llrs = ft8_gray_decode(syms_interleaved, E_interleaved)
 
                     # ── Stage 3b: Normalise — ft8_lib ftx_normalize_logl ─────────────
-                    # Scale ALL 174 channel LLRs so variance = 24.  This is done before
-                    # de-interleaving, exactly as in ft8_lib / WSJT-X.  The 46 erased
-                    # parity bits (codeword pos 128..173) get set to 0 afterwards, so
-                    # including them in the variance estimate does not matter — they are
-                    # all non-zero raw differences at this stage.
+                    # Scale ALL 174 channel LLRs so variance = 24.  This matches
+                    # ft8_lib ftx_normalize_logl() called before bp_decode().
                     llr_var = float(np.var(channel_llrs))
                     if llr_var > 1e-10:
                         channel_llrs = channel_llrs * math.sqrt(24.0 / llr_var)
 
-                    # ── Stage 4: De-interleave — ft8_lib exact loop ──────────────────
-                    # for i in 0..173: codeword_llr[bit_rev7(i)] = channel_llr[i]
-                    # Last write wins (i > i-128 for the same bit_rev7 value).
-                    # Codeword positions 128..173 are never written → remain 0 (erased).
-                    codeword_llrs = np.zeros(174, dtype=np.float64)
-                    _br7 = _FT8_BIT_REV7_TABLE   # precomputed bit_rev7(i) for i=0..173
-                    for i in range(174):
-                        codeword_llrs[_br7[i]] = channel_llrs[i]
-
                     if self._debug:
-                        llr_mag_mean = float(np.mean(np.abs(codeword_llrs)))
+                        llr_mag_mean = float(np.mean(np.abs(channel_llrs)))
                         print(
-                             f"{utc}  llrs (deint) mean_|LLR|={llr_mag_mean:.2f}",
+                             f"{utc}  llrs mean_|LLR|={llr_mag_mean:.2f}",
                              flush=True,
                         )
 
-                    # ── Stage 5: LDPC decode → 91 bits ───────────────────
-                    ldpc_ok, codeword, ldpc_iters = ft8_ldpc_decode(codeword_llrs)
+                    # ── Stage 4: LDPC decode → 91 bits ───────────────────────
+                    # Pass channel LLRs directly to bp_decode (ft8_lib convention:
+                    # no deinterleaving needed because _LDPC_CHECKS column indices
+                    # are already in transmission order, matching ft8_lib kFTX_LDPC_Nm).
+                    ldpc_ok, codeword, ldpc_iters = ft8_ldpc_decode(channel_llrs)
 
                     if self._debug or ldpc_ok:
                         status = "PASS" if ldpc_ok else "FAIL"
