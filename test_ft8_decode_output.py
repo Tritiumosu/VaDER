@@ -147,6 +147,8 @@ run("6. format_ft8_message — SNR with sign prefix", t_snr_field_width)
 _WAV2 = os.path.join(os.path.dirname(__file__), "live_ft8_traffic_2.wav")
 
 # Decode once at module load time (shared by tests 7-10).
+# If the file is missing, _WAV2_RESULTS will be None and each test raises
+# FileNotFoundError with a clear message rather than failing silently.
 _WAV2_RESULTS: list | None = None
 if os.path.exists(_WAV2):
     _WAV2_RESULTS = decode_wav(_WAV2)
