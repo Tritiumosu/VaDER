@@ -212,7 +212,14 @@ _AP_LLR_MAGNITUDE: float = 50.0
 # Threshold: only run AP passes when baseline LDPC had this many or fewer parity
 # errors.  Signals with many parity errors are likely noise, not near-miss signals;
 # adding AP passes would waste time without improving decodes.
-_AP_PARITY_ERROR_THRESHOLD: int = 8
+_AP_PARITY_ERROR_THRESHOLD: int = 15
+
+# Fine sub-bin frequency offsets (Hz) used after the coarse 6.25 Hz grid sync.
+# FT8 transmitters may have calibration offsets of a few Hz, causing a signal
+# centred between two 6.25 Hz grid points.  Trying these offsets finds the
+# optimal base frequency and significantly improves Costas scores and LLR quality
+# for off-grid signals.
+_FINE_FREQ_OFFSETS_HZ: tuple[float, ...] = (-3.0, -2.0, -1.0, 1.0, 2.0, 3.0)
 
 # Common AP tuples (n28a encoding helpers)
 _AP_BITS_I3_1 = ((74, 0), (75, 0), (76, 1))   # i3 = 001
@@ -1064,6 +1071,17 @@ def decode_wav(
                 if costas_m < 7:
                     continue
 
+                # Fine frequency refinement: try sub-bin Hz offsets to handle signals
+                # not exactly on the 6.25 Hz grid (transceiver calibration drift ≤ ±3 Hz).
+                f0_dec = f0_hz   # refined frequency used for the decode path below
+                for _fdf in _FINE_FREQ_OFFSETS_HZ:
+                    _E79_try = extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz + _fdf)
+                    _m_try, _, _ = _costas_score(_E79_try)
+                    if _m_try > costas_m:
+                        costas_m = _m_try
+                        f0_dec = f0_hz + _fdf
+                        E79 = _E79_try
+
                 E_payload, hard_syms = ft8_extract_payload_symbols(E79)
                 _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
 
@@ -1073,8 +1091,8 @@ def decode_wav(
                     ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
                 ok, payload, iters, _base_errs = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
-                # If baseline fails with very few parity errors (≤ 8 = near-miss real
-                # signal), try the most impactful AP passes only.
+                # If baseline fails with few parity errors (near-miss real signal),
+                # try AP passes for common message types.
                 if not ok and _base_errs <= _AP_PARITY_ERROR_THRESHOLD:
                     for _ap_name, _ap_bits in _AP_PASSES:
                         ok, payload, iters, _ = ft8_ldpc_decode(
@@ -1096,7 +1114,7 @@ def decode_wav(
 
                 if debug:
                     print(
-                        f"  [DECODE] slot={utc_label} f0={f0_hz:.1f}Hz "
+                        f"  [DECODE] slot={utc_label} f0={f0_dec:.1f}Hz "
                         f"dt={dt:+.2f}s costas={costas_m}/21 "
                         f"iters={iters} msg='{message}'"
                     )
@@ -1104,7 +1122,7 @@ def decode_wav(
                 results.append(FT8DecodeResult(
                     utc_time=utc_label,
                     strength_db=snr_db,
-                    frequency_hz=f0_hz,
+                    frequency_hz=f0_dec,
                     message=message,
                 ))
 
@@ -1324,7 +1342,7 @@ class FT8SyncSearch:
         Return list of (t0_s, f0_hz, costas_score_db) for the best candidates.
         """
         df_hz = self.tone_hz
-        dt_step = self.sym_s / 4.0
+        dt_step = self.sym_s / 8.0   # 20 ms — finer step improves timing resolution
         t_offsets = np.arange(-time_search_s, time_search_s + dt_step / 2, dt_step)
 
         results: list[tuple[float, float, float]] = []
@@ -1440,9 +1458,9 @@ class FT8ConsoleDecoder:
         _T0_MIN = -0.50
         _T0_MAX = 15.0 - FT8_TX_DURATION_S   # ≈ +2.36 s
 
-        # Detect candidate seed frequencies (top 10 of 20 to keep sync search fast)
+        # Detect candidate seed frequencies (all top-20 to maximise coverage)
         candidates = self._detector.detect(frame, top_n=20)
-        seed_items = candidates[:10]
+        seed_items = candidates[:20]
         seed_freqs = [f for f, _ in seed_items]
 
         if self._debug:
@@ -1457,7 +1475,7 @@ class FT8ConsoleDecoder:
             seed_freqs_hz=seed_freqs,
             time_search_s=0.5,
             freq_search_bins=3,
-            max_candidates=5,
+            max_candidates=10,
         )
 
         if self._debug:
@@ -1482,6 +1500,32 @@ class FT8ConsoleDecoder:
 
             E79 = self._extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
             costas_m, _, _ = _costas_score(E79)
+
+            # Fine frequency refinement: try sub-bin Hz offsets to handle signals
+            # whose base frequency is not exactly on the 6.25 Hz grid (e.g. due to
+            # transceiver calibration drift).  Improves Costas scores and LLR quality.
+            _best_m = costas_m
+            _best_f0 = f0_hz
+            _best_E79 = E79
+            for _fdf in _FINE_FREQ_OFFSETS_HZ:
+                _E79_try = self._extractor.extract_all_79(
+                    frame, t0_s=t0_s, f0_hz=f0_hz + _fdf
+                )
+                _m_try, _, _ = _costas_score(_E79_try)
+                if _m_try > _best_m:
+                    _best_m = _m_try
+                    _best_f0 = f0_hz + _fdf
+                    _best_E79 = _E79_try
+            if _best_m > costas_m and self._debug:
+                print(
+                    f"    [fine-freq] {f0_hz:.1f} → {_best_f0:.1f} Hz"
+                    f"  costas {costas_m} → {_best_m}/21",
+                    flush=True,
+                )
+            costas_m = _best_m
+            f0_hz = _best_f0
+            E79 = _best_E79
+
             if self._debug:
                 print(
                     f"  [cand] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
