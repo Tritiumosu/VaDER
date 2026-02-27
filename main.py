@@ -20,7 +20,7 @@ except Exception:
 
 from ft991a_cat import Yaesu991AControl
 from digi_input import SoundCardAudioSource
-from ft8_decode import FT8ConsoleDecoder
+from ft8_decode import FT8ConsoleDecoder, format_ft8_message
 
 # --- Constants & Band Plans ---
 BANDS = {
@@ -518,8 +518,11 @@ class RadioGUI:
         Must be thread-safe — puts a UI update onto the queue; never touches
         Tkinter widgets directly.
         """
-        line = f"{utc}  {snr_db:+5.1f}dB  {freq_hz:7.1f}Hz  {message}\n"
-        self._ui_queue.put(("ft8_decoded", line))
+        line = format_ft8_message(utc, snr_db, freq_hz, message)
+        # Print to terminal (includes all debug info)
+        print(line, flush=True)
+        # Send formatted line to GUI display queue
+        self._ui_queue.put(("ft8_decoded", line + "\n"))
 
     def _clear_ft8_log(self) -> None:
         """Clear the FT8 decoded messages panel (called from GUI thread)."""

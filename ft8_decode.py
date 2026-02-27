@@ -830,6 +830,27 @@ class FT8DecodeResult:
     message: str
 
 
+def format_ft8_message(utc: str, snr_db: float, freq_hz: float, message: str) -> str:
+    """
+    Format an FT8 decoded message matching the reference decoder output format.
+
+    Output: ``HHMMSS +NN NNNN.NNN MESSAGE``
+
+    Parameters
+    ----------
+    utc      : UTC timestamp string (e.g. ``HH:MM:SS`` or ``HHMMSS``)
+    snr_db   : signal-to-noise ratio in dB (rounded to nearest integer)
+    freq_hz  : audio frequency in Hz
+    message  : decoded FT8 message text (e.g. ``CQ W4ABC EM73``)
+
+    Returns
+    -------
+    str  formatted line ready for terminal or log output
+    """
+    snr_int = int(round(snr_db))
+    return f"{utc} {snr_int:+3d} {freq_hz:8.3f} {message}"
+
+
 def decode_wav(
     wav_path: str,
     *,

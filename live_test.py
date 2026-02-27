@@ -22,7 +22,7 @@ import sys
 import time
 
 from digi_input import SoundCardAudioSource
-from ft8_decode import FT8ConsoleDecoder
+from ft8_decode import FT8ConsoleDecoder, format_ft8_message
 
 
 # ── Load vader.cfg defaults ───────────────────────────────────────────────────
@@ -93,17 +93,9 @@ _decode_count = 0
 def _on_decode(utc: str, freq_hz: float, snr_db: float, message: str) -> None:
     global _decode_count
     _decode_count += 1
-    # Bold/bright green for actual decodes — stands out from the debug noise
-    print(
-        f"\n{'='*60}\n"
-        f"  *** DECODE #{_decode_count} ***\n"
-        f"  UTC:  {utc}\n"
-        f"  Freq: {freq_hz:.1f} Hz\n"
-        f"  SNR:  {snr_db:+.1f} dB\n"
-        f"  MSG:  {message}\n"
-        f"{'='*60}\n",
-        flush=True,
-    )
+    # Print in standard FT8 reference decoder format: HHMMSS +NN NNNN.NNN MESSAGE
+    line = format_ft8_message(utc, snr_db, freq_hz, message)
+    print(line, flush=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
