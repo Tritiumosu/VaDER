@@ -87,20 +87,24 @@ def _pack_callsign_28(call: str) -> int:
 
 
 def _pack_grid_15(grid: str) -> int:
-    """Pack a 4-char Maidenhead grid square into 15 bits."""
+    """Pack a 4-char Maidenhead grid square or special token into 15 bits."""
     grid = grid.upper().strip()
 
-    # Special tokens
+    # Special tokens — checked BEFORE integer parse to avoid treating '73' as a report
     if grid == 'RRR':  return 32767
     if grid == 'RR73': return 32766
     if grid == '73':   return 32765
 
-    # Signal report e.g. '-15' or '+05'
-    try:
-        db = int(grid)
-        return max(0, min(61, db + 35))
-    except ValueError:
-        pass
+    # Signal report e.g. '-15', '+05', '-24'..'+09'
+    # Only treat as report if the string looks like a signed/unsigned small integer
+    import re as _re
+    if _re.fullmatch(r'[+-]?\d{1,2}', grid):
+        try:
+            db = int(grid)
+            # Valid FT8 signal report range is -24..+9 dB (encoded as n+35, 0..62)
+            return max(0, min(61, db + 35))
+        except ValueError:
+            pass
 
     if len(grid) < 4:
         return 0

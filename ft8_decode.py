@@ -988,15 +988,27 @@ def ft8_costas_rank_stats(Ec: np.ndarray) -> dict[str, float]:
 def _build_ft8_interleave_tables() -> tuple[tuple[int, ...], tuple[int, ...]]:
     """
     Build the FT8 interleave and de-interleave tables using 7-bit reversal
-    with last-write-wins semantics (WSJT-X / ft8_lib convention).
+    (WSJT-X / ft8_lib convention).
+
+    FT8 transmitter (encoder side):
+      transmitted[i] = codeword[bit_rev7(i)]   for i in 0..173
+    Since bit_rev7 produces values in 0..127 only, codeword positions 128..173
+    are parity bits that are never transmitted.  Positions 0..45 are each written
+    twice (by i and i+128); the last write (higher i, i.e. 128..173) is the one
+    actually transmitted.
+
+    FT8 receiver (decoder side):
+      codeword_llr[bit_rev7(i)] = channel_llr[i]   (last write wins)
+    Codeword positions 128..173 receive no channel LLR → set to 0 (erased).
 
     Returns
     -------
-    interleave   : length-174 tuple; interleave[dst] = src
-                   transmitted[dst] = codeword[interleave[dst]]
-    deinterleave : length-174 tuple; deinterleave[src] = dst  (or -1 if erased)
-                   codeword_llr[src] = channel_llr[deinterleave[src]]
-                   codeword_llr[src] = 0  when deinterleave[src] == -1
+    interleave   : length-174 tuple; interleave[i] = bit_rev7(i)
+                   transmitted[i] = codeword[interleave[i]]
+    deinterleave : length-174 tuple; deinterleave[codeword_pos] = transmitted_pos
+                   (or -1 for codeword positions 128..173 which are never transmitted)
+                   codeword_llr[c] = channel_llr[deinterleave[c]]  if deinterleave[c] >= 0
+                   codeword_llr[c] = 0                              if deinterleave[c] == -1
     """
     def bit_rev7(x: int) -> int:
         result = 0
@@ -1006,20 +1018,18 @@ def _build_ft8_interleave_tables() -> tuple[tuple[int, ...], tuple[int, ...]]:
         return result
 
     N = 174
-    # Forward interleave: last write wins
-    interleave = list(range(N))   # default: identity (covers positions 128..173)
-    for i in range(N):
-        j = bit_rev7(i)
-        if j < N:
-            interleave[j] = i     # last write wins (higher i overwrites lower i)
+    # Forward interleave: interleave[i] = codeword position for transmitted index i
+    interleave = [bit_rev7(i) for i in range(N)]   # values in 0..127
 
-    # Reverse: for each codeword bit src, where did it end up in transmitted[]?
-    # Since multiple src can map to the same dst (only the last survives),
-    # only the last writer for each dst is the true source.
-    # For codeword positions that were overwritten (early i), set -1 (erased).
-    deinterleave = [-1] * N
-    for dst, src in enumerate(interleave):
-        deinterleave[src] = dst   # last assignment = final mapping
+    # Receiver de-interleave: for each codeword position c, which transmitted
+    # index i should supply its LLR?  Use last-write-wins (higher i wins).
+    deinterleave = [-1] * N   # -1 = erased (no transmitted bit reaches this position)
+    for i in range(N):
+        c = bit_rev7(i)
+        deinterleave[c] = i   # last write (higher i) wins
+
+    # Positions 128..173 are never targeted by bit_rev7 (max value = 127),
+    # so they remain -1 (truly erased parity bits).
 
     return tuple(interleave), tuple(deinterleave)
 
@@ -1029,6 +1039,19 @@ def _build_ft8_interleave_tables() -> tuple[tuple[int, ...], tuple[int, ...]]:
 _FT8_INTERLEAVE: tuple[int, ...]
 _FT8_DEINTERLEAVE: tuple[int, ...]
 _FT8_INTERLEAVE, _FT8_DEINTERLEAVE = _build_ft8_interleave_tables()
+
+# Precomputed bit_rev7(i) for i = 0..173.  Used in the de-interleave loop:
+#   for i in range(174): codeword_llr[_FT8_BIT_REV7_TABLE[i]] = channel_llr[i]
+def _build_bit_rev7_table() -> tuple[int, ...]:
+    def _br7(x: int) -> int:
+        r = 0
+        for _ in range(7):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        return r
+    return tuple(_br7(i) for i in range(174))
+
+_FT8_BIT_REV7_TABLE: tuple[int, ...] = _build_bit_rev7_table()
 
 # Legacy aliases kept for API compatibility (some tests import these names)
 _FT8_INTERLEAVE_DST_TO_SRC: tuple[int, ...] = _FT8_INTERLEAVE
@@ -1086,11 +1109,18 @@ def ft8_gray_decode(
         gray_map = np.array([0, 1, 3, 2, 6, 4, 5, 7], dtype=np.int32)
 
     hard_bits = np.empty(N_bits, dtype=np.uint8)
+    llrs      = np.empty(N_bits, dtype=np.float64)
 
     E_safe = np.maximum(E, 1e-30)
 
     for s in range(N_syms):
         row = E_safe[s]   # (8,) energies indexed by tone
+
+        # Use raw energies exactly as ft8_lib ft8_extract_symbol() does.
+        # No per-symbol normalisation here — the global ftx_normalize_logl
+        # step (scale all 174 channel LLRs so variance=24) is applied after
+        # Gray decoding in the caller.  Per-symbol normalisation would cap
+        # LLR differences at ±1, making them far too small for BP convergence.
 
         # s2[gv] = energy of the tone that carries Gray value gv
         s2 = np.empty(8, dtype=np.float64)
@@ -1447,37 +1477,54 @@ for _m, _row in enumerate(_BP_Nm):
     for _n in _row:
         _BP_Mn[_n].append(_m)
 
+# _BP_Nm_idx[m][n_idx] = position of variable _BP_Nm[m][n_idx] within _BP_Mn[that variable]
+# i.e. r[m][n_idx] is stored at index _BP_Nm_idx[m][n_idx] of the C→V array for that variable.
+# Precomputed so the hard-decision sum in bp_decode is O(1) per (variable, check) pair.
+_BP_Mn_pos: list[list[int]] = [[] for _ in range(83)]   # _BP_Mn_pos[m][n_idx] = j where _BP_Mn[n][j]==m
+for _m, _row in enumerate(_BP_Nm):
+    for _n in _row:
+        _BP_Mn_pos[_m].append(_BP_Mn[_n].index(_m))
+
 
 def ft8_ldpc_decode(
     llrs: np.ndarray,
     *,
-    max_iterations: int = 100,
+    max_iterations: int = 50,
 ) -> tuple[bool, np.ndarray, int]:
     """
-    Stage 4 — Belief-propagation LDPC decoder matching ft8_lib bp_decode().
+    Stage 4 — Min-sum belief-propagation LDPC decoder matching ft8_lib bp_decode().
 
-    Sign convention (matching ft8_lib):
-      llrs[n] > 0  →  bit n is more likely 0
-      llrs[n] < 0  →  bit n is more likely 1
+    Uses the min-sum algorithm, which is what ft8_lib / WSJT-X implements.
 
-    The 174-bit decoded codeword layout (matching ft8_lib / WSJT-X):
-      bits[0..76]  — 77-bit message payload
-      bits[77..90] — 14-bit CRC
-      bits[91..173] — 83 parity bits
+    Input convention (ft8_lib / this pipeline):
+        llrs[n] > 0  →  bit n more likely 1
+        llrs[n] < 0  →  bit n more likely 0
+
+    Internally converts to the standard LDPC convention:
+        L[n] > 0  →  bit n more likely 0   (L = -llrs)
+    so the even-parity XOR=0 check equation is satisfied when the product of
+    all incoming L signs equals +1 — the condition the min-sum sign rule uses.
 
     Returns (success, plain174[:91], iterations_used).
-    success is True only when all 83 parity checks pass AND the CRC matches.
-
-    Reference: ft8_lib ft8/ldpc.c bp_decode(), decode.c ftx_decode_candidate().
+    success is True only when all 83 parity checks pass AND CRC-14 matches.
     """
-    llrs = np.asarray(llrs, dtype=np.float64)
-    assert llrs.shape == (174,), f"Expected (174,) LLRs, got {llrs.shape}"
+    llrs_in = np.asarray(llrs, dtype=np.float64)
+    assert llrs_in.shape == (174,), f"Expected (174,) LLRs, got {llrs_in.shape}"
+
+    # Standard LDPC convention: positive = bit 0 more likely.
+    L = -llrs_in
 
     N = 174
-    # tov[n][j] — message from check _BP_Mn[n][j] to variable n
-    tov = [[0.0, 0.0, 0.0] for _ in range(N)]
-    # toc[m][n_idx] — message from variable _BP_Nm[m][n_idx] to check m
-    toc = [[0.0] * len(row) for row, row in zip(_BP_Nm, _BP_Nm)]
+
+    # Precompute edge adjacency for O(1) message passing:
+    # edges_of_n[n] = list of (m, n_idx) where n_idx = position of n in _BP_Nm[m]
+    edges_of_n = [[] for _ in range(N)]
+    for m, row in enumerate(_BP_Nm):
+        for n_idx, n in enumerate(row):
+            edges_of_n[n].append((m, n_idx))
+
+    # r[m][n_idx] — C→V message from check m to variable _BP_Nm[m][n_idx]
+    r = [[0.0] * len(row) for row in _BP_Nm]
 
     plain = np.zeros(N, dtype=np.uint8)
     min_errors = 83
@@ -1485,12 +1532,13 @@ def ft8_ldpc_decode(
     iterations_used = max_iterations
 
     for iteration in range(max_iterations):
-        # Hard decision: positive LLR → bit 1, matching ft8_lib bp_decode
+        # ── Hard decision: positive L → bit 0 ────────────────────────────
         for n in range(N):
-            val = llrs[n] + tov[n][0] + tov[n][1] + tov[n][2]
-            plain[n] = 1 if val > 0 else 0
+            total = L[n]
+            for (m, n_idx) in edges_of_n[n]:
+                total += r[m][n_idx]
+            plain[n] = 0 if total > 0 else 1
 
-        # Check convergence (also on iteration 0 before any BP)
         errors = _ldpc_check(plain)
         if errors < min_errors:
             min_errors = errors
@@ -1499,36 +1547,43 @@ def ft8_ldpc_decode(
                 iterations_used = iteration
                 break
 
-        # Variable → Check: toc[m][n_idx] = llrs[n] + sum_{j≠ this check} tov[n][j]
+        # ── V→C: extrinsic L for each edge (m, n_idx) ────────────────────
+        # q[m][n_idx] = L[n] + sum of all C→V to n except from check m
+        q = [[0.0] * len(row) for row in _BP_Nm]
         for m, row in enumerate(_BP_Nm):
             for n_idx, n in enumerate(row):
-                Tnm = llrs[n]
-                for j, chk in enumerate(_BP_Mn[n]):
-                    if chk != m:
-                        Tnm += tov[n][j]
-                toc[m][n_idx] = math.tanh(-Tnm / 2.0)
+                extrinsic = L[n]
+                for (m2, n_idx2) in edges_of_n[n]:
+                    if m2 != m:
+                        extrinsic += r[m2][n_idx2]
+                q[m][n_idx] = extrinsic
 
-        # Check → Variable: tov[n][j] = -2 * atanh(prod_{n'≠n} toc[m][n'_idx])
-        for n in range(N):
-            for j, m in enumerate(_BP_Mn[n]):
-                prod = 1.0
-                for n_idx, nn in enumerate(_BP_Nm[m]):
-                    if nn != n:
-                        v = toc[m][n_idx]
-                        # clamp to avoid atanh domain error
-                        v = max(-0.9999999, min(0.9999999, v))
-                        prod *= v
-                prod = max(-0.9999999, min(0.9999999, prod))
-                tov[n][j] = -2.0 * math.atanh(prod)
+        # ── C→V: min-sum update ──────────────────────────────────────────
+        for m, row in enumerate(_BP_Nm):
+            deg = len(row)
+            signs = [1 if q[m][k] >= 0 else -1 for k in range(deg)]
+            mags  = [abs(q[m][k]) for k in range(deg)]
+            sign_all = 1
+            for s in signs:
+                sign_all *= s
+            min1 = math.inf; min2 = math.inf; min1_idx = 0
+            for k, mg in enumerate(mags):
+                if mg <= min1:
+                    min2 = min1; min1 = mg; min1_idx = k
+                elif mg < min2:
+                    min2 = mg
+            for n_idx in range(deg):
+                out_sign = sign_all * signs[n_idx]   # product of all OTHER signs
+                out_mag  = min1 if n_idx != min1_idx else min2
+                r[m][n_idx] = float(out_sign) * out_mag
 
-    # Use best result found
     plain = best_plain
     payload = plain[:91].copy()
 
     if min_errors > 0:
         return False, payload, iterations_used
 
-    # CRC check: bits 0..76 = message, bits 77..90 = CRC
+    # CRC-14 check
     msg_bits = payload[:77]
     rx_crc_bits = payload[77:91]
     rx_crc = int(sum(int(b) << (13 - i) for i, b in enumerate(rx_crc_bits)))
@@ -1820,17 +1875,19 @@ def ft8_unpack_message(msg_bits: np.ndarray) -> str:
     i3 = _bits_to_int(msg_bits, 74, 3)
 
     if i3 == 0:
-        # n3 subtype is bits [71:74]
-        n3 = _bits_to_int(msg_bits, 71, 3)
-        if n3 == 0 or n3 == 1:
-            return _unpack_type1(msg_bits)
-        elif n3 == 2:
-            return _unpack_type_compound(msg_bits, 1)
-        elif n3 == 3:
-            return _unpack_type_compound(msg_bits, 2)
-        else:
-            raw = _bits_to_int(msg_bits, 0, 77)
-            return f'?i3=0,n3={n3}:{raw:020X}'
+        # i3=0: Standard QSO / CQ type.
+        #
+        # The n3 sub-type field (bits[71:74]) physically overlaps the bottom 2 bits
+        # of the 15-bit grid field (bits[58:73]) plus the spare bit (bit 73).  For
+        # typical Maidenhead grids, signal reports, and special tokens like 73/RRR/RR73
+        # the bottom bits are non-zero, producing n3 = 1–7 even for perfectly valid
+        # standard QSO frames.
+        #
+        # The correct behaviour (matching WSJT-X / ft8_lib unpack77):
+        #   i3=0 → ALWAYS unpack as standard type-1 (call + call + grid/report)
+        #   The n3 sub-type is NOT used as a dispatch key for i3=0 messages.
+        #   Compound-callsign messages use i3=1 or i3=4 in modern WSJT-X.
+        return _unpack_type1(msg_bits)
 
     elif i3 == 1:
         return _unpack_free_text(msg_bits)
@@ -2160,34 +2217,29 @@ class FT8ConsoleDecoder:
                     E_interleaved = E_payload
                     syms_interleaved = np.argmax(E_interleaved, axis=1)
 
-                    if self._debug:
-                        sym_str = "".join(str(int(t)) for t in syms_interleaved)
-                        print(
-                            f"{utc}  payload_syms (interleaved) [{len(syms_interleaved)}]: {sym_str}",
-                            flush=True,
-                        )
-
-                    # ── Stage 3: Gray decode → 174 Channel LLRs ─────────────────
-                    # produce 174 LLRs corresponding to the TRANSMITTED (interleaved) bits
+                    # ── Stage 3: Gray decode → 174 channel LLRs (transmitted order) ──
+                    # Matches ft8_lib ft8_extract_symbol() exactly.  Raw energy
+                    # differences are used — no per-symbol normalisation.
                     hard_bits_ch, channel_llrs = ft8_gray_decode(syms_interleaved, E_interleaved)
 
-                    # Normalize LLRs
+                    # ── Stage 3b: Normalise — ft8_lib ftx_normalize_logl ─────────────
+                    # Scale ALL 174 channel LLRs so variance = 24.  This is done before
+                    # de-interleaving, exactly as in ft8_lib / WSJT-X.  The 46 erased
+                    # parity bits (codeword pos 128..173) get set to 0 afterwards, so
+                    # including them in the variance estimate does not matter — they are
+                    # all non-zero raw differences at this stage.
                     llr_var = float(np.var(channel_llrs))
                     if llr_var > 1e-10:
                         channel_llrs = channel_llrs * math.sqrt(24.0 / llr_var)
 
-                    # ── Stage 4: De-interleave LLRs → Codeword LLRs ─────────────
-                    # codeword_llr[src] = channel_llr[deinterleave[src]]
-                    # or 0 if deinterleave[src] == -1 (erased)
+                    # ── Stage 4: De-interleave — ft8_lib exact loop ──────────────────
+                    # for i in 0..173: codeword_llr[bit_rev7(i)] = channel_llr[i]
+                    # Last write wins (i > i-128 for the same bit_rev7 value).
+                    # Codeword positions 128..173 are never written → remain 0 (erased).
                     codeword_llrs = np.zeros(174, dtype=np.float64)
-                    deint_map = np.array(_FT8_DEINTERLEAVE, dtype=np.int32)
-
-                    # Valid mappings: src -> dst
-                    # We iterate 0..173. If map[src] >= 0, copy. Else 0.
-                    # Vectorised:
-                    mask = (deint_map >= 0)
-                    codeword_llrs[mask] = channel_llrs[deint_map[mask]]
-                    # The erased bits (mask=False) are left as 0.0
+                    _br7 = _FT8_BIT_REV7_TABLE   # precomputed bit_rev7(i) for i=0..173
+                    for i in range(174):
+                        codeword_llrs[_br7[i]] = channel_llrs[i]
 
                     if self._debug:
                         llr_mag_mean = float(np.mean(np.abs(codeword_llrs)))

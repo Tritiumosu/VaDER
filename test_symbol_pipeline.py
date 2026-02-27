@@ -94,40 +94,57 @@ roundtrip_mismatches = np.sum(syms_deint != expected_hard)
 print(f"[ft8_deinterleave]  pass-through mismatches: {roundtrip_mismatches}/58")
 assert roundtrip_mismatches == 0
 
-# ── 6. Gray decode — verify hard bits and LLRs (after 174-bit de-interleave) ──
-# Build expected bits in CHANNEL (interleaved) order from payload tones
+# ── 6. Gray decode — verify hard bits and LLRs ──────────────────────────────
+# ft8_gray_decode takes 58 payload symbols and produces 174 CHANNEL-ordered bits
+# (i.e. bit[3*s+k] = bit k of the Gray-decoded value for symbol s).
+# De-interleaving is applied EXTERNALLY after ft8_gray_decode.
+#
+# Expected CHANNEL bits from known payload tones:
 gray_table = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
-bits_channel = np.empty(174, dtype=np.uint8)
+expected_channel_bits = np.empty(174, dtype=np.uint8)
 for i, tone in enumerate(payload_tones):
-    gv = int(gray_table[tone])
-    for b in range(3):
-        bits_channel[3 * i + b] = (gv >> (2 - b)) & 1
-
-# Apply the same 174-bit de-interleave that ft8_gray_decode applies internally.
-# _FT8_DEINTERLEAVE[src] = dst in channel order, or -1 for erased positions.
-# Erased positions (46 parity bits never transmitted) get 0.
-expected_bits = np.array([
-    bits_channel[_FT8_DEINTERLEAVE[src]] if _FT8_DEINTERLEAVE[src] >= 0 else 0
-    for src in range(174)
-], dtype=np.uint8)
+    gv = int(gray_table[int(tone)])
+    expected_channel_bits[3 * i + 0] = (gv >> 2) & 1   # MSB (bit2 of gray value)
+    expected_channel_bits[3 * i + 1] = (gv >> 1) & 1   # bit1
+    expected_channel_bits[3 * i + 2] = gv & 1           # LSB (bit0)
 
 hard_bits, llrs = ft8_gray_decode(syms_deint, E_deint)
 
-# Only compare non-erased positions (erased positions are filled by the erasure
-# solver in ft8_ldpc_decode and may not match raw channel bits)
-non_erased = [src for src in range(174) if _FT8_DEINTERLEAVE[src] >= 0]
-bit_mismatches = int(np.sum(hard_bits[non_erased] != expected_bits[non_erased]))
-print(f"[ft8_gray_decode]  hard_bit mismatches vs expected (non-erased): {bit_mismatches}/{len(non_erased)}")
-assert bit_mismatches == 0, f"Expected 0, got {bit_mismatches}"
+# Compare channel bits (all 174 positions — no erasure at channel level)
+bit_mismatches = int(np.sum(hard_bits != expected_channel_bits))
+print(f"[ft8_gray_decode]  channel hard_bit mismatches: {bit_mismatches}/174")
+assert bit_mismatches == 0, f"Expected 0 channel hard-bit mismatches, got {bit_mismatches}"
 
-mean_llr_correct = float(np.mean(np.abs(llrs[non_erased])))
-print(f"[ft8_gray_decode]  mean |LLR| (non-erased) = {mean_llr_correct:.2f}  (should be >> 1 for clean signal)")
-assert mean_llr_correct > 5.0, f"LLRs unexpectedly weak: mean |LLR| = {mean_llr_correct:.2f}"
+mean_llr = float(np.mean(np.abs(llrs)))
+print(f"[ft8_gray_decode]  mean |LLR| = {mean_llr:.2f}  (should be >> 1 for clean signal)")
+assert mean_llr > 5.0, f"LLRs unexpectedly weak: mean |LLR| = {mean_llr:.2f}"
 
 # Sign convention: positive LLR → bit=1
-llr_sign_errors = int(np.sum((llrs[non_erased] > 0).astype(np.uint8) != hard_bits[non_erased]))
-print(f"[ft8_gray_decode]  LLR sign errors vs hard_bits (non-erased): {llr_sign_errors}/{len(non_erased)}")
+llr_sign_errors = int(np.sum((llrs > 0).astype(np.uint8) != hard_bits))
+print(f"[ft8_gray_decode]  LLR sign errors vs hard_bits: {llr_sign_errors}/174")
 assert llr_sign_errors == 0
+
+# ── 7. Verify external de-interleave (as done in FT8ConsoleDecoder) ──────────
+# After ft8_gray_decode: channel_llrs (174 channel-ordered)
+# De-interleave: codeword_llr[src] = channel_llr[deinterleave[src]] or 0 if erased
+deint_map = np.array(_FT8_DEINTERLEAVE, dtype=np.int32)
+codeword_llrs = np.zeros(174, dtype=np.float64)
+mask = deint_map >= 0
+codeword_llrs[mask] = llrs[deint_map[mask]]
+
+non_erased = [i for i in range(174) if deint_map[i] >= 0]
+print(f"[de-interleave]  non-erased codeword positions: {len(non_erased)}/174"
+      f"  (erased: {174 - len(non_erased)})")
+assert len(non_erased) == 128, f"Expected 128 non-erased positions, got {len(non_erased)}"
+
+# Expected codeword bits at non-erased positions
+expected_cw_bits = np.array([
+    expected_channel_bits[deint_map[src]] for src in non_erased
+], dtype=np.uint8)
+got_cw_bits = (codeword_llrs[non_erased] > 0).astype(np.uint8)
+cw_bit_errors = int(np.sum(got_cw_bits != expected_cw_bits))
+print(f"[de-interleave]  codeword bit errors (non-erased): {cw_bit_errors}/128")
+assert cw_bit_errors == 0
 
 print("\nAll assertions passed — symbol pipeline is correct.")
 
