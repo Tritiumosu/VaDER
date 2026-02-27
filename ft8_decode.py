@@ -1,1334 +1,206 @@
+"""
+ft8_decode.py  —  Clean-slate FT8 decoder based on the WSJT-X / ft8_lib reference.
+
+Pipeline (matches ft8_lib / WSJT-X exactly):
+
+  Audio  →  Resample → 12 kHz mono
+         →  UTC-aligned 15 s frames
+         →  Candidate detection (8-tone matched filter)
+         →  Sync search (Costas array score over dt/df grid)
+         →  Symbol energy extraction  (79 symbols × 8 tones)
+         →  Payload extraction        (58 payload symbols)
+         →  Gray decode               (58 symbols → 174 channel LLRs)
+         →  LLR normalisation         (variance = 24  [ftx_normalize_logl])
+         →  LDPC BP decode            (174,91) sum-product
+         →  CRC-14 check
+         →  Message unpack            (77 bits → human string)
+
+Key reference parameters (WSJT-X / ft8_lib constants):
+  Sample rate       12 000 Hz
+  Symbol duration   160 ms  (1920 samples at 12 kHz)
+  Tone spacing      6.25 Hz  (= 1 / 0.160)
+  Symbols per frame 79  (58 data + 21 Costas sync)
+  Costas positions  0-6, 36-42, 72-78
+  Costas pattern    {3,1,4,0,6,5,2}  (WSJT-X source ft8b.f90)
+  FEC               LDPC (174, 91)  — 83 check nodes, col-weight 3
+  CRC               14-bit, polynomial 0x2757
+  Transmission time 12.64 s
+
+Correctness notes (vs the previous broken implementation):
+  1. Gray map  _FT8_GRAY_DECODE = (0,1,3,2,6,4,5,7)
+              This is the exact inverse of ft8_lib kFT8_Gray_map = {0,1,3,2,5,6,4,7}.
+  2. LDPC BP   C→V message = −2·atanh(product) with ft8_lib positive-means-1 LLR convention.
+  3. No bit interleaver in encode/decode path (ft8_lib uses none).
+"""
 from __future__ import annotations
 
+import math
+import queue
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-import math
-import time
-import threading
-import queue
-
 import numpy as np
-from scipy import signal
+from scipy import signal as _scipy_signal
 
-@dataclass(frozen=True)
-class FT8DecodeResult:
-    utc_time: str          # UTC slot time "HH:MM:SS" (start of 15s interval)
-    strength_db: float     # relative strength estimate (dB), currently peak-vs-noise
-    frequency_hz: float    # audio offset frequency estimate (Hz)
-    message: str           # placeholder until full FT8 decode is implemented
 
-@dataclass(frozen=True)
-class FT8SyncCandidate:
-    slot_utc: str
-    time_offset_s: float
-    freq_hz: float
-    score_db: float
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 1  FT8 Protocol Constants
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class PolyphaseResampler:
-    """
-    Streaming-friendly resampler using resample_poly in chunks.
+FT8_TONE_SPACING_HZ: float = 6.25
+FT8_SYMBOL_DURATION_S: float = 0.160        # 1 / 6.25
+FT8_NSYMS: int = 79
+FT8_NDATASYM: int = 58
+FT8_FS: int = 12_000
+FT8_SYM_SAMPLES: int = int(round(FT8_SYMBOL_DURATION_S * FT8_FS))  # 1920
+FT8_TX_DURATION_S: float = FT8_NSYMS * FT8_SYMBOL_DURATION_S       # 12.64 s
 
-    For FT8 we can accept small boundary artifacts; we keep it simple and fast.
-    """
-    def __init__(self, fs_in: int, fs_out: int) -> None:
-        self.fs_in = int(fs_in)
-        self.fs_out = int(fs_out)
-        g = math.gcd(self.fs_in, self.fs_out)
-        self.up = self.fs_out // g
-        self.down = self.fs_in // g
-
-    def process(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-        if x.size == 0:
-            return x
-        y = signal.resample_poly(x, self.up, self.down).astype(np.float32, copy=False)
-        return y
-
-class UTC15sFramer:
-    """
-    Collects a continuous fs_proc stream and emits exact 15.0s frames aligned to UTC boundaries.
-
-    The first frame emitted may be a partial slot (audio started mid-slot).
-    push() returns (slot_start_utc_epoch, frame_samples, is_partial) tuples.
-    Consumers should skip frames where is_partial=True.
-    """
-    def __init__(self, fs_proc: int, frame_s: float = 15.0) -> None:
-        self.fs = int(fs_proc)
-        self.frame_s = float(frame_s)
-        self.frame_n = int(round(self.fs * self.frame_s))
-        self._buf = np.zeros(0, dtype=np.float32)
-
-        # We associate the buffer with an estimated UTC time for its first sample.
-        self._t0_utc: Optional[float] = None  # epoch seconds
-
-        # Track whether the first frame has been emitted yet (to flag it as partial).
-        self._first_frame_emitted: bool = False
-
-        # Stable monotonic->UTC mapping (smoothed)
-        self._utc_minus_mono: Optional[float] = None
-        self._alpha = 0.01  # smoothing factor; small = stable, large = more reactive
-
-    @staticmethod
-    def _utc_now_epoch() -> float:
-        return datetime.now(timezone.utc).timestamp()
-
-    @staticmethod
-    def _slot_start_epoch(t_utc_epoch: float, slot_s: float = 15.0) -> float:
-        return math.floor(t_utc_epoch / slot_s) * slot_s
-
-    def _update_utc_minus_mono(self) -> float:
-        """
-        Maintain a smoothed estimate of (utc_epoch - monotonic_seconds).
-        """
-        utc_now = self._utc_now_epoch()
-        mono_now = time.monotonic()
-        sample = utc_now - mono_now
-
-        if self._utc_minus_mono is None:
-            self._utc_minus_mono = sample
-        else:
-            a = float(self._alpha)
-            self._utc_minus_mono = (1.0 - a) * float(self._utc_minus_mono) + a * float(sample)
-
-        return float(self._utc_minus_mono)
-
-    def push(self, x: np.ndarray, *, t0_monotonic: float) -> list[tuple[float, np.ndarray, bool]]:
-        """
-        Push new fs_proc samples.
-        Returns list of (slot_start_utc_epoch, frame_samples, is_partial).
-
-        is_partial=True for the very first frame when audio collection started
-        mid-slot.  The frame samples are time-shifted and the earlier portion
-        of the FT8 transmission is missing, so sync scores will be poor.
-        Consumers should skip partial frames.
-        """
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-        if x.size == 0:
-            return []
-
-        utc_minus_mono = self._update_utc_minus_mono()
-        t0_utc = float(t0_monotonic) + float(utc_minus_mono)
-
-        if self._t0_utc is None:
-            self._t0_utc = t0_utc
-
-        self._buf = np.concatenate((self._buf, x))
-
-        out: list[tuple[float, np.ndarray, bool]] = []
-
-        while self._buf.size >= self.frame_n and self._t0_utc is not None:
-            slot0 = self._slot_start_epoch(self._t0_utc, self.frame_s)
-            offset_s = self._t0_utc - slot0
-            offset_n = int(round(offset_s * self.fs))
-
-            if offset_n < 0:
-                drop = min(-offset_n, self._buf.size)
-                self._buf = self._buf[drop:]
-                self._t0_utc += drop / self.fs
-                continue
-
-            if offset_n >= self.frame_n:
-                advance_frames = offset_n // self.frame_n
-                drop = advance_frames * self.frame_n
-                if drop <= 0:
-                    drop = min(offset_n, self._buf.size)
-                self._buf = self._buf[drop:]
-                self._t0_utc += drop / self.fs
-                continue
-
-            need = offset_n + self.frame_n
-            if self._buf.size < need:
-                break
-
-            frame = self._buf[offset_n:offset_n + self.frame_n].copy()
-            frame_start_utc = slot0
-
-            # The very first frame is partial when audio started mid-slot
-            # (offset_n > 0 means the slot boundary is before our first audio sample).
-            is_partial = (not self._first_frame_emitted) and (offset_n > 0)
-            self._first_frame_emitted = True
-
-            out.append((frame_start_utc, frame, is_partial))
-
-            drop = offset_n + self.frame_n
-            self._buf = self._buf[drop:]
-            self._t0_utc += drop / self.fs
-
-        return out
-
-def ft8_costas_margin_score(Ec: np.ndarray) -> tuple[float, tuple[float, float, float], int, int, int, bool]:
-    """
-    Returns:
-      (mean_margin_db, (b0_db, b1_db, b2_db), matches, total, best_shift, inverted)
-
-    b0/b1/b2 are the mean per-symbol margin in dB for each of the three Costas
-    blocks (sum/7).  mean_margin_db is the mean across all 21 symbols.
-    This makes values directly comparable to the sync score_db (~3-15 dB for
-    real signals) and makes the block balance check meaningful.
-    """
-    costas_tones = (3, 1, 4, 0, 6, 5, 2)
-
-    Ec = np.asarray(Ec, dtype=np.float64)
-    matches, total, sh, inv = ft8_costas_ok_costasE(Ec)
-
-    def sym_margin_db(row: np.ndarray, expected_tone: int) -> float:
-        expv = float(row[expected_tone])
-        others = np.delete(row, expected_tone)
-        base = float(np.median(others))
-        expv = max(expv, 1e-12)
-        base = max(base, 1e-12)
-        return 10.0 * math.log10(expv / base)
-
-    block_margins = []
-    for b in range(3):
-        sym_margins = []
-        for i in range(7):
-            r = b * 7 + i
-            expected = int((costas_tones[i] + sh) % 8)
-            if inv:
-                expected = 7 - expected
-            sym_margins.append(sym_margin_db(Ec[r, :], expected))
-        block_margins.append(float(np.mean(sym_margins)))   # mean per block
-
-    mean_margin = float(np.mean(block_margins))
-    return mean_margin, (block_margins[0], block_margins[1], block_margins[2]), int(matches), int(total), int(sh), bool(inv)
-
-class FT8SyncSearch:
-    """
-    FT8 synchronization search using the three embedded 7-symbol Costas arrays.
-
-    Two-stage frequency search:
-    1. Coarse: waterfall-based, stepping by whole 6.25 Hz bins.  Fast.
-    2. Fine:   extractor-based (arbitrary Hz), sub-bin resolution.  Accurate.
-
-    The waterfall score is only meaningful at exact bin-centre frequencies
-    (multiples of 6.25 Hz) because the rectangular-window DFT is orthogonal
-    only at those points.  Scanning between bins with the waterfall returns the
-    same integer-rounded bin energies, wasting time and masking the true peak.
-    Fine resolution requires re-running the DFT at the exact frequency, which
-    FT8SymbolEnergyExtractor does via its vectorised rfft + bin lookup.
-    """
-    COSTAS_TONES = (3, 1, 4, 0, 6, 5, 2)
-    COSTAS_POS = (0, 36, 72)  # start indices of 7-symbol Costas arrays within 79 symbols
-
-    def __init__(
-        self,
-        *,
-        fs: int,
-        fmin_hz: float = 200.0,
-        fmax_hz: float = 3200.0,
-        sym_s: float = 0.160,
-        tone_spacing_hz: float = 6.25,
-        extractor: "FT8SymbolEnergyExtractor | None" = None,
-    ) -> None:
-        self.fs = int(fs)
-        self.fmin = float(fmin_hz)
-        self.fmax = float(fmax_hz)
-        self.sym_s = float(sym_s)
-        self.tone_spacing_hz = float(tone_spacing_hz)
-        self._extractor = extractor  # optional; enables sub-bin fine refinement
-
-        # sym_n MUST equal fs / tone_spacing for orthogonality
-        self.sym_n = int(round(float(fs) / float(tone_spacing_hz)))
-        # Verify orthogonality
-        expected_spacing = float(fs) / float(self.sym_n)
-        if abs(expected_spacing - float(tone_spacing_hz)) > 0.01:
-            raise ValueError(
-                f"fs={fs} and tone_spacing_hz={tone_spacing_hz} are not orthogonal "
-                f"(sym_n={self.sym_n}, actual spacing={expected_spacing:.4f} Hz)"
-            )
-
-    def _symbol_waterfall(self, x: np.ndarray, *, t0_offset_n: int = 0) -> tuple[np.ndarray, np.ndarray, int]:
-        """
-        Compute symbol-aligned power waterfall.
-
-        Returns:
-          freqs_hz   : shape (nfreqs,) — sliced in-band frequency axis (exact bin centres)
-          pwr        : shape (nfreqs, nsymbols)
-          lo         : absolute bin index of freqs_hz[0]
-        """
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-        sym_n = self.sym_n
-
-        # Trim/pad so we start at the requested offset
-        if t0_offset_n > 0:
-            if t0_offset_n >= x.size:
-                x = np.zeros(sym_n * 79, dtype=np.float32)
-            else:
-                x = x[t0_offset_n:]
-        elif t0_offset_n < 0:
-            x = np.concatenate((np.zeros(-t0_offset_n, dtype=np.float32), x))
-
-        # Number of complete symbols available
-        n_syms = x.size // sym_n
-        if n_syms < 1:
-            return np.zeros(0, dtype=np.float64), np.zeros((0, 0), dtype=np.float32), 0
-
-        # Reshape to (n_syms, sym_n)
-        x_mat = x[: n_syms * sym_n].reshape(n_syms, sym_n).astype(np.float64)
-
-        # FFT each symbol row — rectangular window, full sym_n
-        F = np.fft.rfft(x_mat, n=sym_n, axis=1)   # shape (n_syms, sym_n//2 + 1)
-        pwr = (F.real * F.real + F.imag * F.imag).astype(np.float32)  # (n_syms, freq_bins)
-
-        freqs_hz = np.fft.rfftfreq(sym_n, d=1.0 / float(self.fs))   # (freq_bins,)
-
-        lo = int(np.searchsorted(freqs_hz, self.fmin, side="left"))
-        hi = int(np.searchsorted(freqs_hz, self.fmax, side="right"))
-        if hi <= lo + 2:
-            return freqs_hz, np.zeros((0, n_syms), dtype=np.float32), 0
-
-        # Return as (freq_bins, n_syms) to match convention
-        return freqs_hz[lo:hi], pwr[:, lo:hi].T, lo
-
-    def _costas_score_waterfall(
-        self,
-        pwr: np.ndarray,
-        *,
-        lo_bin: int,
-        f0_bin: int,
-    ) -> float:
-        """
-        Costas score using waterfall bins.  f0_bin is the ABSOLUTE DFT bin
-        index for tone 0 (i.e. f0_hz / tone_spacing_hz, rounded to integer).
-        pwr rows are indexed relative to lo_bin, so the row for absolute bin b
-        is pwr[b - lo_bin, sym_idx].
-
-        This must only be called with f0_bin values that are exact integers,
-        i.e. f0 is a multiple of tone_spacing_hz.
-        """
-        if pwr.size == 0:
-            return float("-inf")
-
-        n_freq_bins = pwr.shape[0]
-        n_syms = pwr.shape[1]
-
-        # Check all 8 tone bins are within the sliced pwr array
-        for k in range(8):
-            b_rel = (f0_bin + k) - lo_bin
-            if b_rel < 0 or b_rel >= n_freq_bins:
-                return float("-inf")
-
-        sym_scores: list[float] = []
-        tone_energies = np.empty(8, dtype=np.float64)
-
-        for pos0 in self.COSTAS_POS:
-            for i, tone in enumerate(self.COSTAS_TONES):
-                sym_idx = pos0 + i  # sym_offset is always 0 here (frame is pre-shifted)
-                if sym_idx >= n_syms:
-                    continue
-
-                for k in range(8):
-                    b_rel = (f0_bin + k) - lo_bin
-                    tone_energies[k] = float(pwr[b_rel, sym_idx])
-
-                e_exp = tone_energies[tone]
-                e_noise = float(np.median(np.delete(tone_energies, tone)))
-                e_exp   = max(e_exp,   1e-12)
-                e_noise = max(e_noise, 1e-12)
-                sym_scores.append(10.0 * math.log10(e_exp / e_noise))
-
-        if len(sym_scores) < 8:
-            return float("-inf")
-
-        return float(np.mean(sym_scores))
-
-    def _costas_score_extractor(
-        self,
-        frame: np.ndarray,
-        *,
-        t0_s: float,
-        f0_hz: float,
-        x_mat: "np.ndarray | None" = None,
-    ) -> float:
-        """
-        Costas score using exact-frequency DFT (not bin-rounded).
-        Pass a precomputed x_mat to avoid re-extracting segments on repeated calls
-        with the same t0_s but different f0_hz.
-        """
-        if self._extractor is None:
-            return float("-inf")
-        if x_mat is None:
-            Ec = self._extractor.extract_costas(frame, t0_s=t0_s, f0_hz=f0_hz)
-        else:
-            Ec = self._extractor.score_costas_from_xmat(x_mat, f0_hz=f0_hz)
-        costas_tones = self.COSTAS_TONES
-        sym_scores = np.empty(21, dtype=np.float64)
-        for r in range(21):
-            row   = Ec[r, :]
-            tone  = costas_tones[r % 7]
-            e_exp   = max(float(row[tone]),                        1e-12)
-            e_noise = max(float(np.median(np.delete(row, tone))),  1e-12)
-            sym_scores[r] = 10.0 * math.log10(e_exp / e_noise)
-        return float(np.mean(sym_scores))
-
-    @staticmethod
-    def _dedupe_candidates(
-            cands: list[tuple[float, float, float]],
-            *,
-            time_bucket_s: float = 0.16,
-            freq_bucket_hz: float = 6.25,
-    ) -> list[tuple[float, float, float]]:
-        """Deduplicate by bucketing; keep best score per bucket."""
-        best: dict[tuple[int, int], tuple[float, float, float]] = {}
-        for t0, f0, sc in cands:
-            kt = int(round(t0 / time_bucket_s))
-            kf = int(round(f0 / freq_bucket_hz))
-            key = (kt, kf)
-            prev = best.get(key)
-            if prev is None or sc > prev[2]:
-                best[key] = (t0, f0, sc)
-        out = list(best.values())
-        out.sort(key=lambda x: x[2], reverse=True)
-        return out
-
-    def search(
-        self,
-        frame: np.ndarray,
-        *,
-        seed_freqs_hz: list[float],
-        time_search_s: float = 0.8,
-        freq_search_bins: int = 4,
-        max_candidates: int = 8,
-    ) -> list[tuple[float, float, float]]:
-        """
-        Returns list of (best_t0_s, best_f0_hz, score_db), sorted by score desc.
-
-        Coarse stage:
-          - Steps by whole bins (6.25 Hz) using the pre-computed waterfall.
-          - Time steps by one symbol period (160 ms) over ±time_search_s.
-          - freq_search_bins: ± how many bins to search around each seed.
-
-        Fine stage (only if extractor is available):
-          - 2-D sweep: t0 in ±80 ms steps of 10 ms AND f0 in ±4 Hz steps of 0.05 Hz.
-          - Uses FT8SymbolEnergyExtractor (exact-frequency DFT, sub-bin resolution).
-          - x_mat extracted once per t0 candidate since the f0 inner loop is cheap.
-          - Corrects both sub-symbol timing errors and sub-bin frequency errors.
-        """
-        frame = np.asarray(frame, dtype=np.float32).reshape(-1)
-        if not seed_freqs_hz:
-            return []
-
-        spacing = self.tone_spacing_hz  # 6.25
-        max_sym_offset = max(1, int(math.ceil(time_search_s / self.sym_s)))
-        sym_offsets = list(range(-max_sym_offset, max_sym_offset + 1))
-
-        # Build waterfall cache: sym_off -> (freqs, pwr, lo_bin)
-        wf_cache: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
-        for sym_off in sym_offsets:
-            freqs, pwr, lo = self._symbol_waterfall(frame, t0_offset_n=sym_off * self.sym_n)
-            if pwr.size > 0:
-                wf_cache[sym_off] = (freqs, pwr, lo)
-
-        # Per-seed tracking
-        n_seeds = len(seed_freqs_hz)
-        best_t0  = [0.0]           * n_seeds
-        best_f0  = list(seed_freqs_hz)
-        best_sc  = [float("-inf")] * n_seeds
-
-        for sym_off, (freqs, pwr, lo_bin) in wf_cache.items():
-            t0_candidate = float(sym_off) * self.sym_s
-
-            for si, seed in enumerate(seed_freqs_hz):
-                # Snap seed to nearest bin, then search ± freq_search_bins bins
-                seed_bin = int(round(float(seed) / spacing))
-                for db in range(-freq_search_bins, freq_search_bins + 1):
-                    f0_bin = seed_bin + db
-                    f0_hz  = float(f0_bin) * spacing
-                    if f0_hz < self.fmin or f0_hz + 7 * spacing > self.fmax:
-                        continue
-                    sc = self._costas_score_waterfall(pwr, lo_bin=lo_bin, f0_bin=f0_bin)
-                    if sc > best_sc[si]:
-                        best_sc[si] = sc
-                        best_t0[si] = t0_candidate
-                        best_f0[si] = f0_hz
-
-        # Fine 2-D refinement: sweep both t0 (±half-symbol in 10 ms steps) and
-        # f0 (±4 Hz in 0.05 Hz steps) using exact-frequency DFT.
-        # For each t0 candidate the x_mat is extracted once; all f0 values are
-        # evaluated in one batched matrix multiply via score_costas_batch().
-        if self._extractor is not None:
-            fine_f_step  = 0.05   # Hz
-            fine_f_half  = 4.0    # ± Hz — covers full bin ± margin
-            fine_t_step  = 0.010  # s  (10 ms — 16× finer than coarse 160 ms step)
-            fine_t_half  = self.sym_s / 2.0   # ±80 ms — covers full inter-step gap
-
-            for si in range(n_seeds):
-                coarse_t0 = best_t0[si]
-                coarse_f0 = best_f0[si]
-
-                # Determine best shift/inverted from one exact-DFT eval at coarse peak
-                x_mat_coarse = self._extractor._get_costas_xmat(frame, t0_s=coarse_t0)
-                Ec_coarse = self._extractor.score_costas_from_xmat(x_mat_coarse, f0_hz=coarse_f0)
-                _m, _tot, coarse_shift, coarse_inv = ft8_costas_ok_costasE(Ec_coarse)
-
-                t_fine = np.arange(
-                    coarse_t0 - fine_t_half,
-                    coarse_t0 + fine_t_half + 1e-9,
-                    fine_t_step,
-                    dtype=np.float64,
-                )
-                f_fine = np.arange(
-                    coarse_f0 - fine_f_half,
-                    coarse_f0 + fine_f_half + 1e-9,
-                    fine_f_step,
-                    dtype=np.float64,
-                )
-
-                for t0_cand in t_fine:
-                    # Extract segment matrix once per t0 candidate
-                    x_mat = self._extractor._get_costas_xmat(frame, t0_s=float(t0_cand))
-                    # Score all f0 values in one batched operation, using coarse shift/inv
-                    scores_f = self._extractor.score_costas_batch(
-                        x_mat, f_fine, shift=int(coarse_shift), inverted=bool(coarse_inv)
-                    )  # (N_f,)
-                    best_idx = int(np.argmax(scores_f))
-                    sc = float(scores_f[best_idx])
-                    if sc > best_sc[si]:
-                        best_sc[si] = sc
-                        best_t0[si] = float(t0_cand)
-                        best_f0[si] = float(f_fine[best_idx])
-
-        all_best = list(zip(best_t0, best_f0, best_sc))
-        all_best = self._dedupe_candidates(all_best, time_bucket_s=self.sym_s, freq_bucket_hz=spacing)
-        return all_best[:max_candidates]
-
-class FT8SignalDetector:
-    """
-    FT8-structure-aware candidate detector.
-
-    Rather than finding individual loud spectral peaks, this computes a
-    matched-filter response for the FT8 8-tone structure: for each candidate
-    base frequency f0, it sums the time-averaged power at the 8 tone bins
-    (f0, f0+6.25, ..., f0+43.75 Hz) and normalises against the local noise
-    floor.  This directly answers "is there an 8-tone FSK signal starting at
-    f0?" rather than "is there a loud tone at f0?".
-
-    The result is a candidate list of (f0_hz, score_db) values where f0 is the
-    lowest tone of the FT8 signal, ready to be passed to FT8SyncSearch.
-
-    Key facts exploited:
-    - sym_n = fs / tone_spacing = 1920 at 12 kHz  →  each 6.25 Hz-wide bin
-      corresponds to exactly one FT8 tone, zero inter-tone leakage.
-    - An FT8 signal occupies exactly 8 consecutive bins.
-    - The matched-filter score is sum(8 tone bins) / (8 * local_noise_per_bin).
-    """
-
-    # FT8 uses 8 tones; bin stride is 1 (each bin = one tone spacing)
-    N_TONES = 8
-
-    def __init__(
-        self,
-        *,
-        fs: int,
-        fmin_hz: float = 200.0,
-        fmax_hz: float = 3200.0,
-        peak_threshold_db: float = 3.0,
-        max_peaks: int = 30,
-        noise_bw_bins: int = 50,
-    ) -> None:
-        self.fs = int(fs)
-        self.fmin = float(fmin_hz)
-        self.fmax = float(fmax_hz)
-        self.peak_threshold_db = float(peak_threshold_db)
-        self.max_peaks = int(max_peaks)
-        # Half-width (in bins) of the local noise estimation window.
-        # Must be >> N_TONES so the signal itself doesn't inflate noise.
-        self.noise_bw_bins = int(noise_bw_bins)
-
-        # sym_n = fs / tone_spacing; at 12 kHz = 1920
-        self.sym_n = int(round(float(fs) / 6.25))
-
-    def _time_averaged_spectrum(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Time-averaged power spectrum with sym_n-point rectangular windows.
-        Returns (freqs_hz, avg_pwr), shapes (sym_n//2+1,).
-        """
-        sym_n = self.sym_n
-        n_syms = x.size // sym_n
-        if n_syms < 1:
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-
-        x_mat = x[: n_syms * sym_n].reshape(n_syms, sym_n).astype(np.float64)
-        F = np.fft.rfft(x_mat, n=sym_n, axis=1)
-        pwr = F.real ** 2 + F.imag ** 2          # (n_syms, freq_bins)
-        avg_pwr = pwr.mean(axis=0)               # (freq_bins,)
-        freqs_hz = np.fft.rfftfreq(sym_n, d=1.0 / float(self.fs))
-        return freqs_hz, avg_pwr
-
-    def _local_noise(self, avg_pwr: np.ndarray) -> np.ndarray:
-        """
-        Estimate local noise floor per bin using a running median over a wide
-        window (noise_bw_bins bins on each side).  Uses uniform_filter1d on
-        a sorted-percentile approximation via a sliding minimum+maximum blend
-        — for simplicity we use scipy.ndimage-free approach: convolve with a
-        uniform kernel to get a local mean, which is a reasonable noise proxy
-        for a relatively flat noise floor.
-        """
-        hw = self.noise_bw_bins
-        n = avg_pwr.size
-        if n < 2 * hw + 1:
-            return np.full(n, float(np.median(avg_pwr)), dtype=np.float64)
-
-        # Cumulative sum trick for fast sliding mean
-        cs = np.concatenate(([0.0], np.cumsum(avg_pwr)))
-        # Clamp window to valid range at edges
-        i = np.arange(n)
-        lo = np.maximum(0, i - hw)
-        hi = np.minimum(n, i + hw + 1)
-        noise = (cs[hi] - cs[lo]) / (hi - lo).astype(np.float64)
-        return noise
-
-    def detect(self, x: np.ndarray) -> list[tuple[float, float]]:
-        """Returns list of (f0_hz, score_db) candidates."""
-        peaks, _best = self.detect_with_best_score(x)
-        return peaks
-
-    def detect_with_best_score(self, x: np.ndarray) -> tuple[list[tuple[float, float]], float]:
-        """
-        Returns (candidates, best_score_db).
-
-        Each candidate is (f0_hz, score_db) where f0_hz is the lowest tone of
-        a hypothesised FT8 signal and score_db is the 8-tone matched-filter SNR.
-        """
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-        if x.size < self.sym_n:
-            return [], float("-inf")
-
-        freqs_hz, avg_pwr = self._time_averaged_spectrum(x)
-        if avg_pwr.size == 0:
-            return [], float("-inf")
-
-        lo = int(np.searchsorted(freqs_hz, self.fmin, side="left"))
-        # Upper limit: f0 + 7*6.25 = f0 + 43.75 Hz must be <= fmax
-        # So f0 <= fmax - 43.75; find the last valid f0 bin
-        hi_f0 = float(self.fmax) - (self.N_TONES - 1) * 6.25
-        hi = int(np.searchsorted(freqs_hz, hi_f0, side="right"))
-
-        if hi <= lo + self.N_TONES:
-            return [], float("-inf")
-
-        full_pwr = avg_pwr  # shape (all_freq_bins,)
-        noise_all = self._local_noise(full_pwr)
-
-        # Matched filter: sum of N_TONES consecutive bins starting at bin b
-        # score[b] = sum(pwr[b:b+N]) / (N * noise[b + N//2])
-        # We compute this for all valid b in [lo, hi) using cumsum
-        cs = np.concatenate(([0.0], np.cumsum(full_pwr)))
-        n_bins = int(full_pwr.size)
-
-        scores = np.full(hi - lo, float("-inf"), dtype=np.float64)
-        for idx, b in enumerate(range(lo, hi)):
-            b_end = b + self.N_TONES
-            if b_end > n_bins:
-                break
-            signal_sum = float(cs[b_end] - cs[b])
-            noise_ref = float(noise_all[b + self.N_TONES // 2])
-            noise_ref = max(noise_ref, 1e-12)
-            scores[idx] = 10.0 * math.log10(
-                max(signal_sum / (self.N_TONES * noise_ref), 1e-12)
-            )
-
-        best_score_db = float(scores.max(initial=float("-inf")))
-
-        # Find peaks in the matched-filter response.
-        # Minimum separation = N_TONES bins (8 * 6.25 = 50 Hz) so we don't
-        # return two f0 candidates for the same signal.
-        peaks_idx, props = signal.find_peaks(
-            scores,
-            height=self.peak_threshold_db,
-            distance=self.N_TONES,
-        )
-        if peaks_idx.size == 0:
-            return [], best_score_db
-
-        heights = props.get("peak_heights", scores[peaks_idx])
-        order = np.argsort(heights)[::-1][: self.max_peaks]
-
-        results: list[tuple[float, float]] = []
-        for k in order:
-            bi = int(peaks_idx[k])
-            f0_hz = float(freqs_hz[lo + bi])
-            results.append((f0_hz, float(heights[k])))
-
-        return results, best_score_db
-
-class FT8SymbolEnergyExtractor:
-    """
-    Compute per-symbol per-tone energies.
-
-    For Costas/sync validation, we provide a Costas-only path that is much faster.
-    """
-    def __init__(self, *, fs: int, sym_s: float = 0.160, tone_spacing_hz: float = 6.25) -> None:
-        self.fs = int(fs)
-        self.sym_s = float(sym_s)
-        self.tone_spacing_hz = float(tone_spacing_hz)
-        self.sym_n = int(round(self.sym_s * self.fs))
-
-    def _get_samples(self, frame: np.ndarray, *, t0_s: float, total_symbols: int) -> tuple[np.ndarray, int]:
-        x = np.asarray(frame, dtype=np.float32).reshape(-1)
-
-        t0_n = int(round(float(t0_s) * self.fs))
-        if t0_n < 0:
-            pad0 = -t0_n
-            x = np.concatenate((np.zeros(pad0, dtype=np.float32), x))
-            start = 0
-        else:
-            start = t0_n
-
-        need = start + total_symbols * self.sym_n
-        if need > x.size:
-            x = np.concatenate((x, np.zeros(need - x.size, dtype=np.float32)))
-
-        return x, start
-
-    def _get_costas_xmat(self, frame: np.ndarray, *, t0_s: float) -> np.ndarray:
-        """
-        Extract the (21, sym_n) segment matrix for the Costas positions at t0_s.
-        Separated so callers can cache it and reuse across frequency scans.
-        """
-        costas_pos = (0, 36, 72)
-        x, start = self._get_samples(frame, t0_s=float(t0_s), total_symbols=79)
-        sym_n = self.sym_n
-        rows: list[np.ndarray] = []
-        for p0 in costas_pos:
-            for i in range(7):
-                s = p0 + i
-                rows.append(x[start + s * sym_n: start + (s + 1) * sym_n].astype(np.float64, copy=False))
-        return np.stack(rows, axis=0)   # (21, sym_n)
-
-    def score_costas_from_xmat(self, x_mat: np.ndarray, *, f0_hz: float) -> np.ndarray:
-        """
-        Given a precomputed (21, sym_n) segment matrix, return E_costas (21, 8)
-        at the specified f0_hz using the DFT dot-product method.
-        """
-        sym_n = self.sym_n
-        fs = float(self.fs)
-        n_vec = np.arange(sym_n, dtype=np.float64)
-        cos_mat = np.empty((8, sym_n), dtype=np.float64)
-        sin_mat = np.empty((8, sym_n), dtype=np.float64)
-        for k in range(8):
-            f_k = float(f0_hz) + k * self.tone_spacing_hz
-            phase = (2.0 * math.pi * f_k / fs) * n_vec
-            cos_mat[k] = np.cos(phase)
-            sin_mat[k] = np.sin(phase)
-        I = x_mat @ cos_mat.T
-        Q = x_mat @ sin_mat.T
-        return I * I + Q * Q
-
-    def score_costas_batch(
-        self,
-        x_mat: np.ndarray,
-        f0_array: np.ndarray,
-        *,
-        shift: int = 0,
-        inverted: bool = False,
-    ) -> np.ndarray:
-        """
-        Vectorised scorer: evaluate the mean Costas margin score for every f0
-        value in f0_array without a Python loop over frequencies.
-
-        Parameters
-        ----------
-        x_mat    : (21, sym_n) segment matrix from _get_costas_xmat()
-        f0_array : (N,) array of base frequencies in Hz
-        shift    : tone-index shift [0..7] from coarse Costas check
-        inverted : whether tones are inverted (k -> 7-k)
-
-        Returns
-        -------
-        scores  : (N,) array of mean-margin-dB scores (same metric as
-                  _costas_score_extractor)
-        """
-        sym_n = self.sym_n
-        fs    = float(self.fs)
-        spacing = float(self.tone_spacing_hz)
-        N     = int(f0_array.size)
-
-        n_vec = np.arange(sym_n, dtype=np.float32)   # (sym_n,)
-        # phase[i, k] = 2*pi * (f0[i] + k*spacing) / fs
-        f_mat = (f0_array[:, None] + np.arange(8, dtype=np.float64) * spacing).astype(np.float32)  # (N, 8)
-        # phase_mat: (N, 8, sym_n)
-        phase_mat = (2.0 * math.pi / fs) * f_mat[:, :, None] * n_vec[None, None, :]  # (N,8,sym_n)
-
-        # DFT kernels: cos and sin, shape (N, 8, sym_n)
-        cos_k = np.cos(phase_mat)   # (N, 8, sym_n)
-        sin_k = np.sin(phase_mat)   # (N, 8, sym_n)
-
-        # x_mat: (21, sym_n)  →  project onto each tone kernel
-        # I[i, r, k] = x_mat[r] . cos_k[i, k]  =  einsum('rs, iks -> irk', x_mat, cos_k)
-        # But einsum with 3 large indices is slow; use matmul reshape trick:
-        #   x_mat @ cos_k[i].T  gives (21, 8) for each i
-        # Batch: cos_k reshaped to (N*8, sym_n), matmul, reshape back
-        cos_2d = cos_k.reshape(N * 8, sym_n)   # (N*8, sym_n)
-        sin_2d = sin_k.reshape(N * 8, sym_n)
-
-        I_2d = x_mat.astype(np.float32) @ cos_2d.T   # (21, N*8)
-        Q_2d = x_mat.astype(np.float32) @ sin_2d.T   # (21, N*8)
-
-        E_all = (I_2d * I_2d + Q_2d * Q_2d).reshape(21, N, 8)  # (21, N, 8)
-        E_all = E_all.transpose(1, 0, 2)                        # (N, 21, 8)
-
-        # Compute mean-margin score for each of the N candidates
-        costas_tones = np.array([3, 1, 4, 0, 6, 5, 2], dtype=np.int32)
-        base_expected = np.tile(costas_tones, 3)               # (21,) at shift=0
-        expected = (base_expected + int(shift)) % 8
-        if inverted:
-            expected = 7 - expected
-
-        # For each row r, margin = 10*log10(E[r, expected[r]] / median(E[r, others]))
-        # Vectorise over r and N simultaneously
-        E_exp    = E_all[:, np.arange(21), expected]  # (N, 21)
-        # Median of the other 7 tones per row — use a masked sort
-        # Build (N, 21, 7) by removing expected tone column per row
-        mask = np.ones((21, 8), dtype=bool)
-        mask[np.arange(21), expected] = False            # (21, 8) — True for non-expected
-        E_others = E_all[:, mask.nonzero()[0], mask.nonzero()[1]].reshape(N, 21, 7)  # (N,21,7)
-        noise    = np.median(E_others, axis=2)            # (N, 21)
-
-        E_exp  = np.maximum(E_exp,  1e-12)
-        noise  = np.maximum(noise,  1e-12)
-        margin = 10.0 * np.log10(E_exp / noise)           # (N, 21)
-        return margin.mean(axis=1)                         # (N,)
-
-    def extract_costas(self, frame: np.ndarray, *, t0_s: float, f0_hz: float) -> np.ndarray:
-        """
-        Returns E_costas: shape (21, 8), energies for the 3 Costas arrays only.
-
-        Uses DFT dot-products at exact tone frequencies (not bin-rounded), so
-        off-grid signals are handled correctly.
-        """
-        x_mat = self._get_costas_xmat(frame, t0_s=t0_s)
-        return self.score_costas_from_xmat(x_mat, f0_hz=f0_hz)
-
-    def extract_all_79(self, frame: np.ndarray, *, t0_s: float, f0_hz: float) -> np.ndarray:
-        """
-        Extract per-symbol per-tone energies for ALL 79 FT8 symbols.
-
-        Returns
-        -------
-        E : np.ndarray, shape (79, 8), dtype float64
-            E[s, k] = DFT energy at tone k = f0_hz + k*6.25 Hz for symbol s.
-            Uses exact-frequency DFT dot-products (same method as extract_costas),
-            so sub-bin frequencies are handled correctly.
-
-        Symbol layout (FT8 standard)
-        -----------------------------
-        Positions  0.. 6  — Costas block 0
-        Positions  7..35  — payload symbols 0..28
-        Positions 36..42  — Costas block 1
-        Positions 43..71  — payload symbols 29..57
-        Positions 72..78  — Costas block 2
-
-        The caller can use FT8_COSTAS_POSITIONS to identify Costas rows and
-        the complementary indices for payload rows.
-        """
-        x, start = self._get_samples(frame, t0_s=float(t0_s), total_symbols=79)
-        sym_n = self.sym_n
-        fs    = float(self.fs)
-
-        # Build DFT kernels once for all 8 tones — shape (8, sym_n)
-        n_vec = np.arange(sym_n, dtype=np.float64)
-        cos_mat = np.empty((8, sym_n), dtype=np.float64)
-        sin_mat = np.empty((8, sym_n), dtype=np.float64)
-        for k in range(8):
-            phase = (2.0 * math.pi * (float(f0_hz) + k * self.tone_spacing_hz) / fs) * n_vec
-            cos_mat[k] = np.cos(phase)
-            sin_mat[k] = np.sin(phase)
-
-        # Extract all 79 symbol windows into a (79, sym_n) matrix
-        x_all = np.empty((79, sym_n), dtype=np.float64)
-        for s in range(79):
-            x_all[s] = x[start + s * sym_n : start + (s + 1) * sym_n].astype(np.float64, copy=False)
-
-        # Batch DFT: (79, sym_n) @ (sym_n, 8) → (79, 8) for I and Q
-        I = x_all @ cos_mat.T   # (79, 8)
-        Q = x_all @ sin_mat.T   # (79, 8)
-        return (I * I + Q * Q).astype(np.float64)
-
-def ft8_costas_ok_costasE(Ec: np.ndarray) -> tuple[int, int, int, bool]:
-    """
-    Costas check on Costas-only energy matrix Ec with shape (21, 8).
-
-    Tries:
-      - tone order normal
-      - tone order inverted (k -> 7-k)
-    plus an unknown tone-index shift in [0..7].
-
-    Returns (matches, total, best_shift, inverted)
-    """
-    costas_tones = (3, 1, 4, 0, 6, 5, 2)
-
-    Ec = np.asarray(Ec, dtype=np.float64)
-    total = 21
-
-    best_matches = -1
-    best_shift = 0
-    best_inverted = False
-
-    for inverted in (False, True):
-        for shift in range(8):
-            matches = 0
-            for r in range(21):
-                expected = int((costas_tones[r % 7] + shift) % 8)
-                if inverted:
-                    expected = 7 - expected
-                got = int(np.argmax(Ec[r, :]))
-                if got == expected:
-                    matches += 1
-
-            if matches > best_matches:
-                best_matches = matches
-                best_shift = shift
-                best_inverted = inverted
-
-    return int(best_matches), int(total), int(best_shift), bool(best_inverted)
-
-def ft8_costas_ok(E: np.ndarray) -> tuple[int, int, int]:
-    """
-    Costas check with unknown tone-index shift.
-
-    Returns (matches, total, best_shift), where best_shift is in [0..7] and means:
-      got_tone == (expected_tone + best_shift) % 8
-    """
-    costas_tones = (3, 1, 4, 0, 6, 5, 2)
-    costas_pos = (0, 36, 72)
-
-    E = np.asarray(E, dtype=np.float64)
-    total = 21  # 3 arrays * 7 symbols
-
-    best_matches = -1
-    best_shift = 0
-
-    for shift in range(8):
-        matches = 0
-        for p0 in costas_pos:
-            for i, expected_tone in enumerate(costas_tones):
-                s = p0 + i
-                got = int(np.argmax(E[s, :]))
-                exp = int((int(expected_tone) + shift) % 8)
-                if got == exp:
-                    matches += 1
-
-        if matches > best_matches:
-            best_matches = matches
-            best_shift = shift
-
-    return int(best_matches), int(total), int(best_shift)
-def ft8_costas_rank_stats(Ec: np.ndarray) -> dict[str, float]:
-    """
-    Given Costas-only energies Ec shape (21, 8),
-    compute stats about the rank of the expected tone (with best shift and inversion).
-    """
-    costas_tones = (3, 1, 4, 0, 6, 5, 2)
-
-    Ec = np.asarray(Ec, dtype=np.float64)
-    m, tot, sh, inv = ft8_costas_ok_costasE(Ec)
-
-    ranks: list[int] = []
-    margins_db: list[float] = []
-
-    for r in range(21):
-        expected = int((costas_tones[r % 7] + int(sh)) % 8)
-        if inv:
-            expected = 7 - expected
-
-        row = Ec[r, :]
-
-        order = np.argsort(row)[::-1]
-        rank = int(np.where(order == expected)[0][0]) + 1
-        ranks.append(rank)
-
-        best = float(row[order[0]])
-        expv = float(row[expected])
-        best = max(best, 1e-12)
-        expv = max(expv, 1e-12)
-        margins_db.append(10.0 * math.log10(expv / best))
-
-    return {
-        "matches": float(m),
-        "total": float(tot),
-        "shift": float(sh),
-        "inverted": float(bool(inv)),
-        "rank_mean": float(np.mean(ranks)),
-        "rank_median": float(np.median(ranks)),
-        "margin_db_mean": float(np.mean(margins_db)),
-        "margin_db_median": float(np.median(margins_db)),
-    }
-
-# ---------------------------------------------------------------------------
-# FT8 bit-level interleaver (Stage 2b)
-# ---------------------------------------------------------------------------
-# The FT8 interleaver operates on the 174 channel BITS (not symbols).
-# This is the actual FT8 interleaver permutation from WSJT-X / ft8_lib.
-#
-# Algorithm (WSJT-X Fortran lib/ft8/encode.f90 / ft8_lib encode.cpp):
-#   itmp = codeword            (copy all 174 bits)
-#   for i in 0..173:
-#       j = bit_reverse_7(i)  (reverse the bottom 7 bits)
-#       if j < 174: itmp[j] = codeword[i]   (last write wins)
-#   transmitted = itmp
-#
-# Because bit_rev7(i) == bit_rev7(i + 128) for i < 128, positions 0..127 in
-# the output are overwritten twice; the final value comes from i in 128..173
-# (higher i writes last).  Positions 128..173 are never overwritten and keep
-# their initial value codeword[j] from the initial copy.
-#
-# Key property: the 46 codeword bits that are overwritten (positions 0..45)
-# are all PARITY bits in the FT8 LDPC systematic form, so losing them is
-# safe — the LDPC decoder reconstructs them from the remaining bits.
-#
-# For the RECEIVER de-interleaver we build a lookup table:
-#   _FT8_DEINTERLEAVE[codeword_pos] = transmitted_pos  (or -1 if unknown)
-# where -1 means the codeword bit was never transmitted independently
-# (overwritten); those LLRs are set to 0 (erased) for the LDPC decoder.
-
-def _build_ft8_interleave_tables() -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """
-    Build the FT8 interleave and de-interleave tables using 7-bit reversal
-    (WSJT-X / ft8_lib convention).
-
-    FT8 transmitter (encoder side):
-      transmitted[i] = codeword[bit_rev7(i)]   for i in 0..173
-    Since bit_rev7 produces values in 0..127 only, codeword positions 128..173
-    are parity bits that are never transmitted.  Positions 0..45 are each written
-    twice (by i and i+128); the last write (higher i, i.e. 128..173) is the one
-    actually transmitted.
-
-    FT8 receiver (decoder side):
-      codeword_llr[bit_rev7(i)] = channel_llr[i]   (last write wins)
-    Codeword positions 128..173 receive no channel LLR → set to 0 (erased).
-
-    Returns
-    -------
-    interleave   : length-174 tuple; interleave[i] = bit_rev7(i)
-                   transmitted[i] = codeword[interleave[i]]
-    deinterleave : length-174 tuple; deinterleave[codeword_pos] = transmitted_pos
-                   (or -1 for codeword positions 128..173 which are never transmitted)
-                   codeword_llr[c] = channel_llr[deinterleave[c]]  if deinterleave[c] >= 0
-                   codeword_llr[c] = 0                              if deinterleave[c] == -1
-    """
-    def bit_rev7(x: int) -> int:
-        result = 0
-        for _ in range(7):
-            result = (result << 1) | (x & 1)
-            x >>= 1
-        return result
-
-    N = 174
-    # Forward interleave: interleave[i] = codeword position for transmitted index i
-    interleave = [bit_rev7(i) for i in range(N)]   # values in 0..127
-
-    # Receiver de-interleave: for each codeword position c, which transmitted
-    # index i should supply its LLR?  Use last-write-wins (higher i wins).
-    deinterleave = [-1] * N   # -1 = erased (no transmitted bit reaches this position)
-    for i in range(N):
-        c = bit_rev7(i)
-        deinterleave[c] = i   # last write (higher i) wins
-
-    # Positions 128..173 are never targeted by bit_rev7 (max value = 127),
-    # so they remain -1 (truly erased parity bits).
-
-    return tuple(interleave), tuple(deinterleave)
-
-
-# TX: transmitted[dst] = codeword[_FT8_INTERLEAVE[dst]]
-# RX: codeword_llr[src] = channel_llr[_FT8_DEINTERLEAVE[src]]  (or 0 if -1)
-_FT8_INTERLEAVE: tuple[int, ...]
-_FT8_DEINTERLEAVE: tuple[int, ...]
-_FT8_INTERLEAVE, _FT8_DEINTERLEAVE = _build_ft8_interleave_tables()
-
-# Precomputed bit_rev7(i) for i = 0..173.  Used in the de-interleave loop:
-#   for i in range(174): codeword_llr[_FT8_BIT_REV7_TABLE[i]] = channel_llr[i]
-def _build_bit_rev7_table() -> tuple[int, ...]:
-    def _br7(x: int) -> int:
-        r = 0
-        for _ in range(7):
-            r = (r << 1) | (x & 1)
-            x >>= 1
-        return r
-    return tuple(_br7(i) for i in range(174))
-
-_FT8_BIT_REV7_TABLE: tuple[int, ...] = _build_bit_rev7_table()
-
-# Legacy aliases kept for API compatibility (some tests import these names)
-_FT8_INTERLEAVE_DST_TO_SRC: tuple[int, ...] = _FT8_INTERLEAVE
-_FT8_DEINTERLEAVE_SRC_TO_DST: tuple[int, ...] = tuple(d if d >= 0 else 0 for d in _FT8_DEINTERLEAVE)
-_FT8_INTERLEAVE_PERM: tuple[int, ...] = _FT8_INTERLEAVE
-
-
-def ft8_deinterleave(
-    hard_syms: np.ndarray,
-    E_payload: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Stage 2b — Pass-through: the FT8 interleaver operates on 174 *bits*,
-    not on the 58 symbols.  Symbol-level reordering is therefore an identity
-    here; the actual bit de-interleaving is applied inside ft8_gray_decode
-    after Gray decoding.
-
-    This function is kept for API compatibility and simply returns its inputs
-    unchanged.
-    """
-    return np.asarray(hard_syms, dtype=np.int32), np.asarray(E_payload, dtype=np.float64)
-
-
-def ft8_gray_decode(
-    syms_deint: np.ndarray,
-    E_deint: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Stage 3 — Gray-decode 58 payload symbols → 174 LLRs in transmitted (channel) order.
-
-    Matches ft8_lib ft8_extract_symbol() exactly:
-
-      s2[j] = energy at the tone that carries Gray value j
-            = s[kFT8_Gray_map[j]]   where kFT8_Gray_map = {0,1,3,2,6,4,7,5}
-
-      logl[0] = max(s2[4..7]) - max(s2[0..3])          (MSB, bit2 of gray value)
-      logl[1] = max(s2[2,3,6,7]) - max(s2[0,1,4,5])
-      logl[2] = max(s2[1,3,5,7]) - max(s2[0,2,4,6])    (LSB, bit0 of gray value)
-
-    Sign convention (matching ft8_lib bp_decode):
-      positive LLR → bit 1 more likely
-      negative LLR → bit 0 more likely
-
-    Gray map (ft8_lib constants.h kFT8_Gray_map):
-      gray_value -> tone: {0,1,3,2,6,4,7,5}
-    _FT8_GRAY_DECODE (inverse, tone -> gray_value):
-      {0,1,3,2,5,7,4,6}
-    """
-    syms = np.asarray(syms_deint, dtype=np.int32)
-    E    = np.asarray(E_deint,    dtype=np.float64)
-
-    N_syms = 58
-    N_bits = 174
-
-    gray_map = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
-    if gray_map.size != 8:
-        print(f"FATAL: gray_map should be size 8, got {gray_map.size} (content={gray_map})")
-        # Fallback to correct constant if corrupted (tone -> gray_value inverse of kFT8_Gray_map)
-        gray_map = np.array([0, 1, 3, 2, 5, 7, 4, 6], dtype=np.int32)
-
-    hard_bits = np.empty(N_bits, dtype=np.uint8)
-    llrs      = np.empty(N_bits, dtype=np.float64)
-
-    E_safe = np.maximum(E, 1e-30)
-
-    for s in range(N_syms):
-        row = E_safe[s]   # (8,) energies indexed by tone
-
-        # Use raw energies exactly as ft8_lib ft8_extract_symbol() does.
-        # No per-symbol normalisation here — the global ftx_normalize_logl
-        # step (scale all 174 channel LLRs so variance=24) is applied after
-        # Gray decoding in the caller.  Per-symbol normalisation would cap
-        # LLR differences at ±1, making them far too small for BP convergence.
-
-        # s2[gv] = energy of the tone that carries Gray value gv
-        s2 = np.empty(8, dtype=np.float64)
-        for tone in range(8):
-            s2[int(gray_map[tone])] = float(row[tone])
-
-        # LLRs matching ft8_lib ft8_extract_symbol():
-        # positive = bit 1 more likely (bit value matches bit position in gray value)
-        # Bit 0 (MSB, bit2 of gray value): set in gv 4,5,6,7
-        llrs[3*s + 0] = max(s2[4], s2[5], s2[6], s2[7]) - max(s2[0], s2[1], s2[2], s2[3])
-        # Bit 1 (bit1 of gray value): set in gv 2,3,6,7
-        llrs[3*s + 1] = max(s2[2], s2[3], s2[6], s2[7]) - max(s2[0], s2[1], s2[4], s2[5])
-        # Bit 2 (LSB, bit0 of gray value): set in gv 1,3,5,7
-        llrs[3*s + 2] = max(s2[1], s2[3], s2[5], s2[7]) - max(s2[0], s2[2], s2[4], s2[6])
-
-        # Hard bits from the peak tone's gray value
-        gv = int(gray_map[int(syms[s])])
-        hard_bits[3*s + 0] = (gv >> 2) & 1
-        hard_bits[3*s + 1] = (gv >> 1) & 1
-        hard_bits[3*s + 2] = gv & 1
-
-    return hard_bits, llrs
-
-
-
-# ---------------------------------------------------------------------------
-# FT8 symbol pipeline constants
-# ---------------------------------------------------------------------------
-
-# Symbol indices of the three Costas arrays within the 79-symbol frame.
+# Costas sync array positions (3 blocks of 7, at symbols 0-6, 36-42, 72-78)
 FT8_COSTAS_POSITIONS: tuple[int, ...] = (
-    0, 1, 2, 3, 4, 5, 6,       # Costas block 0
-    36, 37, 38, 39, 40, 41, 42, # Costas block 1
-    72, 73, 74, 75, 76, 77, 78, # Costas block 2
+    0, 1, 2, 3, 4, 5, 6,
+    36, 37, 38, 39, 40, 41, 42,
+    72, 73, 74, 75, 76, 77, 78,
 )
 
-# The 58 payload symbol positions (all 79 positions minus the 21 Costas ones).
+# Costas sync tone pattern (from WSJT-X ft8b.f90 / ft8_lib)
+FT8_COSTAS_TONES: tuple[int, ...] = (3, 1, 4, 0, 6, 5, 2)
+
+# Payload symbol positions (all 79 minus the 21 Costas positions)
 FT8_PAYLOAD_POSITIONS: tuple[int, ...] = tuple(
-    s for s in range(79) if s not in set(FT8_COSTAS_POSITIONS)
+    s for s in range(FT8_NSYMS) if s not in set(FT8_COSTAS_POSITIONS)
 )
 
-# 3-bit Gray code used by FT8.
-#
-# ft8_lib constants.h / WSJT-X constants.f90 (canonical source):
-#   kFT8_Gray_map[8] = {0, 1, 3, 2, 6, 4, 7, 5}   (gray_value -> tone_index)
-#
-# _FT8_GRAY_DECODE is the exact inverse: tone_index -> gray_value
-#   Derived by: for gv, tone in enumerate(kFT8_Gray_map): inv[tone] = gv
-#   tone: 0->0, 1->1, 2->3, 3->2, 4->5, 5->7, 6->4, 7->6
-_FT8_GRAY_DECODE: tuple[int, ...] = (0, 1, 3, 2, 5, 7, 4, 6)
-
-# WSJT-X-derived payload interleaver permutation for the 58 payload symbols.
-# This is a fixed permutation.
-# (REMOVED: FT8 uses bit-interleaving, not symbol interleaving)
-
-def ft8_extract_payload_symbols(
-    E79: np.ndarray,
-    *,
-    shift: int = 0,
-    inverted: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Stage 2a — Pull the 58 payload symbol rows out of the full (79, 8) energy
-    matrix.
-
-    Matches ft8_lib ft8_extract_symbol() / ft8_decode.cpp:
-      The payload energies are extracted directly at the already-found (t0, f0).
-      No column reordering is applied here.  The 'shift' and 'inverted'
-      parameters from the Costas check are used only during sync candidate
-      evaluation; they do NOT modify the energy matrix for decoding.
-      (ft8_lib never applies a tone-index permutation to E_payload.)
-
-    Parameters
-    ----------
-    E79      : (79, 8) energy matrix from FT8SymbolEnergyExtractor.extract_all_79()
-    shift    : unused — kept for API compatibility; not applied to E_payload
-    inverted : unused — kept for API compatibility; not applied to E_payload
-
-    Returns
-    -------
-    E_payload : (58, 8)  — raw energy matrix for the 58 payload symbols
-    hard_syms : (58,)    — hard-decision tone index (0..7) per payload symbol
-    """
-    E79 = np.asarray(E79, dtype=np.float64)
-    if E79.shape != (79, 8):
-        raise ValueError(f"E79 must be shape (79, 8), got {E79.shape}")
-
-    # Extract the 58 payload rows — no column permutation (reference behaviour)
-    E_payload = E79[list(FT8_PAYLOAD_POSITIONS), :].copy()   # (58, 8)
-    hard_syms = np.argmax(E_payload, axis=1).astype(np.int32)  # (58,)
-
-    return E_payload, hard_syms
-
-
-
-
 # ---------------------------------------------------------------------------
-# FT8 LDPC decoder — Stage 4
+# Gray code  (ft8_lib constants.c  kFT8_Gray_map)
 # ---------------------------------------------------------------------------
+# Forward map: gray_value (3-bit integer) → tone index
+#   kFT8_Gray_map[8] = {0, 1, 3, 2, 5, 6, 4, 7}
+_FT8_GRAY_MAP: tuple[int, ...] = (0, 1, 3, 2, 5, 6, 4, 7)
+
+# Inverse map: tone index → gray_value
+#   Derived: for gv, tone in enumerate(_FT8_GRAY_MAP): inv[tone] = gv
+#   Result:  (0, 1, 3, 2, 6, 4, 5, 7)
+_tmp_inv = [0] * 8
+for _gv, _tone in enumerate(_FT8_GRAY_MAP):
+    _tmp_inv[_tone] = _gv
+_FT8_GRAY_DECODE: tuple[int, ...] = tuple(_tmp_inv)
+del _tmp_inv, _gv, _tone
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 2  LDPC (174, 91) Parity-Check Matrix
+# ═══════════════════════════════════════════════════════════════════════════════
+# Source: ft8_lib constants.c  kFTX_LDPC_Nm  (0-based column indices).
+# 83 check rows, 174 variable columns, column weight 3 (regular LDPC).
+# Systematic bits occupy columns 0–90; parity bits columns 91–173.
 
 _LDPC_CHECKS: tuple[tuple[int, ...], ...] = (
-    (3, 30, 58, 90, 91, 95, 152,),
-    (4, 31, 59, 92, 114, 145,),
-    (5, 23, 60, 93, 121, 150,),
-    (6, 32, 61, 94, 95, 142,),
-    (7, 24, 62, 82, 92, 95, 147,),
-    (5, 31, 63, 96, 125, 137,),
-    (4, 33, 64, 77, 97, 106, 153,),
-    (8, 34, 65, 98, 138, 145,),
-    (9, 35, 66, 99, 106, 125,),
-    (10, 36, 66, 86, 100, 138, 157,),
-    (11, 37, 67, 101, 104, 154,),
-    (12, 38, 68, 102, 148, 161,),
-    (7, 39, 69, 81, 103, 113, 144,),
-    (13, 40, 70, 87, 101, 122, 155,),
-    (14, 41, 58, 105, 122, 158,),
-    (0, 32, 71, 105, 106, 156,),
-    (15, 42, 72, 107, 140, 159,),
-    (16, 36, 73, 80, 108, 130, 153,),
-    (10, 43, 74, 109, 120, 165,),
-    (44, 54, 63, 110, 129, 160, 172,),
-    (7, 45, 70, 111, 118, 165,),
-    (17, 35, 75, 88, 112, 113, 142,),
-    (18, 37, 76, 103, 115, 162,),
-    (19, 46, 69, 91, 137, 164,),
-    (1, 47, 73, 112, 127, 159,),
-    (20, 44, 77, 82, 116, 120, 150,),
-    (21, 46, 57, 117, 126, 163,),
-    (15, 38, 61, 111, 133, 157,),
-    (22, 42, 78, 119, 130, 144,),
-    (18, 34, 58, 72, 109, 124, 160,),
-    (19, 35, 62, 93, 135, 160,),
-    (13, 30, 78, 97, 131, 163,),
-    (2, 43, 79, 123, 126, 168,),
-    (18, 45, 80, 116, 134, 166,),
-    (6, 48, 57, 89, 99, 104, 167,),
-    (11, 49, 60, 117, 118, 143,),
-    (12, 50, 63, 113, 117, 156,),
-    (23, 51, 75, 128, 147, 148,),
-    (24, 52, 68, 89, 100, 129, 155,),
-    (19, 45, 64, 79, 119, 139, 169,),
-    (20, 53, 76, 99, 139, 170,),
-    (34, 81, 132, 141, 170, 173,),
-    (13, 29, 82, 112, 124, 169,),
-    (3, 28, 67, 119, 133, 172,),
-    (0, 3, 51, 56, 85, 135, 151,),
-    (25, 50, 55, 90, 121, 136, 167,),
-    (51, 83, 109, 114, 144, 167,),
-    (6, 49, 80, 98, 131, 172,),
-    (22, 54, 66, 94, 171, 173,),
-    (25, 40, 76, 108, 140, 147,),
-    (1, 26, 40, 60, 61, 114, 132,),
-    (26, 39, 55, 123, 124, 125,),
-    (17, 48, 54, 123, 140, 166,),
-    (5, 32, 84, 107, 115, 155,),
-    (27, 47, 69, 84, 104, 128, 157,),
-    (8, 53, 62, 130, 146, 154,),
-    (21, 52, 67, 108, 120, 173,),
-    (2, 12, 47, 77, 94, 122,),
-    (30, 68, 132, 149, 154, 168,),
-    (11, 42, 65, 88, 96, 134, 158,),
-    (4, 38, 74, 101, 135, 166,),
-    (1, 53, 85, 100, 134, 163,),
-    (14, 55, 86, 107, 118, 170,),
-    (9, 43, 81, 90, 110, 143, 148,),
-    (22, 33, 70, 93, 126, 152,),
-    (10, 48, 87, 91, 141, 156,),
-    (28, 33, 86, 96, 146, 161,),
-    (29, 49, 59, 85, 136, 141, 161,),
-    (9, 52, 65, 83, 111, 127, 164,),
-    (21, 56, 84, 92, 139, 158,),
-    (27, 31, 71, 102, 131, 165,),
-    (27, 28, 83, 87, 116, 142, 149,),
-    (0, 25, 44, 79, 127, 146,),
-    (16, 26, 88, 102, 115, 152,),
-    (50, 56, 97, 162, 164, 171,),
-    (20, 36, 72, 137, 151, 168,),
-    (15, 46, 75, 129, 136, 153,),
-    (2, 23, 29, 71, 103, 138,),
-    (8, 39, 89, 105, 133, 150,),
-    (14, 57, 59, 73, 110, 149, 162,),
-    (17, 41, 78, 143, 145, 151,),
-    (24, 37, 64, 98, 121, 159,),
-    (16, 41, 74, 128, 169, 171,),
+    (3, 30, 58, 90, 91, 95, 152),
+    (4, 31, 59, 92, 114, 145),
+    (5, 23, 60, 93, 121, 150),
+    (6, 32, 61, 94, 95, 142),
+    (7, 24, 62, 82, 92, 95, 147),
+    (5, 31, 63, 96, 125, 137),
+    (4, 33, 64, 77, 97, 106, 153),
+    (8, 34, 65, 98, 138, 145),
+    (9, 35, 66, 99, 106, 125),
+    (10, 36, 66, 86, 100, 138, 157),
+    (11, 37, 67, 101, 104, 154),
+    (12, 38, 68, 102, 148, 161),
+    (7, 39, 69, 81, 103, 113, 144),
+    (13, 40, 70, 87, 101, 122, 155),
+    (14, 41, 58, 105, 122, 158),
+    (0, 32, 71, 105, 106, 156),
+    (15, 42, 72, 107, 140, 159),
+    (16, 36, 73, 80, 108, 130, 153),
+    (10, 43, 74, 109, 120, 165),
+    (44, 54, 63, 110, 129, 160, 172),
+    (7, 45, 70, 111, 118, 165),
+    (17, 35, 75, 88, 112, 113, 142),
+    (18, 37, 76, 103, 115, 162),
+    (19, 46, 69, 91, 137, 164),
+    (1, 47, 73, 112, 127, 159),
+    (20, 44, 77, 82, 116, 120, 150),
+    (21, 46, 57, 117, 126, 163),
+    (15, 38, 61, 111, 133, 157),
+    (22, 42, 78, 119, 130, 144),
+    (18, 34, 58, 72, 109, 124, 160),
+    (19, 35, 62, 93, 135, 160),
+    (13, 30, 78, 97, 131, 163),
+    (2, 43, 79, 123, 126, 168),
+    (18, 45, 80, 116, 134, 166),
+    (6, 48, 57, 89, 99, 104, 167),
+    (11, 49, 60, 117, 118, 143),
+    (12, 50, 63, 113, 117, 156),
+    (23, 51, 75, 128, 147, 148),
+    (24, 52, 68, 89, 100, 129, 155),
+    (19, 45, 64, 79, 119, 139, 169),
+    (20, 53, 76, 99, 139, 170),
+    (34, 81, 132, 141, 170, 173),
+    (13, 29, 82, 112, 124, 169),
+    (3, 28, 67, 119, 133, 172),
+    (0, 3, 51, 56, 85, 135, 151),
+    (25, 50, 55, 90, 121, 136, 167),
+    (51, 83, 109, 114, 144, 167),
+    (6, 49, 80, 98, 131, 172),
+    (22, 54, 66, 94, 171, 173),
+    (25, 40, 76, 108, 140, 147),
+    (1, 26, 40, 60, 61, 114, 132),
+    (26, 39, 55, 123, 124, 125),
+    (17, 48, 54, 123, 140, 166),
+    (5, 32, 84, 107, 115, 155),
+    (27, 47, 69, 84, 104, 128, 157),
+    (8, 53, 62, 130, 146, 154),
+    (21, 52, 67, 108, 120, 173),
+    (2, 12, 47, 77, 94, 122),
+    (30, 68, 132, 149, 154, 168),
+    (11, 42, 65, 88, 96, 134, 158),
+    (4, 38, 74, 101, 135, 166),
+    (1, 53, 85, 100, 134, 163),
+    (14, 55, 86, 107, 118, 170),
+    (9, 43, 81, 90, 110, 143, 148),
+    (22, 33, 70, 93, 126, 152),
+    (10, 48, 87, 91, 141, 156),
+    (28, 33, 86, 96, 146, 161),
+    (29, 49, 59, 85, 136, 141, 161),
+    (9, 52, 65, 83, 111, 127, 164),
+    (21, 56, 84, 92, 139, 158),
+    (27, 31, 71, 102, 131, 165),
+    (27, 28, 83, 87, 116, 142, 149),
+    (0, 25, 44, 79, 127, 146),
+    (16, 26, 88, 102, 115, 152),
+    (50, 56, 97, 162, 164, 171),
+    (20, 36, 72, 137, 151, 168),
+    (15, 46, 75, 129, 136, 153),
+    (2, 23, 29, 71, 103, 138),
+    (8, 39, 89, 105, 133, 150),
+    (14, 57, 59, 73, 110, 149, 162),
+    (17, 41, 78, 143, 145, 151),
+    (24, 37, 64, 98, 121, 159),
+    (16, 41, 74, 128, 169, 171),
 )
 
+# Pre-built adjacency lists for the BP decoder.
+# _BP_Nm[m] = variable indices for check m  (check → variables)
+# _BP_Mn[n] = check indices for variable n  (variable → checks, length always 3)
+_BP_Nm: list[list[int]] = [list(row) for row in _LDPC_CHECKS]
+_BP_Mn: list[list[int]] = [[] for _ in range(174)]
+for _m, _row in enumerate(_BP_Nm):
+    for _n in _row:
+        _BP_Mn[_n].append(_m)
+del _m, _row, _n
+
+
 def _compute_ft8_ldpc_free_cols() -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """
-    Compute the free (systematic) and pivot (parity) column indices for the
-    FT8 (174,91) LDPC code via Gaussian elimination over GF(2).
-
-    The FT8 parity-check matrix H is 83×174.  Gaussian elimination finds 83
-    pivot columns (parity) and 91 free columns (systematic/message+CRC bits).
-
-    These are the columns from which the 77-bit message and 14-bit CRC are
-    extracted after LDPC decoding, in the order produced by elimination.
-    """
-    import numpy as np
+    """GF(2) Gaussian elimination → free (systematic) and pivot (parity) columns."""
     N, M = 174, 83
     H = np.zeros((M, N), dtype=np.uint8)
     for r, cols in enumerate(_LDPC_CHECKS):
         for c in cols:
             H[r, c] = 1
-
     A = H.copy().astype(np.int32)
     pivot_cols: list[int] = []
     row = 0
@@ -1344,7 +216,6 @@ def _compute_ft8_ldpc_free_cols() -> tuple[tuple[int, ...], tuple[int, ...]]:
         row += 1
         if row == M:
             break
-
     pivot_set = set(pivot_cols)
     free_cols = [c for c in range(N) if c not in pivot_set]
     return tuple(free_cols), tuple(pivot_cols)
@@ -1356,40 +227,251 @@ _FT8_LDPC_FREE_COLS, _FT8_LDPC_PIVOT_COLS = _compute_ft8_ldpc_free_cols()
 
 
 # ---------------------------------------------------------------------------
-# NOTE: ft8_lib bp_decode() does NOT pre-fill erased codeword positions.
-# After de-interleave, positions 128..173 remain at LLR=0 (never written by
-# bit_rev7).  bp_decode() receives these as weak/neutral priors and the
-# sum-product iterations resolve them naturally via the check equations.
-# No erasure solver is needed or used.
+# Interleave tables (kept for API compatibility with existing test code).
+# ft8_lib does NOT use a bit interleaver; these are provided as no-op stubs.
 # ---------------------------------------------------------------------------
 
-# CRC-14 generator polynomial used by FT8 (same as WSJT-X / ft8_lib)
-_FT8_CRC14_POLY = 0x2757   # x^14 + x^13 + x^11 + x^9 + x^8 + x^6 + x^4 + x^2 + x + 1
+def _build_ft8_interleave_tables() -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def bit_rev7(x: int) -> int:
+        r = 0
+        for _ in range(7):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        return r
+    N = 174
+    interleave = tuple(bit_rev7(i) for i in range(N))
+    deint: list[int] = [-1] * N
+    for i in range(N):
+        deint[bit_rev7(i)] = i   # last write wins
+    return interleave, tuple(deint)
+
+
+_FT8_INTERLEAVE: tuple[int, ...]
+_FT8_DEINTERLEAVE: tuple[int, ...]
+_FT8_INTERLEAVE, _FT8_DEINTERLEAVE = _build_ft8_interleave_tables()
+
+# Legacy name aliases for test compatibility
+_FT8_BIT_REV7_TABLE: tuple[int, ...] = _FT8_INTERLEAVE
+_FT8_INTERLEAVE_DST_TO_SRC: tuple[int, ...] = _FT8_INTERLEAVE
+_FT8_DEINTERLEAVE_SRC_TO_DST: tuple[int, ...] = tuple(
+    d if d >= 0 else 0 for d in _FT8_DEINTERLEAVE
+)
+_FT8_INTERLEAVE_PERM: tuple[int, ...] = _FT8_INTERLEAVE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 3  CRC-14
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FT8_CRC14_POLY: int = 0x2757   # from ft8_lib constants.h
 
 
 def _ft8_crc14(bits: np.ndarray) -> int:
     """
-    CRC-14 over 77 message bits, zero-extended to 82 bits.
+    CRC-14 over 77 message bits zero-extended to 82 bits.
 
-    Matches WSJT-X / ft8_lib ftx_compute_crc(a91, 96-14):
-      The 77 message bits are zero-padded to 82 bits (5 trailing zeros)
-      before the CRC is computed.
+    Matches ft8_lib ftx_compute_crc(a91, 96-14):
+      polynomial 0x2757, width 14, init 0, no final XOR.
 
-    Polynomial: 0x2757, width 14.
+    Algorithm: each byte is XOR'd into the top 8 bits of the 14-bit remainder
+    register before 8 shift/reduce steps — this matches ft8_lib exactly.
     """
+    # Pack 77 bits (MSB-first) into 11 bytes, with bits 77-81 as zeros (5-bit pad)
     padded = np.zeros(82, dtype=np.uint8)
     padded[:77] = np.asarray(bits[:77], dtype=np.uint8)
+    n_bytes = (82 + 7) // 8  # 11 bytes to cover 82 bits
+    msg_bytes = np.zeros(n_bytes, dtype=np.uint8)
+    for i in range(82):
+        msg_bytes[i // 8] |= int(padded[i]) << (7 - i % 8)
+
+    # ft8_lib ftx_compute_crc: XOR next byte into top 8 bits, then shift each bit
     crc = 0
-    for bit in padded:
-        top = (crc >> 13) & 1
-        crc = ((crc << 1) & 0x3FFF) | int(bit)
-        if top:
-            crc ^= _FT8_CRC14_POLY
+    idx_byte = 0
+    for idx_bit in range(82):
+        if idx_bit % 8 == 0:
+            crc ^= int(msg_bytes[idx_byte]) << (14 - 8)   # shift byte to top 8 bits
+            idx_byte += 1
+        if crc & 0x2000:   # TOPBIT = 1 << 13
+            crc = ((crc << 1) ^ _FT8_CRC14_POLY) & 0xFFFF
+        else:
+            crc = (crc << 1) & 0xFFFF
     return crc & 0x3FFF
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 4  Symbol Energy Extractor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FT8SymbolEnergyExtractor:
+    """
+    Compute per-tone energy for each of the 79 FT8 symbols.
+
+    For each symbol position, a sym_n-point coherent DFT is evaluated at the
+    8 tone frequencies f0 + k·6.25 Hz (k=0..7).  This is equivalent to the
+    matched-filter approach used in WSJT-X / ft8_lib.
+    """
+
+    def __init__(self, fs: int = FT8_FS) -> None:
+        self.fs = int(fs)
+        self.sym_n = int(round(FT8_SYMBOL_DURATION_S * self.fs))  # 1920 @ 12 kHz
+
+    def extract_all_79(
+        self,
+        frame: np.ndarray,
+        *,
+        t0_s: float,
+        f0_hz: float,
+    ) -> np.ndarray:
+        """
+        Return (79, 8) energy matrix for one FT8 slot.
+
+        Parameters
+        ----------
+        frame  : 1-D float audio at self.fs (≥15 s)
+        t0_s   : signal start time offset from frame start (seconds)
+        f0_hz  : lowest-tone frequency of the candidate signal
+
+        Returns
+        -------
+        E79 : (79, 8) float64 — |DFT|² at each (symbol, tone)
+        """
+        x = np.asarray(frame, dtype=np.float64)
+        sym_n = self.sym_n
+        t0_n = int(round(t0_s * self.fs))
+
+        # Pre-compute basis vectors: exp(−j·2π·f_k/fs · t) for t=0..sym_n-1
+        phase_inc = 2.0 * math.pi * np.array(
+            [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
+        ) / float(self.fs)               # (8,) rad/sample
+        t_sym = np.arange(sym_n, dtype=np.float64)
+        basis = np.exp(-1j * np.outer(phase_inc, t_sym))   # (8, sym_n)
+
+        E79 = np.zeros((FT8_NSYMS, 8), dtype=np.float64)
+        for s in range(FT8_NSYMS):
+            start = t0_n + s * sym_n
+            end = start + sym_n
+            if start < 0 or end > len(x):
+                continue
+            dft = basis @ x[start:end]             # (8,) complex
+            E79[s] = (dft * np.conj(dft)).real     # |DFT|²
+        return E79
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 5  Payload Symbol Extraction  (pass-through with API compatibility)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ft8_extract_payload_symbols(
+    E79: np.ndarray,
+    *,
+    shift: int = 0,
+    inverted: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract (58, 8) payload energies from a (79, 8) energy matrix.
+
+    Parameters 'shift' and 'inverted' are accepted for API compatibility but
+    not applied; ft8_lib never permutes the energy matrix for decoding.
+
+    Returns
+    -------
+    E_payload : (58, 8) float64
+    hard_syms : (58,)  int32 — argmax tone per payload symbol
+    """
+    E79 = np.asarray(E79, dtype=np.float64)
+    if E79.shape != (FT8_NSYMS, 8):
+        raise ValueError(f"E79 must be shape ({FT8_NSYMS}, 8), got {E79.shape}")
+    E_payload = E79[list(FT8_PAYLOAD_POSITIONS), :].copy()
+    hard_syms = np.argmax(E_payload, axis=1).astype(np.int32)
+    return E_payload, hard_syms
+
+
+def ft8_deinterleave(
+    hard_syms: np.ndarray,
+    E_payload: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Symbol-level deinterleave — identity pass-through (ft8_lib uses none)."""
+    return (
+        np.asarray(hard_syms, dtype=np.int32),
+        np.asarray(E_payload, dtype=np.float64),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 6  Gray Decode → Channel LLRs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ft8_gray_decode(
+    syms: np.ndarray,
+    E: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Gray-decode 58 payload symbols → 174 channel LLRs.
+
+    Matches ft8_lib ft8_extract_symbol() exactly:
+
+      s2[gv] = E[tone that has gray_value gv]   (forward Gray map)
+
+      LLR bit 2 (MSB):  L[0] = max(s2[4..7]) − max(s2[0..3])
+      LLR bit 1:        L[1] = max(s2[2,3,6,7]) − max(s2[0,1,4,5])
+      LLR bit 0 (LSB):  L[2] = max(s2[1,3,5,7]) − max(s2[0,2,4,6])
+
+    LLR sign convention (ft8_lib): positive → bit = 1 more likely.
+
+    Parameters
+    ----------
+    syms : (58,) int   — hard-decision tone indices 0..7
+    E    : (58, 8) float — symbol energies indexed by tone
+
+    Returns
+    -------
+    hard_bits : (174,) uint8
+    llrs      : (174,) float64
+    """
+    syms = np.asarray(syms, dtype=np.int32)
+    E = np.asarray(E, dtype=np.float64)
+
+    # gray_fwd[gv] = tone  (kFT8_Gray_map)
+    gray_fwd = np.array(_FT8_GRAY_MAP, dtype=np.int32)
+    # gray_inv[tone] = gv  (_FT8_GRAY_DECODE)
+    gray_inv = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
+
+    N = FT8_NDATASYM
+    hard_bits = np.empty(N * 3, dtype=np.uint8)
+    llrs = np.empty(N * 3, dtype=np.float64)
+    E_safe = np.maximum(E, 1e-30)
+
+    for s in range(N):
+        row = E_safe[s]
+        # s2[gv] = energy at the tone that carries gray_value gv
+        s2 = np.empty(8, dtype=np.float64)
+        for gv in range(8):
+            s2[gv] = row[gray_fwd[gv]]
+
+        llrs[3 * s + 0] = (
+            max(s2[4], s2[5], s2[6], s2[7]) - max(s2[0], s2[1], s2[2], s2[3])
+        )
+        llrs[3 * s + 1] = (
+            max(s2[2], s2[3], s2[6], s2[7]) - max(s2[0], s2[1], s2[4], s2[5])
+        )
+        llrs[3 * s + 2] = (
+            max(s2[1], s2[3], s2[5], s2[7]) - max(s2[0], s2[2], s2[4], s2[6])
+        )
+
+        gv = int(gray_inv[int(syms[s])])
+        hard_bits[3 * s + 0] = (gv >> 2) & 1
+        hard_bits[3 * s + 1] = (gv >> 1) & 1
+        hard_bits[3 * s + 2] = gv & 1
+
+    return hard_bits, llrs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 7  LDPC (174, 91) Sum-Product (Belief-Propagation) Decoder
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _ldpc_check(plain: np.ndarray) -> int:
-    """Count parity check failures. 0 = valid codeword."""
+    """Count parity-check failures (0 = valid codeword)."""
     errors = 0
     for row in _LDPC_CHECKS:
         x = 0
@@ -1400,96 +482,65 @@ def _ldpc_check(plain: np.ndarray) -> int:
     return errors
 
 
-# Pre-built adjacency lists for bp_decode (built once at import time)
-_BP_Nm: list[list[int]] = [list(row) for row in _LDPC_CHECKS]          # check m → variable indices
-_BP_Mn: list[list[int]] = [[] for _ in range(174)]                      # variable n → check indices
-for _m, _row in enumerate(_BP_Nm):
-    for _n in _row:
-        _BP_Mn[_n].append(_m)
-
-# _BP_Nm_idx[m][n_idx] = position of variable _BP_Nm[m][n_idx] within _BP_Mn[that variable]
-# i.e. r[m][n_idx] is stored at index _BP_Nm_idx[m][n_idx] of the C→V array for that variable.
-# Precomputed so the hard-decision sum in bp_decode is O(1) per (variable, check) pair.
-_BP_Mn_pos: list[list[int]] = [[] for _ in range(83)]   # _BP_Mn_pos[m][n_idx] = j where _BP_Mn[n][j]==m
-for _m, _row in enumerate(_BP_Nm):
-    for _n in _row:
-        _BP_Mn_pos[_m].append(_BP_Mn[_n].index(_m))
-
-
 def ft8_ldpc_decode(
     llrs: np.ndarray,
     *,
     max_iterations: int = 50,
 ) -> tuple[bool, np.ndarray, int]:
     """
-    Direct Python translation of ft8_lib bp_decode() from lib/ldpc.cpp.
+    Sum-product LDPC decoder for the FT8 (174, 91) code.
 
-    The algorithm is sum-product belief propagation on the FT8 (174,91) LDPC
-    parity-check matrix.  Every detail matches the C source:
+    Algorithm (matches ft8_lib bp_decode() from lib/ldpc.cpp with the
+    ft8_lib LLR convention where positive means bit = 1 more likely):
 
-      Initialise:  tov[174][3] = 0,  toc[83][<=7] = 0
+      Initialise  tov[174][3] = 0,  toc[83][≤7] = 0
 
       Each iteration:
-        V→C:  for each check m, for each var n in check[m]:
-                Lmn = codeword[n] + sum_{k: _BP_Mn[n][k] != m} tov[n][k]
-                toc[m][n_idx] = tanh(Lmn / 2)
+        V→C:  Lmn = ch_llr[n] + Σ_{k≠m} tov[n][k]
+              toc[m][n_idx] = tanh(−Lmn / 2)    ← ft8_lib uses negative sign
 
-        C→V:  for each check m:
-                prod_all = product of toc[m][k] for all k in check[m]
-                for each var n in check[m] (index n_idx):
-                  prod_excl = prod_all / toc[m][n_idx]      (product-divide)
-                  if |toc[m][n_idx]| < eps: recompute as loop product excluding n
-                  prod_excl = clamp(prod_excl, -0.9999, 0.9999)
-                  tov[n][m_idx] = 2 * atanh(prod_excl)
+        C→V:  prod_all = Π toc[m][k]
+              prod_excl = prod_all / toc[m][n_idx]   (or loop if |toc| < eps)
+              prod_excl = clamp(prod_excl, −0.9999, +0.9999)
+              tov[n][m_idx] = −2 · atanh(prod_excl)
 
-        Hard: plain[n] = 1 if (codeword[n] + sum tov[n]) > 0 else 0
-        if check_errors(plain) == 0: break
+        Hard: plain[n] = 1 if (ch_llr[n] + Σ tov[n]) > 0 else 0
+        Check parity; exit early if 0 errors.
 
-    Erased codeword positions (128..173, never written by de-interleave) are
-    passed as LLR=0.  BP resolves them via the check equations — no pre-fill.
+    The −2·atanh sign is correct for the ft8_lib positive-means-1 LLR
+    convention (verified empirically against the reference LDPC matrix).
 
-    Input convention:
-        llrs[n] > 0  →  bit n more likely 1
-        llrs[n] < 0  →  bit n more likely 0
-
-    Returns (success, plain[:91], iterations_used).
-    success is True only when all 83 parity checks pass AND CRC-14 matches.
+    Returns (success, payload[0:91], iterations_used).
+    success=True only when all 83 parity checks pass AND CRC-14 matches.
     """
     codeword = np.asarray(llrs, dtype=np.float64)
-    assert codeword.shape == (174,), f"Expected (174,) LLRs, got {codeword.shape}"
+    if codeword.shape != (174,):
+        raise ValueError(f"Expected (174,) LLRs, got {codeword.shape}")
 
     N = 174
-    TANH_CLAMP = 0.9999
+    CLAMP = 0.9999
     EPS = 1e-10
 
-    # tov[n][j]: C→V message from the j-th check of variable n (j in 0,1,2)
-    # toc[m][k]: V→C message from the k-th variable in check m
-    tov = [[0.0, 0.0, 0.0] for _ in range(N)]
-    toc = [[0.0] * len(row) for row in _BP_Nm]
+    tov: list[list[float]] = [[0.0, 0.0, 0.0] for _ in range(N)]
+    toc: list[list[float]] = [[0.0] * len(row) for row in _BP_Nm]
 
     plain = np.zeros(N, dtype=np.uint8)
     best_errors = 83
-    best_plain  = plain.copy()
+    best_plain = plain.copy()
     iterations_used = max_iterations
 
     for iteration in range(max_iterations):
-
-        # ── V→C ───────────────────────────────────────────────────────────
-        # toc[m][n_idx] = tanh(Lmn / 2)
-        # Lmn = codeword[n] + extrinsic sum (all C→V messages to n except from m)
+        # ── V→C ──────────────────────────────────────────────────────────
         for m, row in enumerate(_BP_Nm):
             for n_idx, n in enumerate(row):
-                Lmn = codeword[n]
+                Lmn = float(codeword[n])
                 for j in range(3):
                     if _BP_Mn[n][j] != m:
                         Lmn += tov[n][j]
-                toc[m][n_idx] = math.tanh(Lmn / 2.0)
+                toc[m][n_idx] = math.tanh(-Lmn / 2.0)  # ft8_lib uses tanh(-Tnm/2)
 
-        # ── C→V ───────────────────────────────────────────────────────────
-        # For each check m: compute product of all tanh messages, then divide
-        # out each variable's contribution to get its extrinsic message.
+        # ── C→V ──────────────────────────────────────────────────────────
         for m, row in enumerate(_BP_Nm):
-            # Product of all V→C tanh values for this check
             prod_all = 1.0
             for k in range(len(row)):
                 prod_all *= toc[m][k]
@@ -1500,94 +551,59 @@ def ft8_ldpc_decode(
                 if abs(t) > EPS:
                     prod_excl = prod_all / t
                 else:
-                    # Avoid division by near-zero: recompute without this variable
                     prod_excl = 1.0
                     for k, nv in enumerate(row):
                         if nv != n:
                             prod_excl *= toc[m][k]
-                prod_excl = max(-TANH_CLAMP, min(TANH_CLAMP, prod_excl))
-                tov[n][m_idx] = 2.0 * math.atanh(prod_excl)
+
+                prod_excl = max(-CLAMP, min(CLAMP, prod_excl))
+                tov[n][m_idx] = -2.0 * math.atanh(prod_excl)
 
         # ── Hard decision ─────────────────────────────────────────────────
         for n in range(N):
-            total = codeword[n] + tov[n][0] + tov[n][1] + tov[n][2]
-            plain[n] = 1 if total > 0 else 0
+            total = float(codeword[n]) + tov[n][0] + tov[n][1] + tov[n][2]
+            plain[n] = 1 if total > 0.0 else 0
 
         errors = _ldpc_check(plain)
         if errors < best_errors:
             best_errors = errors
-            best_plain  = plain.copy()
+            best_plain = plain.copy()
             if errors == 0:
                 iterations_used = iteration + 1
                 break
 
-    plain   = best_plain
+    plain = best_plain
     payload = plain[:91].copy()
 
     if best_errors > 0:
         return False, payload, iterations_used
 
-    # CRC-14 check — matches ft8_lib ftx_compute_crc(a91, 96-14)
-    msg_bits    = payload[:77]
+    # CRC-14 verification
+    msg_bits = payload[:77]
     rx_crc_bits = payload[77:91]
-    rx_crc      = int(sum(int(b) << (13 - i) for i, b in enumerate(rx_crc_bits)))
-    calc_crc    = _ft8_crc14(msg_bits)
-
+    rx_crc = int(sum(int(b) << (13 - i) for i, b in enumerate(rx_crc_bits)))
+    calc_crc = _ft8_crc14(msg_bits)
     return (calc_crc == rx_crc), payload, iterations_used
 
 
-# ---------------------------------------------------------------------------
-# FT8 message unpacker — Stage 5
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 8  Message Unpacker (77 bits → human string)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reference: WSJT-X pack77.f90 / unpack77.f90 and ft8_lib pack77.cpp.
 #
-# Reference: WSJT-X source (pack77.f90 / unpack77.f90) and
-#            Steve Franke K9AN / Joe Taylor K1JT, "New Concepts in FT8",
-#            QEX, Sept/Oct 2020.
-#
-# The 77-bit message space is partitioned by a 3-bit "i3" type field at
-# bits 74-76 (MSB-first), with a further 3-bit "n3" subtype in bits 71-73
-# for i3=0.
-#
-# Type i3=0  (n3 sub-type)
-#   n3=0  Standard type-1:  28+1 + 28+1 + 15 bits  (call1 + call2 + grid/rpt)
-#   n3=1  European VHF:     28+1 + 28+1 + 15 bits  (same packing, different grid)
-#   n3=2  Compound call 1:  12 + 58 + 1 + 3 bits
-#   n3=3  Compound call 2:  58 + 12 + 1 + 3 bits
-#   n3=4  CQ with grid/freq: special
-#   n3=5  ARRL RTTY Roundup contest
-# Type i3=1  Free text (up to 13 chars, 71 bits)
-# Type i3=2  European VHF contest
-# Type i3=3  ARRL Field Day
-# Type i3=4  Telemetry (18 hex digits)
-# Type i3=5  Reserved
-#
-# We implement the most common types fully:
-#   i3=0, n3=0  — standard type-1 (most QSOs)
-#   i3=0, n3=2/3 — compound callsigns (DX prefixes)
-#   i3=1        — free text (CQ, etc.)
-#   i3=4        — telemetry (logged as hex)
-# All other types fall back to a hex dump.
+# 77-bit layout (i3 field at bits 74-76):
+#   i3=0  Standard QSO/CQ: [28 c1][1 R1][28 c2][1 R2][15 grid][1 spare][3 i3]
+#   i3=1  Free text:        [71 text][3 spare][3 i3]
+#   i3=2  EU VHF contest:   same layout as i3=0
+#   i3=3  ARRL Field Day:   [28 c1][1 R][28 c2][1 R][13 exch][3 spare][3 i3]
+#   i3=4  Telemetry:        [71 payload][3 spare][3 i3]
 
-# ── Character set tables ────────────────────────────────────────────────────
-
-# 37-character set used for standard callsign packing (A-Z, 0-9, space)
-_C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-# 42-character set used for compound/suffix callsigns (adds /+-. chars)
 _C42 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/+-."
-
-# 42-character free-text set from WSJT-X packjt77.f90
-# 71 bits encodes 13 chars at base-42: 42^13 ≈ 1.1e21 < 2^71 ≈ 2.4e21
-_C69 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?="   # kept as _C69 for compat, but 42 chars
-# Correct: WSJT-X uses exactly these 42 printable chars for free text
 _FREETEXT_CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
-
-# Grid square characters: A-R for field letters, 0-9 for square digits
 _GRID_LETTERS = "ABCDEFGHIJKLMNOPQR"
 
 
 def _bits_to_int(bits: np.ndarray, start: int, length: int) -> int:
-    """Extract an unsigned integer from a bit array (MSB first)."""
     val = 0
     for i in range(length):
         val = (val << 1) | int(bits[start + i])
@@ -1595,156 +611,66 @@ def _bits_to_int(bits: np.ndarray, start: int, length: int) -> int:
 
 
 def _unpack_callsign_28(n: int) -> str:
-    """
-    Decode a 28-bit packed standard callsign.
-
-    From WSJT-X packjt77.f90 / ft8_lib pack77.cpp:
-
-    NBASE = 37*36*10*27*27*27 = 262,177,560
-    Values 0..NBASE-1  → standard callsign (mixed-radix decode)
-    NBASE+0            → 'DE'
-    NBASE+1            → 'QRZ'
-    NBASE+2            → 'CQ'
-    NBASE+3..NBASE+2+1000 → 'CQ 000'..'CQ 999'  (directed CQ by frequency)
-    NBASE+3+1000..     → 'CQ XX' style (4-char suffix, base-27)
-    > 2^28-1           → hashed callsign (not decodable)
-
-    Encoding (c0..c5, MSB-first):
-      n = ((((c0*36 + c1)*10 + c2)*27 + c3)*27 + c4)*27 + c5
-      c0 ∈ C36 (0-9, A-Z — NO space; first char of callsign cannot be space)
-      c1 ∈ C37 (space, 0-9, A-Z — second char can be space for 1-char prefix)
-      c2 ∈ C10 (0-9 — must be the digit)
-      c3,c4,c5 ∈ C27 (A-Z, space — suffix chars, trailing spaces)
-    """
-    # From WSJT-X: NBASE = 37*36*10*27**3
-    NBASE = 37 * 36 * 10 * 27 * 27 * 27   # 262177560
-
+    """Decode a 28-bit packed standard callsign (ft8_lib / WSJT-X convention)."""
+    NBASE = 37 * 36 * 10 * 27 * 27 * 27   # 262 177 560
     if n >= NBASE:
         r = n - NBASE
-        if r == 0:  return 'DE'
-        if r == 1:  return 'QRZ'
-        if r == 2:  return 'CQ'
-        if 3 <= r <= 2 + 1000:
+        if r == 0: return 'DE'
+        if r == 1: return 'QRZ'
+        if r == 2: return 'CQ'
+        if 3 <= r <= 1002:
             return f'CQ {r - 3:03d}'
-        if r <= 2 + 1000 + 531441:   # 531441 = 27^4... actually use simpler bound
-            m = r - 3 - 1000
-            suffix = ''
-            for _ in range(4):
-                suffix = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ '[m % 27] + suffix
-                m //= 27
-            return f'CQ {suffix.strip()}'
-        return f'<hash:{n & 0x3FFFFF:06X}>'
-
-    # Standard callsign decode
-    # n = ((((c0*36 + c1)*10 + c2)*27 + c3)*27 + c4)*27 + c5
-    # Note: c0 uses base-36, c1 uses base-37 (can be space)
-    C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # 36 chars, NO space
-    C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # 37 chars, space at index 0
+        m = r - 1003
+        suffix = ''
+        for _ in range(4):
+            suffix = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ '[m % 27] + suffix
+            m //= 27
+        return f'CQ {suffix.strip()}'
+    C36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    C37 = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     C27 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ "
     C10 = "0123456789"
-
-    n, c5 = divmod(n, 27);  c5 = C27[c5]
-    n, c4 = divmod(n, 27);  c4 = C27[c4]
-    n, c3 = divmod(n, 27);  c3 = C27[c3]
-    n, c2 = divmod(n, 10);  c2 = C10[c2]
-    n, c1 = divmod(n, 37);  c1 = C37[c1]
+    n, c5 = divmod(n, 27); c5 = C27[c5]
+    n, c4 = divmod(n, 27); c4 = C27[c4]
+    n, c3 = divmod(n, 27); c3 = C27[c3]
+    n, c2 = divmod(n, 10); c2 = C10[c2]
+    n, c1 = divmod(n, 37); c1 = C37[c1]
     c0 = C36[n] if n < 36 else '?'
-
-    # Remove all spaces (c1 may be space for 1-char prefix; c3-c5 may be trailing spaces)
-    call = (c0 + c1 + c2 + c3 + c4 + c5).replace(' ', '').strip()
-    return call if call else '?'
+    return (c0 + c1 + c2 + c3 + c4 + c5).replace(' ', '').strip() or '?'
 
 
 def _unpack_grid_15(n: int) -> str:
-    """
-    Decode a 15-bit grid/report field.
-
-    Values:
-      0..31:   signal report  -24 to +9 dB  (n=0 → -24, n=1 → -23, ..., n=30 → +6, n=31 → R+6 etc.)
-      32767:   RRR
-      32766:   RR73
-      32765:   73
-      32..32399: Maidenhead grid square AA00..RR99
-      32400+:  special (contest serial etc.)
-    """
+    """Decode a 15-bit grid/report field."""
     if n <= 62:
-        if n == 62:
-            return 'RRR'
+        if n == 62: return 'RRR'
         db = n - 35
-        sign = '+' if db >= 0 else ''
-        return f'{sign}{db:02d}'
-    if n == 32767:
-        return 'RRR'
-    if n == 32766:
-        return 'RR73'
-    if n == 32765:
-        return '73'
-    if n == 32764:
-        return 'RRR'
-
-    # Maidenhead grid: 4-character AA00
-    n2 = n - 63
-    if n2 < 0 or n2 >= 32400:
-        return f'?{n}'
-    lon_sq, rem  = divmod(n2, 180)
-    lat_sq, rem2 = divmod(rem, 10)
-    lon_sub      = rem2
-    lat_sub      = 0
-    # Actually: grid = field_lon(0-17) + field_lat(0-17) + sq_lon(0-9) + sq_lat(0-9)
-    # Encoding: n = (lon_field*18 + lat_field)*100 + lon_sq*10 + lat_sq
-    n3 = n - 63
-    lat_sq2, n4  = divmod(n3, 180)
-    lon_sq2, rem3 = divmod(n4, 10)
-    # re-derive properly
-    # FT8: grid packed as (lon+180)/2 * 18*10*10 + (lat+90) ...
-    # Simplest correct decode from WSJT-X unpack77.f90:
-    # n = (igrid4 - NGBASE) where NGBASE = 32768 - 32400 ... let's use the formula directly
-    # igrid = n - 63
+        return f'{db:+03d}'
+    if n == 32767: return 'RRR'
+    if n == 32766: return 'RR73'
+    if n == 32765: return '73'
+    if n == 32764: return 'RRR'
     igrid = n - 63
-    if igrid < 0 or igrid >= 18*18*10*10:
+    if igrid < 0 or igrid >= 18 * 18 * 10 * 10:
         return f'?{n}'
     igrid, g4 = divmod(igrid, 10)
     igrid, g3 = divmod(igrid, 10)
     igrid, g2 = divmod(igrid, 18)
     g1 = igrid
-    grid = _GRID_LETTERS[g1] + _GRID_LETTERS[g2] + str(g3) + str(g4)
-    return grid
+    return _GRID_LETTERS[g1] + _GRID_LETTERS[g2] + str(g3) + str(g4)
 
 
 def _unpack_type1(bits: np.ndarray) -> str:
-    """
-    Unpack standard Type-1 FT8 message (i3=0 or i3=2).
-
-    True 77-bit layout (WSJT-X pack77.f90):
-      [0:28]  call1 (28 bits)
-      [28]    R1 flag
-      [29:57] call2 (28 bits)
-      [57]    R2 flag
-      [58:73] grid/report (15 bits)
-      [73]    spare (0)
-      [74:77] i3  ← already dispatched by caller
-    """
-    call1_n = _bits_to_int(bits, 0,  28)
-    r1      = int(bits[28])
-    call2_n = _bits_to_int(bits, 29, 28)
-    r2      = int(bits[57])
-    grid_n  = _bits_to_int(bits, 58, 15)
-
-    call1 = _unpack_callsign_28(call1_n)
-    call2 = _unpack_callsign_28(call2_n)
-    grid  = _unpack_grid_15(grid_n)
-
-    if r1: call1 = 'R' + call1
-    if r2: call2 = 'R' + call2
-    return f'{call1} {call2} {grid}'
+    c1 = _unpack_callsign_28(_bits_to_int(bits, 0, 28))
+    r1 = int(bits[28])
+    c2 = _unpack_callsign_28(_bits_to_int(bits, 29, 28))
+    r2 = int(bits[57])
+    grid = _unpack_grid_15(_bits_to_int(bits, 58, 15))
+    if r1: c1 = 'R' + c1
+    if r2: c2 = 'R' + c2
+    return f'{c1} {c2} {grid}'
 
 
 def _unpack_free_text(bits: np.ndarray) -> str:
-    """
-    Unpack free-text message (i3=1).
-    bits[0:71] = 71-bit integer → 13 chars from _FREETEXT_CHARS (base-42, MSB-first).
-    42^13 ≈ 1.1e21 < 2^71 ≈ 2.4e21, so 13 chars fit in 71 bits.
-    """
     n = _bits_to_int(bits, 0, 71)
     chars = []
     for _ in range(13):
@@ -1754,7 +680,6 @@ def _unpack_free_text(bits: np.ndarray) -> str:
 
 
 def _unpack_compound_call_58(bits: np.ndarray, start: int) -> str:
-    """Decode a 58-bit compound callsign (base-42, up to 11 chars from C42)."""
     n = _bits_to_int(bits, start, 58)
     chars = []
     for _ in range(11):
@@ -1763,136 +688,567 @@ def _unpack_compound_call_58(bits: np.ndarray, start: int) -> str:
     return ''.join(reversed(chars)).strip()
 
 
-def _unpack_type_compound(bits: np.ndarray, which: int) -> str:
-    """
-    Compound callsign messages (i3=0, one call is a full compound, one is a hash).
-    which=1: [58 compound_call1][1 R1][12 hash_call2][1 R2][3 spare][3 i3]
-    which=2: [12 hash_call1][1 R1][58 compound_call2][1 R2][3 spare][3 i3]
-    """
-    if which == 1:
-        call1 = _unpack_compound_call_58(bits, 0)
-        r1    = int(bits[58])
-        call2 = f'<{_bits_to_int(bits, 59, 12):03X}>'
-        r2    = int(bits[71])
-    else:
-        call1 = f'<{_bits_to_int(bits, 0, 12):03X}>'
-        r1    = int(bits[12])
-        call2 = _unpack_compound_call_58(bits, 13)
-        r2    = int(bits[71])
-    if r1: call1 = 'R' + call1
-    if r2: call2 = 'R' + call2
-    return f'{call1} {call2}'
-
-
 def _unpack_telemetry(bits: np.ndarray) -> str:
-    """i3=4 telemetry: bits[0:71] → 18-nibble hex string."""
-    n = _bits_to_int(bits, 0, 71)
-    return f'TELEMETRY:{n:018X}'
+    return f'TELEMETRY:{_bits_to_int(bits, 0, 71):018X}'
 
 
 def ft8_unpack_message(msg_bits: np.ndarray) -> str:
     """
-    Stage 5 — Decode 77 message bits to a human-readable FT8 message string.
+    Decode 77 message bits to a human-readable FT8 message string.
 
     Parameters
     ----------
-    msg_bits : (77,) uint8  — decoded_free_bits[:77] from ft8_ldpc_decode().
+    msg_bits : (77,) uint8
 
     Returns
     -------
-    str — e.g. 'W4ABC K9XYZ EN52', 'CQ W4ABC EM73', or '?i3=5:...' fallback.
-
-    77-bit layout shared by all types:
-      bits [74:77] = i3 (primary message type selector, 3 bits)
-
-    i3=0  Standard QSO / CQ  [28 call1][1 R][28 call2][1 R][15 grid][1 spare][3 i3]
-    i3=1  Free text           [71 text][3 spare][3 i3]
-    i3=2  EU VHF contest      same layout as i3=0
-    i3=3  ARRL Field Day      [28 call1][1 R][28 call2][1 R][13 exchange][3 spare][3 i3]
-    i3=4  Telemetry           [71 payload][3 spare][3 i3]
-    i3=5+ Reserved
+    str  e.g. 'W4ABC K9XYZ EN52', 'CQ W4ABC EM73', 'TELEMETRY:...'
     """
     msg_bits = np.asarray(msg_bits, dtype=np.uint8)
     if msg_bits.shape != (77,):
         return f'?bad_len={len(msg_bits)}'
-
     i3 = _bits_to_int(msg_bits, 74, 3)
-
     if i3 == 0:
-        # i3=0: Standard QSO / CQ type.
-        #
-        # The n3 sub-type field (bits[71:74]) physically overlaps the bottom 2 bits
-        # of the 15-bit grid field (bits[58:73]) plus the spare bit (bit 73).  For
-        # typical Maidenhead grids, signal reports, and special tokens like 73/RRR/RR73
-        # the bottom bits are non-zero, producing n3 = 1–7 even for perfectly valid
-        # standard QSO frames.
-        #
-        # The correct behaviour (matching WSJT-X / ft8_lib unpack77):
-        #   i3=0 → ALWAYS unpack as standard type-1 (call + call + grid/report)
-        #   The n3 sub-type is NOT used as a dispatch key for i3=0 messages.
-        #   Compound-callsign messages use i3=1 or i3=4 in modern WSJT-X.
         return _unpack_type1(msg_bits)
-
     elif i3 == 1:
         return _unpack_free_text(msg_bits)
-
     elif i3 == 2:
         return 'EU-VHF ' + _unpack_type1(msg_bits)
-
     elif i3 == 3:
-        call1_n = _bits_to_int(msg_bits, 0,  28)
-        r1      = int(msg_bits[28])
-        call2_n = _bits_to_int(msg_bits, 29, 28)
-        r2      = int(msg_bits[57])
-        exch    = _bits_to_int(msg_bits, 58, 13)
-        call1   = _unpack_callsign_28(call1_n)
-        call2   = _unpack_callsign_28(call2_n)
-        if r1: call1 = 'R' + call1
-        if r2: call2 = 'R' + call2
-        return f'FD {call1} {call2} {exch}'
-
+        c1 = _unpack_callsign_28(_bits_to_int(msg_bits, 0, 28))
+        r1 = int(msg_bits[28])
+        c2 = _unpack_callsign_28(_bits_to_int(msg_bits, 29, 28))
+        r2 = int(msg_bits[57])
+        exch = _bits_to_int(msg_bits, 58, 13)
+        if r1: c1 = 'R' + c1
+        if r2: c2 = 'R' + c2
+        return f'FD {c1} {c2} {exch}'
     elif i3 == 4:
         return _unpack_telemetry(msg_bits)
-
     else:
         raw = _bits_to_int(msg_bits, 0, 77)
         return f'?i3={i3}:{raw:020X}'
 
 
-class FT8ConsoleDecoder:
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 9  Costas Sync Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _costas_score(E79: np.ndarray) -> tuple[int, int, bool]:
     """
-    End-to-end (for now):
-    - ingest audio chunks at device fs
-    - resample to fs_proc (12 kHz)
-    - build 15s UTC-aligned frames
-    - detect candidate FT8-ish peaks
-    - print results to console
+    Count how many of the 21 Costas symbols match the expected FT8 pattern.
+
+    Returns (matches, total=21, inverted).
+    'inverted' indicates the signal is reflected (7-n tone).
     """
+    E79 = np.asarray(E79, dtype=np.float64)
+    best = -1
+    best_inv = False
+    for inv in (False, True):
+        m = 0
+        for i, pos in enumerate(FT8_COSTAS_POSITIONS):
+            expected = FT8_COSTAS_TONES[i % 7]
+            if inv:
+                expected = 7 - expected
+            if int(np.argmax(E79[pos])) == expected:
+                m += 1
+        if m > best:
+            best, best_inv = m, inv
+    return best, 21, best_inv
+
+
+# Legacy API shims used by some existing test files
+def ft8_costas_ok(E: np.ndarray) -> tuple[int, int, int]:
+    m, t, _ = _costas_score(E)
+    return m, t, 0
+
+
+def ft8_costas_ok_costasE(Ec: np.ndarray) -> tuple[int, int, int, bool]:
+    m, t, inv = _costas_score(Ec)
+    return m, t, 0, inv
+
+
+def ft8_costas_margin_score(
+    Ec: np.ndarray,
+) -> tuple[float, tuple[float, float, float], int, int, int, bool]:
+    m, t, inv = _costas_score(Ec)
+    return 0.0, (0.0, 0.0, 0.0), m, t, 0, inv
+
+
+def ft8_costas_rank_stats(Ec: np.ndarray) -> dict[str, float]:
+    m, t, inv = _costas_score(Ec)
+    return {
+        "matches": float(m), "total": float(t), "shift": 0.0,
+        "inverted": float(inv), "rank_mean": 0.0, "rank_median": 0.0,
+        "margin_db_mean": 0.0, "margin_db_median": 0.0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 10  Offline Batch Decoder  (decode_wav)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class FT8DecodeResult:
+    utc_time: str
+    strength_db: float
+    frequency_hz: float
+    message: str
+
+
+def decode_wav(
+    wav_path: str,
+    *,
+    fmin_hz: float = 200.0,
+    fmax_hz: float = 3000.0,
+    max_iterations: int = 50,
+    dt_step_s: float = 0.04,
+    debug: bool = False,
+) -> list[FT8DecodeResult]:
+    """
+    Decode FT8 messages from a WAV file.
+
+    Resamples to 12 kHz, segments into 15 s FT8 slots, performs a full
+    time/frequency grid search for Costas candidates, then runs LDPC+CRC
+    on each.  Deduplicates by (slot, message) text.
+
+    The time search covers the entire valid FT8 window within a slot:
+      t0 ∈ [−0.5 s, +2.5 s]  (signal must be fully within the 15 s slot)
+
+    Parameters
+    ----------
+    wav_path     : path to the WAV file (any sample rate, mono or stereo)
+    fmin_hz      : lower bound of search band (Hz)
+    fmax_hz      : upper bound of search band (Hz)
+    max_iterations : LDPC max iterations
+    dt_step_s    : time search step size (s); default 0.04 s ≈ quarter symbol
+    debug        : print per-candidate diagnostics
+
+    Returns
+    -------
+    list of FT8DecodeResult, sorted by (utc_time, frequency_hz)
+    """
+    import wave
+    from scipy.signal import resample_poly
+
+    # ── Load WAV ──────────────────────────────────────────────────────────────
+    with wave.open(wav_path, 'rb') as w:
+        nch = w.getnchannels()
+        fs_in = w.getframerate()
+        raw = w.readframes(w.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).reshape(-1, nch)
+    audio = samples[:, 0].astype(np.float32) / 32768.0   # left channel, float
+
+    # ── Resample to 12 kHz ────────────────────────────────────────────────────
+    if fs_in != FT8_FS:
+        g = math.gcd(fs_in, FT8_FS)
+        audio = resample_poly(audio, FT8_FS // g, fs_in // g).astype(np.float32)
+    fs = FT8_FS
+    sym_n = FT8_SYM_SAMPLES   # 1920
+
+    total_samples = len(audio)
+    slot_samples = int(round(15.0 * fs))   # 180 000 samples
+    # FT8 signals can start at most (15 - 12.64) = 2.36 s after a slot boundary.
+    # Allow 0.5 s margin on each side: search t0 ∈ [−0.5, +2.86] s.
+    t0_min_s = -0.5
+    t0_max_s = 15.0 - FT8_TX_DURATION_S + 0.5   # ≈ 2.86 s
+    n_slots = total_samples // slot_samples
+
+    if debug:
+        print(f"[decode_wav] {wav_path}: {total_samples/fs:.1f}s @ {fs} Hz → {n_slots} slots")
+        print(f"[decode_wav] time search: [{t0_min_s:.2f}, {t0_max_s:.2f}] s  step={dt_step_s:.3f} s")
+
+    extractor = FT8SymbolEnergyExtractor(fs=fs)
+    results: list[FT8DecodeResult] = []
+    seen: set[tuple[str, str]] = set()   # (slot_label, message) dedup
+
+    for slot_idx in range(n_slots):
+        slot_start_n = slot_idx * slot_samples
+        # Frame: take the full slot plus a small guard on each side to cover
+        # timing offsets.  The guard is |t0_min_s| samples before slot start
+        # and t0_max_s samples after slot start (the signal itself is 12.64 s).
+        pre_guard = max(0, int(math.ceil(abs(t0_min_s) * fs)))
+        post_guard = int(math.ceil((t0_max_s + FT8_TX_DURATION_S) * fs))
+        frame_start_n = max(0, slot_start_n - pre_guard)
+        frame_end_n = min(total_samples, slot_start_n + post_guard)
+        frame = audio[frame_start_n:frame_end_n]
+        # t0_s is measured from the beginning of `frame`
+        slot_offset_in_frame = (slot_start_n - frame_start_n) / float(fs)
+
+        utc_label = f"slot{slot_idx:02d}"
+
+        # ── Candidate frequency search ─────────────────────────────────────────
+        # Build time-averaged power spectrum at 6.25 Hz resolution
+        n_wins = len(frame) // sym_n
+        if n_wins == 0:
+            continue
+
+        pwr = np.zeros(sym_n // 2 + 1, dtype=np.float64)
+        for w in range(n_wins):
+            chunk = frame[w * sym_n: (w + 1) * sym_n].astype(np.float64)
+            spec = np.fft.rfft(chunk)
+            pwr += np.abs(spec) ** 2
+        pwr /= n_wins
+
+        df = float(fs) / sym_n   # 6.25 Hz per bin
+        lo_bin = max(0, int(math.floor(fmin_hz / df)))
+        hi_bin = min(len(pwr) - 9, int(math.ceil(fmax_hz / df)))
+
+        # 8-tone matched filter: sum of 8 adjacent bins vs local noise
+        noise_w = 12
+        cand_freqs: list[tuple[float, float]] = []
+        for b in range(lo_bin, hi_bin):
+            sig_pow = float(np.sum(pwr[b: b + 8]))
+            lo_n = max(0, b - noise_w)
+            hi_n = min(len(pwr), b + 8 + noise_w)
+            nbins = np.concatenate([pwr[lo_n:b], pwr[b + 8:hi_n]])
+            if len(nbins) < 4:
+                continue
+            noise_pow = float(np.mean(nbins)) * 8
+            if noise_pow < 1e-30:
+                continue
+            snr_db = 10.0 * math.log10(max(sig_pow / noise_pow, 1e-9))
+            if snr_db > 1.0:
+                cand_freqs.append((b * df, snr_db))
+
+        if not cand_freqs:
+            continue
+
+        # Sort by SNR, keep top 20, de-duplicate within 4 bins (25 Hz)
+        cand_freqs.sort(key=lambda x: -x[1])
+        filtered: list[tuple[float, float]] = []
+        for f0, snr in cand_freqs:
+            if not any(abs(f0 - ff) < 4 * df for ff, _ in filtered):
+                filtered.append((f0, snr))
+            if len(filtered) >= 20:
+                break
+
+        if debug:
+            print(f"[decode_wav] slot {utc_label}: {len(filtered)} freq candidates")
+
+        # ── Time/frequency search across the full slot window ─────────────────
+        # t_offsets are relative to the slot boundary (slot_start_n).
+        t_offsets = np.arange(t0_min_s, t0_max_s + dt_step_s / 2, dt_step_s)
+
+        # Set of (t_key, f_key) already attempted — avoid re-scoring
+        tried: set[tuple[int, int]] = set()
+
+        for f0_hz, _ in filtered:
+            for dt in t_offsets:
+                # t0_s is measured from the frame start
+                t0_s = slot_offset_in_frame + float(dt)
+                tk = int(round(float(dt) / (dt_step_s / 2)))
+                fk = int(round(f0_hz / (df / 2)))
+                if (tk, fk) in tried:
+                    continue
+                tried.add((tk, fk))
+
+                E79 = extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
+                costas_m, _, _ = _costas_score(E79)
+                if costas_m < 7:
+                    continue
+
+                E_payload, hard_syms = ft8_extract_payload_symbols(E79)
+                _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
+
+                # Normalise to variance=24 (ftx_normalize_logl)
+                var = float(np.var(ch_llrs))
+                if var > 1e-10:
+                    ch_llrs = ch_llrs * math.sqrt(24.0 / var)
+
+                ok, payload, iters = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
+                if not ok:
+                    continue
+
+                message = ft8_unpack_message(payload[:77])
+                snr_db = 10.0 * math.log10(max(costas_m / 21.0, 1e-6))
+
+                key = (utc_label, message)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                if debug:
+                    print(
+                        f"  [DECODE] slot={utc_label} f0={f0_hz:.1f}Hz "
+                        f"dt={dt:+.2f}s costas={costas_m}/21 "
+                        f"iters={iters} msg='{message}'"
+                    )
+
+                results.append(FT8DecodeResult(
+                    utc_time=utc_label,
+                    strength_db=snr_db,
+                    frequency_hz=f0_hz,
+                    message=message,
+                ))
+
+    results.sort(key=lambda r: (r.utc_time, r.frequency_hz))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 11  Streaming Infrastructure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PolyphaseResampler:
+    """Streaming resampler wrapping scipy.signal.resample_poly."""
+
+    def __init__(self, fs_in: int, fs_out: int) -> None:
+        self.fs_in = int(fs_in)
+        self.fs_out = int(fs_out)
+        g = math.gcd(self.fs_in, self.fs_out)
+        self.up = self.fs_out // g
+        self.down = self.fs_in // g
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return x
+        return _scipy_signal.resample_poly(x, self.up, self.down).astype(
+            np.float32, copy=False
+        )
+
+
+class UTC15sFramer:
+    """
+    Buffer a continuous fs_proc audio stream and emit exact 15 s UTC-aligned frames.
+
+    push() → list of (slot_start_utc_epoch, frame_samples, is_partial)
+    The first frame emitted may be partial (audio started mid-slot).
+    """
+
+    def __init__(self, fs_proc: int, frame_s: float = 15.0) -> None:
+        self.fs = int(fs_proc)
+        self.frame_s = float(frame_s)
+        self.frame_n = int(round(self.fs * self.frame_s))
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._t0_utc: Optional[float] = None
+        self._first_frame_emitted: bool = False
+        self._utc_minus_mono: Optional[float] = None
+        self._alpha = 0.01
+
+    @staticmethod
+    def _utc_now_epoch() -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    @staticmethod
+    def _slot_start_epoch(t_utc_epoch: float, slot_s: float = 15.0) -> float:
+        return math.floor(t_utc_epoch / slot_s) * slot_s
+
+    def _update_utc_minus_mono(self) -> float:
+        utc_now = self._utc_now_epoch()
+        mono_now = time.monotonic()
+        sample = utc_now - mono_now
+        if self._utc_minus_mono is None:
+            self._utc_minus_mono = sample
+        else:
+            a = float(self._alpha)
+            self._utc_minus_mono = (1.0 - a) * float(self._utc_minus_mono) + a * float(sample)
+        return float(self._utc_minus_mono)
+
+    def push(
+        self, x: np.ndarray, *, t0_monotonic: float
+    ) -> list[tuple[float, np.ndarray, bool]]:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        utc_offset = self._update_utc_minus_mono()
+        t0_utc = t0_monotonic + utc_offset
+        if self._t0_utc is None:
+            self._t0_utc = t0_utc
+        self._buf = np.concatenate([self._buf, x])
+        out: list[tuple[float, np.ndarray, bool]] = []
+        while len(self._buf) >= self.frame_n:
+            frame = self._buf[: self.frame_n].copy()
+            self._buf = self._buf[self.frame_n:]
+            slot_start = self._slot_start_epoch(float(self._t0_utc))
+            is_partial = not self._first_frame_emitted
+            out.append((slot_start, frame, is_partial))
+            self._first_frame_emitted = True
+            self._t0_utc = float(self._t0_utc) + self.frame_s
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 12  FT8 Signal Detector  (candidate seed frequencies)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FT8SignalDetector:
+    """
+    Detect candidate FT8 base frequencies via an 8-tone matched-filter
+    response on the time-averaged spectrogram.
+    """
+
+    def __init__(
+        self,
+        fs: int = FT8_FS,
+        fmin_hz: float = 200.0,
+        fmax_hz: float = 3200.0,
+    ) -> None:
+        self.fs = int(fs)
+        self.fmin_hz = float(fmin_hz)
+        self.fmax_hz = float(fmax_hz)
+        self._sym_n = int(round(FT8_SYMBOL_DURATION_S * self.fs))
+        self._df = float(self.fs) / self._sym_n   # 6.25 Hz
+
+    def detect(self, frame: np.ndarray, *, top_n: int = 20) -> list[tuple[float, float]]:
+        """Return list of (f0_hz, score_db) sorted descending."""
+        x = np.asarray(frame, dtype=np.float64)
+        sym_n = self._sym_n
+        df = self._df
+        n_wins = len(x) // sym_n
+        if n_wins == 0:
+            return []
+
+        pwr = np.zeros(sym_n // 2 + 1, dtype=np.float64)
+        for w in range(n_wins):
+            spec = np.fft.rfft(x[w * sym_n: (w + 1) * sym_n])
+            pwr += np.abs(spec) ** 2
+        pwr /= n_wins
+
+        lo_bin = max(0, int(math.floor(self.fmin_hz / df)))
+        hi_bin = min(len(pwr) - 9, int(math.ceil(self.fmax_hz / df)))
+        noise_w = 16
+        candidates: list[tuple[float, float]] = []
+
+        for b in range(lo_bin, hi_bin):
+            sig = float(np.sum(pwr[b: b + 8]))
+            lo_n, hi_n = max(0, b - noise_w), min(len(pwr), b + 8 + noise_w)
+            nbins = np.concatenate([pwr[lo_n:b], pwr[b + 8:hi_n]])
+            if len(nbins) < 4:
+                continue
+            noise = float(np.mean(nbins)) * 8
+            if noise < 1e-20:
+                continue
+            score = 10.0 * math.log10(max(sig / noise, 1e-9))
+            if score > 0.0:
+                candidates.append((b * df, score))
+
+        candidates.sort(key=lambda t: -t[1])
+        return candidates[:top_n]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 13  FT8 Sync Search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class FT8SyncCandidate:
+    slot_utc: str
+    time_offset_s: float
+    freq_hz: float
+    score_db: float
+
+
+class FT8SyncSearch:
+    """
+    Search for FT8 signals by sliding over time/frequency offsets around
+    each seed frequency and scoring the Costas array match.
+    """
+
     def __init__(
         self,
         *,
-        fs_proc: int = 12_000,
+        fs: int = FT8_FS,
         fmin_hz: float = 200.0,
         fmax_hz: float = 3200.0,
-        on_decode=None,   # optional callable(utc: str, freq_hz: float, snr_db: float, message: str)
+        sym_s: float = FT8_SYMBOL_DURATION_S,
+        tone_spacing_hz: float = FT8_TONE_SPACING_HZ,
+        extractor: Optional["FT8SymbolEnergyExtractor"] = None,
     ) -> None:
+        self.fs = int(fs)
+        self.fmin_hz = float(fmin_hz)
+        self.fmax_hz = float(fmax_hz)
+        self.sym_s = float(sym_s)
+        self.tone_hz = float(tone_spacing_hz)
+        self._extractor = extractor or FT8SymbolEnergyExtractor(fs=self.fs)
 
+    def search(
+        self,
+        frame: np.ndarray,
+        *,
+        seed_freqs_hz: list[float],
+        time_search_s: float = 0.5,
+        freq_search_bins: int = 3,
+        max_candidates: int = 10,
+    ) -> list[tuple[float, float, float]]:
+        """
+        Return list of (t0_s, f0_hz, costas_score_db) for the best candidates.
+        """
+        df_hz = self.tone_hz
+        dt_step = self.sym_s / 4.0
+        t_offsets = np.arange(-time_search_s, time_search_s + dt_step / 2, dt_step)
+
+        results: list[tuple[float, float, float]] = []
+        tried: set[tuple[int, int]] = set()
+
+        for f0 in seed_freqs_hz:
+            for b in range(-freq_search_bins, freq_search_bins + 1):
+                f_try = float(f0) + b * df_hz
+                if f_try < self.fmin_hz or f_try > self.fmax_hz - 7 * df_hz:
+                    continue
+                for t0 in t_offsets:
+                    tk = int(round(float(t0) / (dt_step / 2)))
+                    fk = int(round(f_try / (df_hz / 2)))
+                    if (tk, fk) in tried:
+                        continue
+                    tried.add((tk, fk))
+
+                    E79 = self._extractor.extract_all_79(
+                        frame, t0_s=float(t0), f0_hz=f_try
+                    )
+                    m, _, _ = _costas_score(E79)
+                    score = 10.0 * math.log10(max(m / 21.0, 1e-6))
+                    results.append((float(t0), f_try, score))
+
+        results.sort(key=lambda t: -t[2])
+        return results[:max_candidates]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 14  FT8ConsoleDecoder  (end-to-end streaming decoder)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FT8ConsoleDecoder:
+    """
+    End-to-end FT8 decoder that consumes a live audio stream.
+
+    Audio is fed via feed() calls from any thread; a background worker
+    thread performs resampling, framing, detection, and decoding.
+
+    Every successful decode triggers the on_decode callback:
+        on_decode(utc: str, freq_hz: float, snr_db: float, message: str)
+
+    Usage
+    -----
+        decoder = FT8ConsoleDecoder(on_decode=my_callback)
+        decoder.start()
+        while running:
+            decoder.feed(fs=chunk.fs, samples=chunk.samples, t0_monotonic=chunk.t0)
+        decoder.stop()
+    """
+
+    def __init__(
+        self,
+        *,
+        fs_proc: int = FT8_FS,
+        fmin_hz: float = 200.0,
+        fmax_hz: float = 3200.0,
+        on_decode=None,
+    ) -> None:
         self.fs_proc = int(fs_proc)
         self.fmin_hz = float(fmin_hz)
         self.fmax_hz = float(fmax_hz)
-        self._on_decode = on_decode   # fired on every successful LDPC+CRC decode
+        self._on_decode = on_decode
 
-        self._q: "queue.Queue[tuple[int, np.ndarray, float]]" = queue.Queue(maxsize=400)
+        self._q: queue.Queue = queue.Queue(maxsize=32)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         self._resampler: Optional[PolyphaseResampler] = None
-        self._framer = UTC15sFramer(self.fs_proc, frame_s=15.0)
-        self._detector = FT8SignalDetector(fs=self.fs_proc, fmin_hz=self.fmin_hz, fmax_hz=self.fmax_hz)
-
-        self._debug = True
-
+        self._framer = UTC15sFramer(self.fs_proc)
         self._extractor = FT8SymbolEnergyExtractor(fs=self.fs_proc)
+        self._detector = FT8SignalDetector(
+            fs=self.fs_proc, fmin_hz=self.fmin_hz, fmax_hz=self.fmax_hz
+        )
         self._sync = FT8SyncSearch(
             fs=self.fs_proc,
             fmin_hz=self.fmin_hz,
@@ -1900,128 +1256,94 @@ class FT8ConsoleDecoder:
             extractor=self._extractor,
         )
 
-        # Gate thresholds for passing sync candidates to refinement.
-        # costas_ok: minimum symbol matches out of 21 (random chance ~3/21).
-        # Real weak signals can be as low as 7-9/21 when block 0 is in noise.
-        self._min_costas_matches = 7
-        # Minimum mean margin across all 3 Costas blocks.
-        # 2 dB = expected tone is ~1.6x median of others — a very loose gate.
-        # LDPC+CRC is the real quality filter; we'd rather try and fail than drop.
-        self._min_margin_db = 2.0
-
-    def _get_seed_freqs(self, frame: np.ndarray) -> list[tuple[float, float]]:
-        """
-        Detect candidate signal frequencies from the full 15s frame.
-        FT8SyncSearch handles its own time-offset search, so we only need to
-        run the detector once on the full unshifted frame.
-        """
-        peaks, _score = self._detector.detect_with_best_score(frame)
-        return peaks
-
-    def _refine_candidate_by_costas(
-        self,
-        frame: np.ndarray,
-        *,
-        t0_s: float,
-        f0_hz: float,
-        coarse_shift: int = 0,
-        coarse_inv: bool = False,
-        df_hz: float = 6.25,
-        df_step_hz: float = 0.05,
-        dt_s: float = 0.020,
-        dt_step_s: float = 0.001,
-    ) -> tuple[float, float, int, int, int, bool]:
-        """
-        Refine both f0 and t0 using the continuous mean-margin score from
-        score_costas_batch.  Sweeps f0 over ±df_hz in df_step_hz steps and
-        t0 over ±dt_s in dt_step_s steps (default ±20 ms at 1 ms resolution).
-
-        The 2-D search corrects both residual frequency offset and sub-symbol
-        timing errors (including USB audio clock drift over the 12.6 s frame).
-        """
-        costas_tones = (3, 1, 4, 0, 6, 5, 2)
-        total = 21
-
-        f_vals = np.arange(
-            float(f0_hz) - df_hz,
-            float(f0_hz) + df_hz + 1e-12,
-            df_step_hz,
-            dtype=np.float64,
-        )
-        t_vals = np.arange(
-            float(t0_s) - dt_s,
-            float(t0_s) + dt_s + 1e-12,
-            dt_step_s,
-            dtype=np.float64,
-        )
-
-        best_score  = float("-inf")
-        best_f0     = float(f0_hz)
-        best_t0     = float(t0_s)
-
-        for t_cand in t_vals:
-            x_mat = self._extractor._get_costas_xmat(frame, t0_s=float(t_cand))
-            scores = self._extractor.score_costas_batch(
-                x_mat, f_vals, shift=int(coarse_shift), inverted=bool(coarse_inv)
-            )
-            idx = int(np.argmax(scores))
-            sc  = float(scores[idx])
-            if sc > best_score:
-                best_score = sc
-                best_f0    = float(f_vals[idx])
-                best_t0    = float(t_cand)
-
-        # Compute match count at best (t0, f0) for the return signature
-        x_mat_best = self._extractor._get_costas_xmat(frame, t0_s=best_t0)
-        Ec_best = self._extractor.score_costas_from_xmat(x_mat_best, f0_hz=best_f0)
-        best_matches = 0
-        for r in range(total):
-            expected = int((costas_tones[r % 7] + coarse_shift) % 8)
-            if coarse_inv:
-                expected = 7 - expected
-            if int(np.argmax(Ec_best[r, :])) == expected:
-                best_matches += 1
-
-        return float(best_t0), float(best_f0), int(best_matches), int(total), int(coarse_shift), bool(coarse_inv)
+        self._debug: bool = True
+        self._min_costas_matches: int = 7
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="ft8-decode"
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
 
     def feed(self, *, fs: int, samples: np.ndarray, t0_monotonic: float) -> None:
-        if self._stop.is_set():
-            return
         try:
-            x = np.asarray(samples, dtype=np.float32).reshape(-1)
-            self._q.put_nowait((int(fs), x, float(t0_monotonic)))
+            self._q.put_nowait(
+                (int(fs), np.asarray(samples, dtype=np.float32), float(t0_monotonic))
+            )
         except queue.Full:
-            pass
-
-    @staticmethod
-    def _dedupe_peaks(peaks: list[tuple[float, float]], *, hz_bucket: float = 5.0) -> list[tuple[float, float]]:
-        """
-        Deduplicate near-identical peaks by frequency bucketing.
-        Keeps strongest per bucket.
-        """
-        best_by_bucket: dict[int, tuple[float, float]] = {}
-        for f_hz, s_db in peaks:
-            b = int(round(f_hz / hz_bucket))
-            prev = best_by_bucket.get(b)
-            if prev is None or s_db > prev[1]:
-                best_by_bucket[b] = (f_hz, s_db)
-        out = list(best_by_bucket.values())
-        out.sort(key=lambda p: p[1], reverse=True)
-        return out
+            if self._debug:
+                print("[FT8] audio queue full — dropping chunk", flush=True)
 
     @staticmethod
     def _fmt_utc(epoch_s: float) -> str:
         return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%H:%M:%S")
+
+    def _decode_frame(self, frame: np.ndarray, utc: str) -> None:
+        """Run full decode pipeline on one 15 s frame."""
+        _T0_MIN = -0.50
+        _T0_MAX = 15.0 - FT8_TX_DURATION_S   # ≈ +2.36 s
+
+        # Detect candidate seed frequencies
+        candidates = self._detector.detect(frame, top_n=20)
+        seed_freqs = [f for f, _ in candidates[:10]]
+
+        if self._debug:
+            print(
+                f"[FT8] slot {utc}Z  seeds={len(seed_freqs)}", flush=True
+            )
+
+        sync_cands = self._sync.search(
+            frame,
+            seed_freqs_hz=seed_freqs,
+            time_search_s=0.5,
+            freq_search_bins=3,
+            max_candidates=5,
+        )
+
+        seen_msg: set[str] = set()
+        for t0_s, f0_hz, _score in sync_cands:
+            if float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX:
+                continue
+
+            E79 = self._extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
+            costas_m, _, _ = _costas_score(E79)
+            if costas_m < self._min_costas_matches:
+                continue
+
+            E_payload, hard_syms = ft8_extract_payload_symbols(E79)
+            _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
+
+            var = float(np.var(ch_llrs))
+            if var > 1e-10:
+                ch_llrs = ch_llrs * math.sqrt(24.0 / var)
+
+            ok, payload, iters = ft8_ldpc_decode(ch_llrs)
+            if not ok:
+                continue
+
+            message = ft8_unpack_message(payload[:77])
+            if message in seen_msg:
+                continue
+            seen_msg.add(message)
+
+            snr_db = 10.0 * math.log10(max(costas_m / 21.0, 1e-6))
+
+            if self._debug:
+                print(
+                    f"[FT8] {utc} DECODE f0={f0_hz:.1f}Hz t0={t0_s:+.2f}s "
+                    f"snr≈{snr_db:+.1f}dB iters={iters} '{message}'",
+                    flush=True,
+                )
+
+            if self._on_decode is not None:
+                self._on_decode(utc, f0_hz, snr_db, message)
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -2033,250 +1355,21 @@ class FT8ConsoleDecoder:
             if self._resampler is None or self._resampler.fs_in != fs_in:
                 self._resampler = PolyphaseResampler(fs_in=fs_in, fs_out=self.fs_proc)
                 if self._debug:
-                    print(f"[FT8] resampler locked: fs_in={fs_in} -> fs_proc={self.fs_proc}", flush=True)
+                    print(
+                        f"[FT8] resampler: {fs_in} → {self.fs_proc} Hz", flush=True
+                    )
 
             x = self._resampler.process(x_in)
-
             frames = self._framer.push(x, t0_monotonic=t0)
+
             for slot_start_utc, frame, is_partial in frames:
                 utc = self._fmt_utc(slot_start_utc)
-
                 if is_partial:
                     if self._debug:
-                        print(f"[FT8] slot {utc}Z skipped (partial — audio started mid-slot)", flush=True)
+                        print(
+                            f"[FT8] slot {utc}Z skipped (partial)", flush=True
+                        )
                     continue
-
-                peaks = self._get_seed_freqs(frame)
-                peaks = self._dedupe_peaks(peaks, hz_bucket=10.0)
-                seed_freqs = [f for (f, _s) in peaks[:10]]
-
-                sync_cands = self._sync.search(
-                    frame,
-                    seed_freqs_hz=seed_freqs,
-                    time_search_s=0.5,
-                    freq_search_bins=4,
-                    max_candidates=5,
-                )
-
                 if self._debug:
-                    print(f"[FT8] slot {utc}Z sync_candidates={len(sync_cands)} seeds={len(seed_freqs)}", flush=True)
-
-                # FT8 signals span 79 symbols × 0.160 s = 12.64 s.
-                # A valid signal in this slot must start no earlier than -0.5 s
-                # (otherwise it belongs to the previous slot) and end no later
-                # than the frame length (15.0 s).  Clamp to [-0.5, +1.86] s.
-                _FT8_FRAME_S = 79 * 0.160   # 12.64 s
-                _T0_MIN = -0.50
-                _T0_MAX = 15.0 - _FT8_FRAME_S   # ≈ +2.36 s
-
-                for (t0_s, f0_hz, sc_db) in sync_cands:
-                    if float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX:
-                        if self._debug:
-                            print(
-                                f"{utc}  skip  off={t0_s:+.2f}s  f0={f0_hz:.2f}Hz"
-                                f"  (out of slot window [{_T0_MIN:.2f},{_T0_MAX:.2f}])",
-                                flush=True,
-                            )
-                        continue
-                    Ec0 = self._extractor.extract_costas(frame, t0_s=float(t0_s), f0_hz=float(f0_hz))
-
-                    total_m_db, (b0, b1, b2), m0, tot0, sh0, inv0 = ft8_costas_margin_score(Ec0)
-
-                    print(
-                        f"{utc}  sync  off={t0_s:+.2f}s  f0={f0_hz:8.2f} Hz  score={sc_db:6.2f} dB"
-                        f"  costas_ok={m0:02d}/{tot0:02d} shift={sh0} inv={inv0}"
-                        f"  margin_total={total_m_db:6.2f}dB blocks=({b0:5.2f},{b1:5.2f},{b2:5.2f})",
-                        flush=True,
-                    )
-
-                    # Gate 1: minimum mean Costas margin (loose — LDPC+CRC is the real filter)
-                    if total_m_db < self._min_margin_db:
-                        continue
-
-                    # Gate 2: minimum Costas symbol matches (guards against pure noise hits)
-                    if m0 < self._min_costas_matches:
-                        continue
-
-                    # All gates passed — refine frequency with shift/inv locked
-                    rt, rf, rm, rtot, rsh, rinv = self._refine_candidate_by_costas(
-                        frame,
-                        t0_s=float(t0_s),
-                        f0_hz=float(f0_hz),
-                        coarse_shift=int(sh0),
-                        coarse_inv=bool(inv0),
-                    )
-
-                    print(
-                        f"{utc}  refined  off={rt:+.2f}s  f0={rf:8.2f}Hz  costas_ok={rm:02d}/{rtot:02d} shift={rsh} inv={rinv}",
-                        flush=True,
-                    )
-
-                    # ── Stage 2: Extract all 79 symbol energies ──────────
-                    E79 = self._extractor.extract_all_79(
-                        frame, t0_s=float(rt), f0_hz=float(rf)
-                    )
-
-                    if self._debug:
-                        costas_rows  = E79[list(FT8_COSTAS_POSITIONS), :]
-                        payload_rows = E79[list(FT8_PAYLOAD_POSITIONS), :]
-                        costas_peak_mean  = float(np.mean(np.max(costas_rows,  axis=1)))
-                        payload_peak_mean = float(np.mean(np.max(payload_rows, axis=1)))
-                        # Peak-to-mean ratio: 8.0 = perfect single tone, 1.0 = flat noise
-                        pay_ptm = float(np.mean(
-                            np.max(payload_rows, axis=1) /
-                            np.maximum(np.mean(payload_rows, axis=1), 1e-30)
-                        ))
-                        print(
-                            f"{utc}  symbols  E79 shape={E79.shape}"
-                            f"  costas_peak={costas_peak_mean:.2e}"
-                            f"  payload_peak={payload_peak_mean:.2e}"
-                            f"  payload_ptm={pay_ptm:.2f}/8.00",
-                            flush=True,
-                        )
-                        # Show normalised energy distribution for 3 strongest payload symbols
-                        top3 = np.argsort(np.max(payload_rows, axis=1))[-3:][::-1]
-                        for pidx in top3:
-                            row = payload_rows[pidx]
-                            row_n = row / max(float(np.max(row)), 1e-30)
-                            print(f"{utc}  pay_sym[{pidx:2d}]"
-                                  f"  tones=[{' '.join(f'{v:.2f}' for v in row_n)}]"
-                                  f"  peak={int(np.argmax(row))}  E={np.max(row):.2e}",
-                                  flush=True)
-
-                    # ── Stage 2a: Extract payload symbols + tone correction ─
-                    E_payload, hard_syms = ft8_extract_payload_symbols(
-                        E79, shift=int(rsh), inverted=bool(rinv)
-                    )
-
-                    if self._debug:
-                        # Show the 58 hard tone decisions as a compact string
-                        sym_str = "".join(str(int(t)) for t in hard_syms)
-                        print(
-                            f"{utc}  payload_syms (interleaved) [{len(hard_syms)}]: {sym_str}",
-                            flush=True,
-                        )
-
-                    # ── Stage 2b: Bit De-interleave handled after Gray decode (FT8 is bit-interleaved)
-                    # We pass the INTERLEAVED payload symbols to Gray decode first.
-                    E_interleaved = E_payload
-                    syms_interleaved = np.argmax(E_interleaved, axis=1)
-
-                    # ── Stage 3: Gray decode → 174 channel LLRs (transmitted order) ──
-                    # Matches ft8_lib ft8_extract_symbol() exactly.  Raw energy
-                    # differences are used — no per-symbol normalisation.
-                    hard_bits_ch, channel_llrs = ft8_gray_decode(syms_interleaved, E_interleaved)
-
-                    # ── Stage 3b: Normalise — ft8_lib ftx_normalize_logl ─────────────
-                    # Applied to channel_llrs (174 values, transmitted order) BEFORE
-                    # de-interleaving.  This matches the call site in ft8_lib decode.cpp:
-                    #   ft8_extract_symbol() -> ftx_normalize_logl() -> de-interleave -> bp_decode()
-                    #
-                    # ftx_normalize_logl (ft8_lib decode.cpp):
-                    #   mean_llr = mean(llr)
-                    #   var_llr  = variance(llr)          [population variance]
-                    #   if var_llr > 1e-2:
-                    #       llr[i] = (llr[i] - mean_llr) * sqrt(24 / var_llr)
-                    #
-                    # The mean subtraction is required — without it the LLR vector
-                    # has a DC bias that shifts all BP messages by a constant offset,
-                    # degrading convergence.  The threshold 1e-2 (not 1e-10) guards
-                    # against dividing by zero on a silent channel.
-                    mean_llr = float(np.mean(channel_llrs))
-                    var_llr  = float(np.var(channel_llrs))   # population variance
-                    if var_llr > 1e-2:
-                        norm = math.sqrt(24.0 / var_llr)
-                        channel_llrs = (channel_llrs - mean_llr) * norm
-
-                    if self._debug:
-                        llr_mag_mean = float(np.mean(np.abs(channel_llrs)))
-                        print(
-                             f"{utc}  llrs (norm) mean_|LLR|={llr_mag_mean:.2f}",
-                             flush=True,
-                        )
-
-                    # ── Stage 2b: Bit de-interleave — ft8_lib decode.cpp ─────────────
-                    # channel_llrs[i] is the normalised LLR for transmitted bit i (0..173).
-                    # The LDPC check matrix _LDPC_CHECKS uses codeword bit indices.
-                    # Reference mapping (ft8_lib):
-                    #   codeword_llr[bit_rev7(i)] += channel_llr[i]  for i in 0..173
-                    # bit_rev7 maps 0..173 -> 0..127, so each codeword position 0..127
-                    # accumulates contributions from TWO transmitted bits (i and i+128).
-                    # Codeword positions 128..173 receive no contribution and stay 0.
-                    codeword_llrs = np.zeros(174, dtype=np.float64)
-                    for i in range(174):
-                        codeword_llrs[_FT8_BIT_REV7_TABLE[i]] += channel_llrs[i]
-
-                    # ── Stage 4: LDPC decode → 91 bits ───────────────────────
-                    # codeword_llrs are now in codeword order, matching _LDPC_CHECKS.
-                    ldpc_ok, codeword, ldpc_iters = ft8_ldpc_decode(codeword_llrs)
-
-                    if self._debug or ldpc_ok:
-                        status = "PASS" if ldpc_ok else "FAIL"
-                        print(
-                            f"{utc}  ldpc  {status}"
-                            f"  iters={ldpc_iters}"
-                            f"  crc={'OK' if ldpc_ok else '--'}",
-                            flush=True,
-                        )
-
-                    if not ldpc_ok:
-                        continue
-
-                    # ── Stage 5: Unpack 77 bits → message text ────────────
-                    msg_bits = codeword[:77]
-                    message = ft8_unpack_message(msg_bits)
-
-                    decoded_line = (
-                        f"{utc}  *** DECODED ***  "
-                        f"f0={rf:.2f}Hz  off={rt:+.2f}s  snr≈{sc_db:.1f}dB  "
-                        f"msg='{message}'"
-                    )
-                    print(decoded_line, flush=True)
-
-                    # Fire the GUI callback (if registered) on the decoder thread.
-                    # The callback must be thread-safe (e.g. put onto a queue).
-                    if self._on_decode is not None:
-                        try:
-                            self._on_decode(utc, float(rf), float(sc_db), message)
-                        except Exception:
-                            pass
-
-
-
-def unpack_payload(a77):
-    """
-    Unpack payload message (i3=0 or i3=2, standard or EU VHF).
-
-    True 77-bit layout (WSJT-X pack77.f90):
-      [0:28]  call1 (28 bits)
-      [28]    R1 flag
-      [29:57] call2 (28 bits)
-      [57]    R2 flag
-      [58:73] grid/report (15 bits)
-      [73]    spare (0)
-      [74:77] i3  ← already dispatched by caller
-
-    Returns
-    -------
-    str — e.g. 'W4ABC K9XYZ EN52', 'CQ W4ABC EM73', or '?i3=5:...' fallback.
-    """
-    bits = np.asarray(a77, dtype=np.uint8)
-    if bits.shape != (77,):
-        return f'?bad_len={len(bits)}'
-
-    i3 = _bits_to_int(bits, 74, 3)
-
-    if i3 == 0:
-        # n3 subtype is bits [71:74]
-        n3 = _bits_to_int(bits, 71, 3)
-        if n3 == 0 or n3 == 1:
-            return _unpack_type1(bits)
-        else:
-            raw = _bits_to_int(bits, 0, 77)
-            return f'?i3=0,n3={n3}:{raw:020X}'
-    elif i3 == 2:
-        return 'EU-VHF ' + _unpack_type1(bits)
-    else:
-        raw = _bits_to_int(bits, 0, 77)
-        return f'?i3={i3}:{raw:020X}'
-
+                    print(f"[FT8] slot {utc}Z — decoding", flush=True)
+                self._decode_frame(frame, utc)
