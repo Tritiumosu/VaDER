@@ -112,7 +112,10 @@ class SoundCardAudioSource:
             # Dropped buffers / overflow / etc. We don't print by default to avoid spamming.
             pass
 
-        t0 = time.monotonic()
+        # Use the start time of the buffer, not the callback delivery time.
+        # time.monotonic() is approximately the end of the buffer; subtracting the
+        # buffer duration gives the monotonic time of the first sample.
+        t0 = time.monotonic() - frames / self.fs
         try:
             x = _to_mono_float32(indata)
             self._q.put_nowait((t0, x))

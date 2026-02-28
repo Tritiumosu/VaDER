@@ -1371,6 +1371,114 @@ class FT8SyncSearch:
         return results[:max_candidates]
 
 
+def _ft8_waterfall_sync(
+    frame: np.ndarray,
+    *,
+    fs: int = FT8_FS,
+    fmin_hz: float = 200.0,
+    fmax_hz: float = 3200.0,
+    t0_min_s: float = -0.5,
+    t0_max_s: float = 15.0 - FT8_TX_DURATION_S,
+    min_costas: int = 7,
+    max_results: int = 40,
+) -> list[tuple[float, float, int]]:
+    """
+    Fast coarse sync search using a pre-computed incoherent power spectrogram.
+
+    Implements the ft8_lib ``find_sync`` approach:
+      1. Compute a power waterfall at one-symbol-period (160 ms) hop, no overlap.
+      2. For every (t0_idx, f0_bin) candidate score by Costas-array argmax matches.
+      3. Return candidates sorted by Costas match count descending.
+
+    This covers the full valid FT8 timing window (t0 ∈ [t0_min_s, t0_max_s])
+    in O(n_wins × n_f0) time — typically < 5 ms vs the previous ≈ 8 s per slot.
+
+    Parameters
+    ----------
+    frame      : 1-D float audio at *fs* Hz (should be ≥ 15 s)
+    fs         : sample rate (Hz)
+    fmin_hz    : lower edge of frequency search band
+    fmax_hz    : upper edge of frequency search band
+    t0_min_s   : earliest signal start time relative to frame start (s)
+    t0_max_s   : latest  signal start time relative to frame start (s)
+    min_costas : minimum Costas match count (0–21) required to include result
+    max_results: cap on returned candidates
+
+    Returns
+    -------
+    list of (t0_s, f0_hz, costas_matches) sorted by costas_matches descending.
+    ``t0_s``        — coarse signal start time in seconds (160 ms resolution)
+    ``f0_hz``       — base frequency of lowest tone (6.25 Hz resolution)
+    ``costas_matches`` — number of Costas symbols that matched (0–21)
+    """
+    sym_n = int(round(FT8_SYMBOL_DURATION_S * fs))   # 1920 at 12 kHz
+    df = float(fs) / sym_n                            # 6.25 Hz per bin
+    x = np.asarray(frame, dtype=np.float64)
+    n_wins = len(x) // sym_n
+    if n_wins < FT8_NSYMS:
+        return []
+
+    # ── Step 1: Batch FFT — incoherent power spectrogram at 1-symbol hop ─────
+    # x_matrix rows are non-overlapping sym_n-sample windows.
+    x_matrix = x[: n_wins * sym_n].reshape(n_wins, sym_n)
+    spec = np.abs(np.fft.rfft(x_matrix, axis=1)) ** 2   # (n_wins, sym_n//2+1)
+
+    lo_bin = max(0, int(math.floor(fmin_hz / df)))
+    hi_bin = min(spec.shape[1] - 8, int(math.ceil(fmax_hz / df)))
+    n_f0 = hi_bin - lo_bin
+    if n_f0 <= 0:
+        return []
+
+    # ── Step 2: Compute argmax tone at every (window, f0) position ───────────
+    # For each f0 bin b, the 8 tones occupy spec[:, b+0 .. b+7].
+    # We stack 8 shifted slices and take the argmax along the tone axis.
+    sub = spec[:, lo_bin: lo_bin + n_f0 + 7]            # (n_wins, n_f0 + 7)
+    tone_e = np.stack([sub[:, k: k + n_f0] for k in range(8)], axis=0)  # (8, n_wins, n_f0)
+    argmax_tones = np.argmax(tone_e, axis=0)             # (n_wins, n_f0)
+
+    # ── Step 3: Score every (t0_idx, f0_bin) by Costas match count ───────────
+    t0_idx_lo = int(math.floor(t0_min_s / FT8_SYMBOL_DURATION_S))
+    t0_idx_hi = int(math.ceil(t0_max_s / FT8_SYMBOL_DURATION_S))
+    t0_indices = np.arange(t0_idx_lo, t0_idx_hi + 1, dtype=np.int32)  # (T,)
+    T = len(t0_indices)
+
+    cos_pos = np.array(FT8_COSTAS_POSITIONS, dtype=np.int32)          # (21,)
+    cos_tones = np.array(
+        [FT8_COSTAS_TONES[i % 7] for i in range(21)], dtype=np.int32  # (21,)
+    )
+
+    # sym_indices[t, c] = t0_indices[t] + cos_pos[c]   shape (T, 21)
+    sym_indices = t0_indices[:, np.newaxis] + cos_pos[np.newaxis, :]
+    valid = (sym_indices >= 0) & (sym_indices < n_wins)       # (T, 21) bool
+    sym_clipped = np.clip(sym_indices, 0, n_wins - 1)
+
+    # argmax_at_syms[t, c, f] = argmax_tones[sym_clipped[t,c], f]   (T, 21, n_f0)
+    argmax_at_syms = argmax_tones[sym_clipped, :]
+
+    # matches[t, c, f] = 1 if argmax matches expected Costas tone and index valid
+    matches = (argmax_at_syms == cos_tones[np.newaxis, :, np.newaxis])
+    matches &= valid[:, :, np.newaxis]
+
+    # scores[t, f] = total Costas matches summed over 21 positions
+    scores = matches.sum(axis=1)  # (T, n_f0) int
+
+    # ── Step 4: Collect and return candidates above threshold ─────────────────
+    good_t, good_f = np.where(scores >= min_costas)
+    if len(good_t) == 0:
+        return []
+
+    out = [
+        (
+            float(t0_indices[int(ti)]) * FT8_SYMBOL_DURATION_S,
+            float(lo_bin + int(fi)) * df,
+            int(scores[int(ti), int(fi)]),
+        )
+        for ti, fi in zip(good_t, good_f)
+    ]
+    out.sort(key=lambda r: -r[2])
+    return out[:max_results]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 14  FT8ConsoleDecoder  (end-to-end streaming decoder)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1454,29 +1562,51 @@ class FT8ConsoleDecoder:
         return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%H:%M:%S")
 
     def _decode_frame(self, frame: np.ndarray, utc: str) -> None:
-        """Run full decode pipeline on one 15 s frame."""
+        """Run full decode pipeline on one 15 s frame.
+
+        Sync search follows the ft8_lib ``find_sync`` approach:
+          1. Fast waterfall sync  — incoherent spectrogram, covers full
+             FT8 timing window in O(n_wins × n_f0) time (< 5 ms).
+          2. Fine time search     — ±80 ms at 20 ms steps around each
+             coarse candidate to resolve sub-symbol timing (ft8_lib style).
+          3. Fine frequency       — ±3 Hz sub-bin refinement.
+          4. LLR extraction + LDPC + AP passes (unchanged).
+        """
         _T0_MIN = -0.50
         _T0_MAX = 15.0 - FT8_TX_DURATION_S   # ≈ +2.36 s
 
-        # Detect candidate seed frequencies (all top-20 to maximise coverage)
-        candidates = self._detector.detect(frame, top_n=20)
-        seed_items = candidates[:20]
-        seed_freqs = [f for f, _ in seed_items]
+        # ── Step 1: Fast waterfall sync search (ft8_lib find_sync style) ─────
+        # Covers the full valid FT8 window [_T0_MIN, _T0_MAX] via a precomputed
+        # incoherent power spectrogram; typically completes in < 5 ms.
+        coarse = _ft8_waterfall_sync(
+            frame,
+            fs=self.fs_proc,
+            fmin_hz=self.fmin_hz,
+            fmax_hz=self.fmax_hz,
+            t0_min_s=_T0_MIN,
+            t0_max_s=_T0_MAX,
+            min_costas=self._min_costas_matches,
+            max_results=40,
+        )
 
         if self._debug:
-            print(
-                f"[FT8] slot {utc}Z  seeds={len(seed_freqs)}", flush=True
-            )
-            for f0, score in seed_items:
-                print(f"  [seed] {f0:7.1f} Hz  score={score:+5.1f} dB", flush=True)
+            print(f"[FT8] slot {utc}Z  {len(coarse)} coarse sync candidate(s)",
+                  flush=True)
 
-        sync_cands = self._sync.search(
-            frame,
-            seed_freqs_hz=seed_freqs,
-            time_search_s=0.5,
-            freq_search_bins=3,
-            max_candidates=10,
-        )
+        # De-duplicate by frequency: keep only the best-scoring t0 per f0 bin,
+        # then take the top 10 for the (more expensive) fine decode loop.
+        seen_f0_bin: set[int] = set()
+        sync_cands: list[tuple[float, float, float]] = []
+        df = FT8_TONE_SPACING_HZ
+        for t0_coarse, f0_hz, cos_m in coarse:
+            f0_bin = int(round(f0_hz / df))
+            if f0_bin in seen_f0_bin:
+                continue
+            seen_f0_bin.add(f0_bin)
+            score_db = 10.0 * math.log10(max(cos_m / len(FT8_COSTAS_POSITIONS), 1e-6))
+            sync_cands.append((t0_coarse, f0_hz, score_db))
+            if len(sync_cands) >= 10:
+                break
 
         if self._debug:
             print(
@@ -1484,26 +1614,42 @@ class FT8ConsoleDecoder:
                 flush=True,
             )
             for t0_s, f0_hz, score in sync_cands:
-                tag = "  (outside t window)" if (
-                    float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX
-                ) else ""
                 print(
                     f"  [sync] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
-                    f"  score={score:+5.1f} dB{tag}",
+                    f"  score={score:+5.1f} dB",
                     flush=True,
                 )
 
         seen_msg: set[str] = set()
-        for t0_s, f0_hz, _score in sync_cands:
-            if float(t0_s) < _T0_MIN or float(t0_s) > _T0_MAX:
+        for t0_coarse, f0_hz, _score in sync_cands:
+            # ── Step 2: Fine time search (ft8_lib sub-symbol refinement) ─────
+            # The waterfall has 160 ms (1 symbol) resolution.  Search ±80 ms
+            # (half a symbol) at 20 ms steps to find the exact signal start.
+            dt_fine = FT8_SYMBOL_DURATION_S / 8.0        # 20 ms
+            half_sym = FT8_SYMBOL_DURATION_S * 0.5       # 80 ms
+            best_m = -1
+            best_t0 = t0_coarse
+            best_E79: Optional[np.ndarray] = None
+            for dt in np.arange(-half_sym, half_sym + dt_fine / 2.0, dt_fine):
+                t0_try = float(t0_coarse) + float(dt)
+                if t0_try < _T0_MIN or t0_try > _T0_MAX:
+                    continue
+                E_try = self._extractor.extract_all_79(
+                    frame, t0_s=t0_try, f0_hz=f0_hz
+                )
+                m, _, _ = _costas_score(E_try)
+                if m > best_m:
+                    best_m = m
+                    best_t0 = t0_try
+                    best_E79 = E_try
+
+            if best_E79 is None:
                 continue
+            t0_s = best_t0
+            costas_m = best_m
+            E79 = best_E79
 
-            E79 = self._extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
-            costas_m, _, _ = _costas_score(E79)
-
-            # Fine frequency refinement: try sub-bin Hz offsets to handle signals
-            # whose base frequency is not exactly on the 6.25 Hz grid (e.g. due to
-            # transceiver calibration drift).  Improves Costas scores and LLR quality.
+            # ── Step 3: Fine frequency refinement ─────────────────────────────
             _best_m = costas_m
             _best_f0 = f0_hz
             _best_E79 = E79
@@ -1541,6 +1687,7 @@ class FT8ConsoleDecoder:
                     )
                 continue
 
+            # ── Step 4: LLR extraction, normalisation, LDPC + AP ─────────────
             E_payload, hard_syms = ft8_extract_payload_symbols(E79)
             _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
 
@@ -1550,9 +1697,6 @@ class FT8ConsoleDecoder:
 
             ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)
             ap_pass_name = "none"
-            # If baseline fails with few parity errors (near-miss real signal),
-            # try AP passes for common message types.  Skip if too many errors
-            # (likely noise — AP won't help and would waste time).
             if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
                 for _ap_name, _ap_bits in _AP_PASSES:
                     ok, payload, iters, best_errors = ft8_ldpc_decode(
@@ -1567,7 +1711,6 @@ class FT8ConsoleDecoder:
                     print(f"    [ldpc] OK  ({iters} iters{ap_tag})", flush=True)
                 else:
                     if best_errors == 0:
-                        # LDPC converged but CRC failed
                         rx_crc_bits = payload[77:91]
                         rx_crc = int(
                             sum(int(b) << (13 - i)
