@@ -20,6 +20,10 @@ Tests:
   15. RadioGUI._freq_step defaults to 0.001 MHz
   16. infer_band_from_freq — correct band returned for sample frequencies
   17. infer_band_from_freq — None returned for out-of-band frequency
+  18. AppConfig — TX audio device properties default to -1 / ""
+  19. AppConfig.save_tx_audio — persists and reloads TX devices correctly
+  20. _switch_to_data stops RX monitor and TX capture before switching
+  21. _switch_to_voice stops data-mode audio stream and FT8 decoder
 
 Run:  python test_main_gui_mode.py
 """
@@ -334,6 +338,65 @@ def test_infer_band_out_of_range():
     assert fn(gui, 2.5)   is None   # between 160m and 80m
 
 
+def test_appconfig_tx_audio_defaults():
+    """TX audio device properties should default to -1 / '' when not set."""
+    with tempfile.NamedTemporaryFile(suffix=".cfg", delete=False) as fh:
+        cfg_path = fh.name
+    try:
+        os.unlink(cfg_path)          # start without a config file
+        cfg = main.AppConfig(path=cfg_path)
+        assert cfg.tx_mic_device_index       == -1
+        assert cfg.tx_mic_device_label       == ""
+        assert cfg.tx_radio_out_device_index == -1
+        assert cfg.tx_radio_out_device_label == ""
+    finally:
+        if os.path.exists(cfg_path):
+            os.unlink(cfg_path)
+
+
+def test_appconfig_save_tx_audio():
+    """save_tx_audio must persist all four TX audio fields."""
+    with tempfile.NamedTemporaryFile(suffix=".cfg", delete=False) as fh:
+        cfg_path = fh.name
+    try:
+        cfg = main.AppConfig(path=cfg_path)
+        cfg.save_tx_audio(3, "3: Headset Mic (WASAPI)", 7, "7: FT-991A USB (WASAPI)")
+
+        # Reload from disk
+        cfg2 = main.AppConfig(path=cfg_path)
+        assert cfg2.tx_mic_device_index       == 3,  f"mic idx: {cfg2.tx_mic_device_index}"
+        assert cfg2.tx_mic_device_label       == "3: Headset Mic (WASAPI)"
+        assert cfg2.tx_radio_out_device_index == 7,  f"out idx: {cfg2.tx_radio_out_device_index}"
+        assert cfg2.tx_radio_out_device_label == "7: FT-991A USB (WASAPI)"
+    finally:
+        if os.path.exists(cfg_path):
+            os.unlink(cfg_path)
+
+
+def test_switch_to_data_stops_voice_audio():
+    """_switch_to_data must stop RX monitor and TX capture before switching."""
+    gui = mock.MagicMock()
+    gui._op_mode = "voice"
+    main.RadioGUI._switch_to_data(gui)
+    gui._stop_rx_monitor.assert_called_once()
+    gui._stop_tx_audio.assert_called_once()
+    assert gui._op_mode == "data"
+    gui._ft8.start.assert_called_once()
+    gui._apply_op_mode.assert_called_once_with("data")
+
+
+def test_switch_to_voice_stops_audio_streams():
+    """_switch_to_voice must stop data-mode audio stream and FT8 decoder."""
+    gui = mock.MagicMock()
+    gui._op_mode = "data"
+    main.RadioGUI._switch_to_voice(gui)
+    gui._save_ft8_log_to_file.assert_called_once()
+    gui._stop_audio_stream.assert_called_once()
+    gui._ft8.stop.assert_called_once()
+    assert gui._op_mode == "voice"
+    gui._apply_op_mode.assert_called_once_with("voice")
+
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -360,6 +423,10 @@ if __name__ == "__main__":
     run("15. RadioGUI._freq_step default",         test_freq_step_default)
     run("16. infer_band_from_freq — in-band",      test_infer_band_from_freq)
     run("17. infer_band_from_freq — out-of-band",  test_infer_band_out_of_range)
+    run("18. AppConfig — TX audio defaults",       test_appconfig_tx_audio_defaults)
+    run("19. AppConfig.save_tx_audio — persists",  test_appconfig_save_tx_audio)
+    run("20. _switch_to_data stops voice audio",   test_switch_to_data_stops_voice_audio)
+    run("21. _switch_to_voice stops audio streams", test_switch_to_voice_stops_audio_streams)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total  = len(results)

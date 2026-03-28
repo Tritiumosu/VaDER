@@ -21,6 +21,7 @@ except Exception:
 from ft991a_cat import Yaesu991AControl
 from digi_input import SoundCardAudioSource
 from ft8_decode import FT8ConsoleDecoder, format_ft8_message
+from audio_passthrough import AudioPassthrough, AudioTxCapture
 
 # --- Constants & Band Plans ---
 BANDS = {
@@ -71,6 +72,12 @@ class AppConfig:
             "device_label":        "",
             "output_device_index": "-1",
             "output_device_label": "",
+        },
+        "tx_audio": {
+            "mic_device_index":        "-1",  # computer microphone for TX
+            "mic_device_label":        "",
+            "radio_out_device_index":  "-1",  # soundcard output → radio audio input
+            "radio_out_device_label":  "",
         },
     }
 
@@ -149,6 +156,45 @@ class AppConfig:
             self._cfg.add_section("audio")
         self._cfg.set("audio", "output_device_index", str(int(device_index)))
         self._cfg.set("audio", "output_device_label", device_label.strip())
+        self._write()
+
+    # -- TX Audio helpers --------------------------------------------------
+
+    @property
+    def tx_mic_device_index(self) -> int:
+        try:
+            return int(self._cfg.get("tx_audio", "mic_device_index", fallback="-1"))
+        except ValueError:
+            return -1
+
+    @property
+    def tx_mic_device_label(self) -> str:
+        return self._cfg.get("tx_audio", "mic_device_label", fallback="").strip()
+
+    @property
+    def tx_radio_out_device_index(self) -> int:
+        try:
+            return int(self._cfg.get("tx_audio", "radio_out_device_index", fallback="-1"))
+        except ValueError:
+            return -1
+
+    @property
+    def tx_radio_out_device_label(self) -> str:
+        return self._cfg.get("tx_audio", "radio_out_device_label", fallback="").strip()
+
+    def save_tx_audio(
+        self,
+        mic_idx: int,
+        mic_label: str,
+        radio_out_idx: int,
+        radio_out_label: str,
+    ) -> None:
+        if not self._cfg.has_section("tx_audio"):
+            self._cfg.add_section("tx_audio")
+        self._cfg.set("tx_audio", "mic_device_index",       str(int(mic_idx)))
+        self._cfg.set("tx_audio", "mic_device_label",       mic_label.strip())
+        self._cfg.set("tx_audio", "radio_out_device_index", str(int(radio_out_idx)))
+        self._cfg.set("tx_audio", "radio_out_device_label", radio_out_label.strip())
         self._write()
 
     # -- Internal ----------------------------------------------------------
@@ -249,7 +295,9 @@ class SettingsDialog:
     Opens as a child of the given parent window and blocks until
     the user clicks Apply or Cancel.  On Apply the supplied
     `on_apply` callback is called with:
-      (port, baud, stopbits, audio_in_idx, audio_in_label, audio_out_idx, audio_out_label)
+      (port, baud, stopbits,
+       audio_in_idx, audio_in_label, audio_out_idx, audio_out_label,
+       tx_mic_idx, tx_mic_label, tx_radio_out_idx, tx_radio_out_label)
     """
 
     BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
@@ -262,9 +310,12 @@ class SettingsDialog:
         current_port: str = "",
         current_baud: int = 38400,
         current_stopbits: float = 1,
-        current_audio_in_label:  str = "",
-        current_audio_out_label: str = "",
-        on_apply,   # callable(port, baud, stopbits, in_idx, in_label, out_idx, out_label)
+        current_audio_in_label:      str = "",
+        current_audio_out_label:     str = "",
+        current_tx_mic_label:        str = "",
+        current_tx_radio_out_label:  str = "",
+        on_apply,   # callable(port, baud, stopbits, in_idx, in_label, out_idx, out_label,
+                    #          tx_mic_idx, tx_mic_label, tx_radio_out_idx, tx_radio_out_label)
     ) -> None:
         self._on_apply = on_apply
 
@@ -331,7 +382,7 @@ class SettingsDialog:
         self._stop_combo.pack(side=tk.LEFT, padx=4)
 
         # -- Audio Input row -----------------------------------------------
-        ain_frame = tk.LabelFrame(self._win, text="Audio Input Device")
+        ain_frame = tk.LabelFrame(self._win, text="Audio Input Device (RX: Radio → Computer)")
         ain_frame.pack(padx=16, pady=6, fill=tk.X)
 
         tk.Label(ain_frame, text="Device:").pack(side=tk.LEFT, padx=6)
@@ -353,7 +404,7 @@ class SettingsDialog:
         ).pack(side=tk.LEFT, padx=4)
 
         # -- Audio Output row ----------------------------------------------
-        aout_frame = tk.LabelFrame(self._win, text="Audio Output Device")
+        aout_frame = tk.LabelFrame(self._win, text="Audio Output Device (RX Monitor: Computer → Speakers)")
         aout_frame.pack(padx=16, pady=6, fill=tk.X)
 
         tk.Label(aout_frame, text="Device:").pack(side=tk.LEFT, padx=6)
@@ -370,6 +421,50 @@ class SettingsDialog:
 
         tk.Button(
             aout_frame,
+            text="Refresh",
+            command=self._refresh_audio,
+        ).pack(side=tk.LEFT, padx=4)
+
+        # -- TX Microphone row ---------------------------------------------
+        txmic_frame = tk.LabelFrame(self._win, text="TX Microphone (Computer Mic → Radio)")
+        txmic_frame.pack(padx=16, pady=6, fill=tk.X)
+
+        tk.Label(txmic_frame, text="Device:").pack(side=tk.LEFT, padx=6)
+
+        self._tx_mic_var = tk.StringVar(value=current_tx_mic_label)
+        self._tx_mic_combo = ttk.Combobox(
+            txmic_frame,
+            textvariable=self._tx_mic_var,
+            values=(),
+            state="readonly",
+            width=32,
+        )
+        self._tx_mic_combo.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+
+        tk.Button(
+            txmic_frame,
+            text="Refresh",
+            command=self._refresh_audio,
+        ).pack(side=tk.LEFT, padx=4)
+
+        # -- TX Radio Output row -------------------------------------------
+        txout_frame = tk.LabelFrame(self._win, text="TX Radio Output (Computer → Radio Audio Input)")
+        txout_frame.pack(padx=16, pady=6, fill=tk.X)
+
+        tk.Label(txout_frame, text="Device:").pack(side=tk.LEFT, padx=6)
+
+        self._tx_radio_out_var = tk.StringVar(value=current_tx_radio_out_label)
+        self._tx_radio_out_combo = ttk.Combobox(
+            txout_frame,
+            textvariable=self._tx_radio_out_var,
+            values=(),
+            state="readonly",
+            width=32,
+        )
+        self._tx_radio_out_combo.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+
+        tk.Button(
+            txout_frame,
             text="Refresh",
             command=self._refresh_audio,
         ).pack(side=tk.LEFT, padx=4)
@@ -408,6 +503,8 @@ class SettingsDialog:
         self._refresh_audio(
             initial_in=current_audio_in_label,
             initial_out=current_audio_out_label,
+            initial_tx_mic=current_tx_mic_label,
+            initial_tx_radio_out=current_tx_radio_out_label,
         )
 
         # Centre over the parent
@@ -437,8 +534,14 @@ class SettingsDialog:
             self._port_var.set("")
             self._port_status.config(text="No ports found", fg="red")
 
-    def _refresh_audio(self, initial_in: str = "", initial_out: str = "") -> None:
-        """Query WASAPI devices and populate both audio dropdowns."""
+    def _refresh_audio(
+        self,
+        initial_in: str = "",
+        initial_out: str = "",
+        initial_tx_mic: str = "",
+        initial_tx_radio_out: str = "",
+    ) -> None:
+        """Query WASAPI devices and populate all four audio dropdowns."""
         self._audio_status_lbl.config(text="Scanning audio devices...", fg="gray")
         self._win.update_idletasks()
 
@@ -449,8 +552,10 @@ class SettingsDialog:
 
         self._ain_combo.config(values=in_labels)
         self._aout_combo.config(values=out_labels)
+        self._tx_mic_combo.config(values=in_labels)
+        self._tx_radio_out_combo.config(values=out_labels)
 
-        # Restore or auto-select input
+        # Restore or auto-select RX input
         cur_in = initial_in or self._ain_var.get()
         if cur_in in in_labels:
             self._ain_var.set(cur_in)
@@ -459,7 +564,7 @@ class SettingsDialog:
         else:
             self._ain_var.set("")
 
-        # Restore or auto-select output
+        # Restore or auto-select RX output (monitor)
         cur_out = initial_out or self._aout_var.get()
         if cur_out in out_labels:
             self._aout_var.set(cur_out)
@@ -467,6 +572,24 @@ class SettingsDialog:
             self._aout_var.set(out_labels[0])
         else:
             self._aout_var.set("")
+
+        # Restore or auto-select TX microphone
+        cur_tx_mic = initial_tx_mic or self._tx_mic_var.get()
+        if cur_tx_mic in in_labels:
+            self._tx_mic_var.set(cur_tx_mic)
+        elif in_labels:
+            self._tx_mic_var.set(in_labels[0])
+        else:
+            self._tx_mic_var.set("")
+
+        # Restore or auto-select TX radio output
+        cur_tx_out = initial_tx_radio_out or self._tx_radio_out_var.get()
+        if cur_tx_out in out_labels:
+            self._tx_radio_out_var.set(cur_tx_out)
+        elif out_labels:
+            self._tx_radio_out_var.set(out_labels[0])
+        else:
+            self._tx_radio_out_var.set("")
 
         if err:
             self._audio_status_lbl.config(text=err, fg="orange")
@@ -501,13 +624,22 @@ class SettingsDialog:
             messagebox.showerror("Settings", "Invalid stop-bits value.", parent=self._win)
             return
 
-        ain_label  = self._ain_var.get().strip()
-        aout_label = self._aout_var.get().strip()
-        ain_idx    = self._parse_device_index(ain_label)
-        aout_idx   = self._parse_device_index(aout_label)
+        ain_label          = self._ain_var.get().strip()
+        aout_label         = self._aout_var.get().strip()
+        tx_mic_label       = self._tx_mic_var.get().strip()
+        tx_radio_out_label = self._tx_radio_out_var.get().strip()
+
+        ain_idx          = self._parse_device_index(ain_label)
+        aout_idx         = self._parse_device_index(aout_label)
+        tx_mic_idx       = self._parse_device_index(tx_mic_label)
+        tx_radio_out_idx = self._parse_device_index(tx_radio_out_label)
 
         self._win.destroy()
-        self._on_apply(port, baud, stopbits, ain_idx, ain_label, aout_idx, aout_label)
+        self._on_apply(
+            port, baud, stopbits,
+            ain_idx, ain_label, aout_idx, aout_label,
+            tx_mic_idx, tx_mic_label, tx_radio_out_idx, tx_radio_out_label,
+        )
 
 
 # --- GUI & Features Class ---
@@ -529,24 +661,37 @@ class RadioGUI:
         # Frequency step for tuning buttons (MHz)
         self._freq_step = 0.001
 
-        # Audio input device (index to pass to SoundCardAudioSource)
+        # Audio input device (index to pass to SoundCardAudioSource / AudioPassthrough)
         _saved_idx = self._config.audio_device_index
         self.audio_device_index = _saved_idx if _saved_idx >= 0 else None
 
-        # Audio output device
+        # Audio output device (headphones / speakers for RX monitoring)
         _saved_out = self._config.audio_output_device_index
         self.audio_output_device_index = _saved_out if _saved_out >= 0 else None
 
-        # Live audio stream state
+        # TX audio devices
+        _tx_mic = self._config.tx_mic_device_index
+        self.tx_mic_device_index = _tx_mic if _tx_mic >= 0 else None
+
+        _tx_out = self._config.tx_radio_out_device_index
+        self.tx_radio_out_device_index = _tx_out if _tx_out >= 0 else None
+
+        # Live audio stream state (data mode / FT8)
         self._audio_src    = None
         self._audio_thread = None
         self._audio_stop   = threading.Event()
+
+        # RX audio passthrough (voice mode: radio audio → computer speakers)
+        self._audio_passthrough: "AudioPassthrough | None" = None
+
+        # TX audio capture (PTT active: computer mic → radio audio input)
+        self._tx_capture: "AudioTxCapture | None" = None
 
         # FT8 decoder -- created once, started/stopped with operating mode
         self._ft8 = FT8ConsoleDecoder(on_decode=self._on_ft8_decode)
 
         self.root.title("FT-991A Command Center")
-        self.root.geometry("500x820")
+        self.root.geometry("500x900")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.setup_ui()
@@ -642,6 +787,89 @@ class RadioGUI:
         self._audio_start_btn.config(state=tk.NORMAL)
         self._audio_stop_btn.config(state=tk.DISABLED)
 
+    # -- Voice RX monitoring helpers ---------------------------------------
+
+    def _start_rx_monitor(self) -> None:
+        """
+        Start RX audio passthrough: radio audio input → computer speakers/headphones.
+        Requires both audio_device_index (radio input) and audio_output_device_index
+        (headphones) to be configured in Settings.
+        """
+        self._stop_rx_monitor()
+        if self.audio_device_index is None or self.audio_output_device_index is None:
+            self._ui_queue.put(("voice_audio_status",
+                                "Voice Audio: configure input & output devices in Settings"))
+            return
+        try:
+            self._audio_passthrough = AudioPassthrough(
+                input_device=self.audio_device_index,
+                output_device=self.audio_output_device_index,
+                rms_callback=lambda rms: self._ui_queue.put(("voice_rx_rms", rms)),
+            )
+            self._audio_passthrough.start()
+            self._ui_queue.put((
+                "voice_audio_status",
+                f"RX Monitor: LIVE (in={self.audio_device_index} → out={self.audio_output_device_index})",
+            ))
+        except Exception as e:
+            self._audio_passthrough = None
+            self._ui_queue.put(("voice_audio_status", f"RX Monitor: ERROR ({e})"))
+
+    def _stop_rx_monitor(self) -> None:
+        """Stop RX audio passthrough if running."""
+        pt = self._audio_passthrough
+        self._audio_passthrough = None
+        if pt is not None:
+            try:
+                pt.stop()
+            except Exception:
+                pass
+
+    def _on_start_rx_monitor(self) -> None:
+        """GUI callback: start RX audio monitoring."""
+        self._start_rx_monitor()
+        if self._audio_passthrough is not None:
+            self._voice_rx_start_btn.config(state=tk.DISABLED)
+            self._voice_rx_stop_btn.config(state=tk.NORMAL)
+
+    def _on_stop_rx_monitor(self) -> None:
+        """GUI callback: stop RX audio monitoring."""
+        self._stop_rx_monitor()
+        self._voice_rx_start_btn.config(state=tk.NORMAL)
+        self._voice_rx_stop_btn.config(state=tk.DISABLED)
+        self.voice_audio_status.config(text="RX Monitor: stopped")
+
+    # -- TX audio helpers --------------------------------------------------
+
+    def _start_tx_audio(self) -> None:
+        """
+        Start TX audio capture: computer microphone → radio audio input.
+        Called automatically on PTT press.
+        """
+        if self.tx_mic_device_index is None or self.tx_radio_out_device_index is None:
+            # TX audio not configured; PTT still works via CAT PTT command
+            return
+        try:
+            self._tx_capture = AudioTxCapture(
+                mic_device=self.tx_mic_device_index,
+                radio_out_device=self.tx_radio_out_device_index,
+                rms_callback=lambda rms: self._ui_queue.put(("voice_tx_rms", rms)),
+            )
+            self._tx_capture.start()
+        except Exception as e:
+            self._tx_capture = None
+            self._ui_queue.put(("voice_audio_status", f"TX Audio: ERROR ({e})"))
+
+    def _stop_tx_audio(self) -> None:
+        """Stop TX audio capture. Called automatically on PTT release."""
+        tx = self._tx_capture
+        self._tx_capture = None
+        if tx is not None:
+            try:
+                tx.stop()
+            except Exception:
+                pass
+
     # -- FT8 helpers -------------------------------------------------------
 
     def _on_ft8_decode(self, utc: str, freq_hz: float, snr_db: float, message: str) -> None:
@@ -685,7 +913,7 @@ class RadioGUI:
         """Switch to voice operating mode."""
         # Save decoded FT8 messages before hiding the panel
         self._save_ft8_log_to_file()
-        # Stop audio stream and FT8 decoder
+        # Stop data-mode audio stream and FT8 decoder
         self._stop_audio_stream()
         try:
             self._ft8.stop()
@@ -696,6 +924,9 @@ class RadioGUI:
 
     def _switch_to_data(self) -> None:
         """Switch to data/FT8 operating mode."""
+        # Stop voice-mode audio passthrough before switching
+        self._stop_rx_monitor()
+        self._stop_tx_audio()
         self._op_mode = "data"
         # Start FT8 decoder (it will receive audio once the stream is started)
         try:
@@ -708,8 +939,8 @@ class RadioGUI:
         """
         Show/hide GUI sections based on operating mode.
 
-        Voice: PTT + Signal Log visible; FT8 panel + Audio Controls hidden.
-        Data:  FT8 panel + Audio Controls visible; PTT + Signal Log hidden.
+        Voice: PTT + Voice Audio Monitor + Signal Log visible; FT8 + Audio Controls hidden.
+        Data:  FT8 panel + Audio Controls visible; PTT + Voice Audio + Signal Log hidden.
         """
         # Default button background (platform-safe: read from the widget itself)
         _btn_bg = self._voice_btn.cget("bg")
@@ -724,13 +955,15 @@ class RadioGUI:
 
         # Remove all mode-conditional sections first (preserves pack order on re-add)
         self._ptt_frame.pack_forget()
+        self._voice_audio_frame.pack_forget()
         self.log_frame.pack_forget()
         self._audio_ctrl_frame.pack_forget()
         self.ft8_frame.pack_forget()
 
         if mode == "voice":
             self._ptt_frame.pack(pady=5, fill=tk.X, padx=20)
-            self.log_frame.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
+            self._voice_audio_frame.pack(padx=20, pady=(0, 6), fill=tk.X)
+            self.log_frame.pack(padx=20, pady=(0, 10), fill=tk.BOTH, expand=True)
         else:
             # Reset audio button states
             self._audio_start_btn.config(state=tk.NORMAL)
@@ -954,6 +1187,31 @@ class RadioGUI:
         self.ptt_btn.bind("<ButtonPress-1>",   self._on_ptt_press)
         self.ptt_btn.bind("<ButtonRelease-1>", self._on_ptt_release)
 
+        # -- Voice Audio Monitor (voice-only section) ----------------------
+        self._voice_audio_frame = tk.LabelFrame(self.root, text="Voice Audio")
+
+        voice_audio_btn_row = tk.Frame(self._voice_audio_frame)
+        voice_audio_btn_row.pack(fill=tk.X, padx=5, pady=4)
+
+        self._voice_rx_start_btn = tk.Button(
+            voice_audio_btn_row, text="Start RX Monitor", bg="lightgreen",
+            command=self._on_start_rx_monitor,
+        )
+        self._voice_rx_start_btn.pack(side=tk.LEFT, padx=4)
+
+        self._voice_rx_stop_btn = tk.Button(
+            voice_audio_btn_row, text="Stop RX Monitor", bg="orange", state=tk.DISABLED,
+            command=self._on_stop_rx_monitor,
+        )
+        self._voice_rx_stop_btn.pack(side=tk.LEFT, padx=4)
+
+        self.voice_audio_status = tk.Label(
+            self._voice_audio_frame,
+            text="RX Monitor: configure devices in Settings, then Start",
+            anchor="w", fg="gray",
+        )
+        self.voice_audio_status.pack(padx=5, pady=(0, 4), fill=tk.X)
+
         # -- Signal Log (voice-only section) -------------------------------
         self.log_frame = tk.LabelFrame(self.root, text="Signal Log")
 
@@ -1058,12 +1316,16 @@ class RadioGUI:
         if not self._ptt_allowed():
             return "break"
         self.radio.ptt_on()
+        self._start_tx_audio()
+        self.ptt_btn.config(bg="red")
         return "break"
 
     def _on_ptt_release(self, event):
         if not self._ptt_allowed():
             return "break"
+        self._stop_tx_audio()
         self.radio.ptt_off()
+        self.ptt_btn.config(bg="darkred")
         return "break"
 
     def on_close(self):
@@ -1084,6 +1346,16 @@ class RadioGUI:
 
         try:
             self._stop_audio_stream()
+        except Exception:
+            pass
+
+        try:
+            self._stop_rx_monitor()
+        except Exception:
+            pass
+
+        try:
+            self._stop_tx_audio()
         except Exception:
             pass
 
@@ -1153,6 +1425,22 @@ class RadioGUI:
                 elif kind == "audio_status":
                     _, text = item
                     self.audio_status.config(text=text)
+
+                elif kind == "voice_audio_status":
+                    _, text = item
+                    self.voice_audio_status.config(text=text)
+
+                elif kind == "voice_rx_rms":
+                    _, rms = item
+                    self.voice_audio_status.config(
+                        text=f"RX Monitor: LIVE  RMS {rms:.4f}"
+                    )
+
+                elif kind == "voice_tx_rms":
+                    _, rms = item
+                    self.voice_audio_status.config(
+                        text=f"TX ACTIVE  Mic RMS {rms:.4f}"
+                    )
 
                 elif kind == "rf_power":
                     _, p = item
@@ -1471,6 +1759,8 @@ class RadioGUI:
             current_stopbits=current_stopbits,
             current_audio_in_label=self._config.audio_device_label,
             current_audio_out_label=self._config.audio_output_device_label,
+            current_tx_mic_label=self._config.tx_mic_device_label,
+            current_tx_radio_out_label=self._config.tx_radio_out_device_label,
             on_apply=self._apply_settings,
         )
 
@@ -1483,6 +1773,10 @@ class RadioGUI:
         audio_in_label: str,
         audio_out_idx: int,
         audio_out_label: str,
+        tx_mic_idx: int,
+        tx_mic_label: str,
+        tx_radio_out_idx: int,
+        tx_radio_out_label: str,
     ) -> None:
         """
         Apply new settings from the SettingsDialog.
@@ -1513,7 +1807,7 @@ class RadioGUI:
 
         self._config.save_serial(port, baud, stopbits)
 
-        # Update audio input device
+        # Update audio input device (RX: radio → computer)
         if audio_in_idx >= 0:
             self.audio_device_index = audio_in_idx
             self._config.save_audio(audio_in_idx, audio_in_label)
@@ -1521,10 +1815,27 @@ class RadioGUI:
                 text=f"Audio: device {audio_in_idx} configured -- click Start Audio"
             )
 
-        # Update audio output device
+        # Update audio output device (RX monitor: computer → headphones)
         if audio_out_idx >= 0:
             self.audio_output_device_index = audio_out_idx
             self._config.save_audio_output(audio_out_idx, audio_out_label)
+
+        # Update TX audio devices
+        tx_changed = False
+        if tx_mic_idx >= 0:
+            self.tx_mic_device_index = tx_mic_idx
+            tx_changed = True
+        if tx_radio_out_idx >= 0:
+            self.tx_radio_out_device_index = tx_radio_out_idx
+            tx_changed = True
+        if tx_changed:
+            self._config.save_tx_audio(
+                tx_mic_idx, tx_mic_label,
+                tx_radio_out_idx, tx_radio_out_label,
+            )
+            self.voice_audio_status.config(
+                text="Voice Audio: TX devices updated — re-start RX Monitor if active"
+            )
 
         self.refresh_connection_ui()
 
