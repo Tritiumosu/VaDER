@@ -429,7 +429,7 @@ def test_validate_operator_invalid_callsign():
     """validate_operator returns (False, reason) for an invalid callsign."""
     ok, reason = main.validate_operator("!!!", "EN52")
     assert ok is False
-    assert "callsign" in reason.lower() or reason
+    assert "callsign" in reason.lower()
 
 
 def test_validate_operator_invalid_grid():

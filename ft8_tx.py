@@ -83,6 +83,13 @@ POST_KEY_S: float = 0.05
 #: boundary when the worker thread wakes up, the TX is aborted as "missed".
 MISSED_SLOT_THRESHOLD_S: float = 0.5
 
+#: After the pre-key sleep, seconds_to_next_slot() should be approximately
+#: PRE_KEY_S (≈ 0.2 s).  If the returned value exceeds this buffer, the slot
+#: boundary has already been crossed and we need to check for a missed-slot
+#: condition.  Set to 1 s to give a comfortable margin above normal jitter
+#: while still catching any overrun well before the next slot starts.
+SLOT_OVERRUN_DETECTION_BUFFER_S: float = 1.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 1  TX State
@@ -337,9 +344,9 @@ class Ft8TxCoordinator:
             # boundary.  In that case compute how many seconds have elapsed
             # since the boundary and abort if it exceeds the threshold.
             #
-            # Heuristic: any value > pre_key_s + 1 s means the boundary just
-            # passed (slot_remaining ≈ slot_duration − elapsed).
-            if slot_overrun > self._pre_key_s + 1.0:
+            # Heuristic: any value > pre_key_s + SLOT_OVERRUN_DETECTION_BUFFER_S
+            # means the boundary just passed (slot_remaining ≈ slot_duration − elapsed).
+            if slot_overrun > self._pre_key_s + SLOT_OVERRUN_DETECTION_BUFFER_S:
                 elapsed_past = 15.0 - slot_overrun
                 if elapsed_past > self._missed_s:
                     msg = (
