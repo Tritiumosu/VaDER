@@ -79,6 +79,10 @@ class AppConfig:
             "radio_out_device_index":  "-1",  # soundcard output → radio audio input
             "radio_out_device_label":  "",
         },
+        "operator": {
+            "callsign": "",   # operator callsign, e.g. W4ABC — used in FT8 messages
+            "grid":     "",   # 4-char Maidenhead grid locator, e.g. EN52
+        },
     }
 
     def __init__(self, path: str = _CFG_PATH) -> None:
@@ -195,6 +199,26 @@ class AppConfig:
         self._cfg.set("tx_audio", "mic_device_label",       mic_label.strip())
         self._cfg.set("tx_audio", "radio_out_device_index", str(int(radio_out_idx)))
         self._cfg.set("tx_audio", "radio_out_device_label", radio_out_label.strip())
+        self._write()
+
+    # -- Operator identity helpers ----------------------------------------
+
+    @property
+    def operator_callsign(self) -> str:
+        """Operator callsign stored in vader.cfg (empty string if not set)."""
+        return self._cfg.get("operator", "callsign", fallback="").strip().upper()
+
+    @property
+    def operator_grid(self) -> str:
+        """4-char Maidenhead grid locator stored in vader.cfg (empty if not set)."""
+        return self._cfg.get("operator", "grid", fallback="").strip().upper()
+
+    def save_operator(self, callsign: str, grid: str) -> None:
+        """Persist the operator callsign and grid locator to vader.cfg."""
+        if not self._cfg.has_section("operator"):
+            self._cfg.add_section("operator")
+        self._cfg.set("operator", "callsign", callsign.strip().upper())
+        self._cfg.set("operator", "grid",     grid.strip().upper())
         self._write()
 
     # -- Internal ----------------------------------------------------------

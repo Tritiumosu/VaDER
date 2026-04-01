@@ -1,0 +1,525 @@
+"""
+ft8_qso.py — FT8 QSO state machine and message composition for VaDER (Milestone 4).
+
+This module provides:
+  - OperatorConfig  : stores and validates the operator's callsign and grid
+  - Message composition helpers (compose_cq, compose_reply, …)
+  - ReceivedMessage : parses a decoded FT8 message string into typed fields
+  - QsoState        : enum tracking the lifecycle of a single FT8 QSO
+  - Ft8QsoManager   : state machine that selects responses and advances QSO state
+
+Standard FT8 QSO sequence (WSJT-X convention)
+----------------------------------------------
+Station A (CQ caller)        Station B (answering)
+──────────────────────────────────────────────────
+1.  CQ W4ABC EN52
+                              2.  W4ABC K9XYZ -05
+3.  K9XYZ W4ABC R-07
+                              4.  W4ABC K9XYZ RR73
+5.  K9XYZ W4ABC 73
+
+By convention Station A uses even UTC slots (0 s, 30 s) and Station B uses
+odd slots (15 s, 45 s).  Slot parity is advisory; Ft8QsoManager exposes
+helpers to query the current slot but does not enforce any timing.
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from enum import Enum, auto
+from typing import Optional
+
+import numpy as np
+
+from ft8_encode import validate_callsign, ft8_encode_to_symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 1  QSO lifecycle states
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QsoState(Enum):
+    """Lifecycle states for a single FT8 QSO exchange."""
+    IDLE          = auto()  # No active QSO — ready to call CQ or reply
+    CQ_SENT       = auto()  # We sent CQ; waiting for a reply from any station
+    REPLY_SENT    = auto()  # We replied to a CQ; waiting for their exchange
+    EXCHANGE_SENT = auto()  # We sent our exchange (R+SNR); waiting for RRR/RR73
+    RRR_SENT      = auto()  # We sent RR73; waiting for the final 73
+    COMPLETE      = auto()  # QSO completed — 73 exchanged
+    ABORTED       = auto()  # QSO abandoned (timeout, manual cancel, etc.)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 2  Operator configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OperatorConfig:
+    """
+    Holds the operator's callsign and Maidenhead grid locator.
+
+    Performs basic validation on assignment to catch common mistakes before
+    any message encoding is attempted.
+
+    Usage
+    -----
+    op = OperatorConfig()
+    op.callsign = 'W4ABC'     # raises ValueError if invalid
+    op.grid     = 'EN52'      # raises ValueError if not 4-char Maidenhead
+    assert op.is_configured()
+    """
+
+    def __init__(self, callsign: str = "", grid: str = "") -> None:
+        self._callsign: str = ""
+        self._grid: str = ""
+        if callsign:
+            self.callsign = callsign
+        if grid:
+            self.grid = grid
+
+    # -- Properties --------------------------------------------------------
+
+    @property
+    def callsign(self) -> str:
+        """Operator callsign (uppercase, validated)."""
+        return self._callsign
+
+    @callsign.setter
+    def callsign(self, value: str) -> None:
+        """Set operator callsign after ft8_lib format validation."""
+        call = value.upper().strip()
+        if not validate_callsign(call):
+            raise ValueError(
+                f"Invalid callsign {value!r}.  "
+                "Expected a standard ham callsign (e.g. W4ABC, VK2TIM, K9XYZ)."
+            )
+        self._callsign = call
+
+    @property
+    def grid(self) -> str:
+        """4-character Maidenhead grid locator (uppercase, validated)."""
+        return self._grid
+
+    @grid.setter
+    def grid(self, value: str) -> None:
+        """Set grid locator after 4-char Maidenhead format validation."""
+        g = value.upper().strip()
+        if g and not re.fullmatch(r"[A-R]{2}[0-9]{2}", g):
+            raise ValueError(
+                f"Invalid grid locator {value!r}.  "
+                "Must be a 4-character Maidenhead locator (e.g. EN52, IO91, QF56)."
+            )
+        self._grid = g
+
+    # -- Helpers -----------------------------------------------------------
+
+    def is_configured(self) -> bool:
+        """Return True when both callsign and grid are non-empty."""
+        return bool(self._callsign and self._grid)
+
+    def __repr__(self) -> str:
+        return (
+            f"OperatorConfig(callsign={self._callsign!r}, grid={self._grid!r})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 3  Standard message composition
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compose_cq(our_call: str, our_grid: str) -> str:
+    """
+    Compose a CQ message.
+
+    Example
+    -------
+    >>> compose_cq('W4ABC', 'EN52')
+    'CQ W4ABC EN52'
+    """
+    return f"CQ {our_call.upper()} {our_grid.upper()}"
+
+
+def compose_reply(dx_call: str, our_call: str, snr_db: int) -> str:
+    """
+    Compose a reply to a received CQ (Station B's opening message).
+
+    Includes the received SNR of the DX station's signal so they know the
+    link quality from their end.
+
+    Example
+    -------
+    >>> compose_reply('W4ABC', 'K9XYZ', -5)
+    'W4ABC K9XYZ -05'
+    """
+    return f"{dx_call.upper()} {our_call.upper()} {snr_db:+03d}"
+
+
+def compose_exchange(dx_call: str, our_call: str, snr_db: int) -> str:
+    """
+    Compose the exchange message with 'R' acknowledgement prefix.
+
+    This is Station A's response to Station B's reply; the 'R' confirms
+    receipt and is followed by our own SNR measurement.
+
+    Example
+    -------
+    >>> compose_exchange('K9XYZ', 'W4ABC', -7)
+    'K9XYZ W4ABC R-07'
+    """
+    return f"{dx_call.upper()} {our_call.upper()} R{snr_db:+03d}"
+
+
+def compose_rrr(dx_call: str, our_call: str) -> str:
+    """
+    Compose an RRR acknowledgement message.
+
+    Example
+    -------
+    >>> compose_rrr('W4ABC', 'K9XYZ')
+    'W4ABC K9XYZ RRR'
+    """
+    return f"{dx_call.upper()} {our_call.upper()} RRR"
+
+
+def compose_rr73(dx_call: str, our_call: str) -> str:
+    """
+    Compose an RR73 message (roger + farewell combined, saves one exchange).
+
+    Example
+    -------
+    >>> compose_rr73('W4ABC', 'K9XYZ')
+    'W4ABC K9XYZ RR73'
+    """
+    return f"{dx_call.upper()} {our_call.upper()} RR73"
+
+
+def compose_73(dx_call: str, our_call: str) -> str:
+    """
+    Compose a 73 (farewell / QSO complete) message.
+
+    Example
+    -------
+    >>> compose_73('K9XYZ', 'W4ABC')
+    'K9XYZ W4ABC 73'
+    """
+    return f"{dx_call.upper()} {our_call.upper()} 73"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 4  Received-message parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ReceivedMessage:
+    """
+    Parsed representation of a decoded FT8 message.
+
+    Splits the raw string into typed fields so that the QSO state machine
+    can react to the message without repeated string parsing.
+
+    Attributes
+    ----------
+    raw          : str  — original decoded message string
+    call1        : str  — first callsign field  (the addressed station)
+    call2        : str  — second callsign field  (the transmitting station)
+    extra        : str  — third field (grid, SNR, RRR, RR73, 73, or '')
+    snr_db       : int | None  — numeric SNR if extra is a dB report
+    is_cq        : bool — True when call1 is 'CQ' or 'QRZ'
+    is_rrr       : bool — True when extra == 'RRR'
+    is_rr73      : bool — True when extra == 'RR73'
+    is_73        : bool — True when extra == '73'
+    is_r_report  : bool — True when extra is an R-prefixed SNR (e.g. 'R-07')
+    """
+
+    def __init__(self, raw: str) -> None:
+        self.raw   = raw.strip()
+        parts      = self.raw.upper().split()
+        self.call1 = parts[0] if len(parts) > 0 else ""
+        self.call2 = parts[1] if len(parts) > 1 else ""
+        self.extra = parts[2] if len(parts) > 2 else ""
+
+        self.is_cq   = self.call1 in ("CQ", "QRZ")
+        self.is_rrr  = self.extra == "RRR"
+        self.is_rr73 = self.extra == "RR73"
+        self.is_73   = self.extra == "73"
+        self.is_r_report = bool(
+            len(self.extra) > 1
+            and self.extra[0] == "R"
+            and self.extra[1] in ("+", "-")
+        )
+
+        self.snr_db: Optional[int] = None
+        if self.extra and self.extra[0] in ("+", "-"):
+            try:
+                self.snr_db = int(self.extra)
+            except ValueError:
+                pass
+        elif self.is_r_report:
+            try:
+                self.snr_db = int(self.extra[1:])
+            except ValueError:
+                pass
+
+    def is_addressed_to(self, callsign: str) -> bool:
+        """Return True when call1 matches *callsign* (case-insensitive)."""
+        return self.call1.upper() == callsign.upper()
+
+    def is_from(self, callsign: str) -> bool:
+        """Return True when call2 matches *callsign* (case-insensitive)."""
+        return self.call2.upper() == callsign.upper()
+
+    def __repr__(self) -> str:
+        return f"ReceivedMessage({self.raw!r})"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 5  QSO manager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Ft8QsoManager:
+    """
+    Manages a single FT8 QSO exchange from initial contact to 73.
+
+    The manager tracks state, composes the correct next message, and exposes
+    the encoded 79-symbol tone sequence ready for audio synthesis.
+
+    Calling CQ (Station A)
+    ----------------------
+    manager = Ft8QsoManager(operator)
+    manager.start_cq()                           # queued_tx = 'CQ W4ABC EN52'
+    manager.advance('W4ABC K9XYZ -05')           # queued_tx = 'K9XYZ W4ABC R+00'
+    manager.advance('K9XYZ W4ABC RR73')          # queued_tx = 'K9XYZ W4ABC 73'
+    assert manager.state == QsoState.COMPLETE
+
+    Answering a CQ (Station B)
+    --------------------------
+    manager = Ft8QsoManager(operator)
+    manager.start_from_received('CQ W4ABC EN52', snr_db=-5)
+    # queued_tx = 'W4ABC K9XYZ -05'
+    manager.advance('K9XYZ W4ABC R-07')          # queued_tx = 'W4ABC K9XYZ RR73'
+    manager.advance('W4ABC K9XYZ 73')
+    assert manager.state == QsoState.COMPLETE
+    """
+
+    def __init__(self, operator: OperatorConfig) -> None:
+        self.operator: OperatorConfig = operator
+        self.state: QsoState = QsoState.IDLE
+        self._queued_tx: Optional[str] = None
+        self._dx_call:   Optional[str] = None
+        # SNR reported to us by the DX station (used if we want to echo it)
+        self._rx_snr:    Optional[int] = None
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def start_cq(self) -> str:
+        """
+        Compose a CQ message and queue it for the next TX slot.
+
+        Returns
+        -------
+        str  The CQ message text (e.g. 'CQ W4ABC EN52').
+
+        Raises
+        ------
+        RuntimeError if the operator callsign is not configured.
+        """
+        self._require_callsign()
+        if not self.operator.grid:
+            raise RuntimeError(
+                "Operator grid not configured.  "
+                "Set operator.grid before calling start_cq()."
+            )
+        msg = compose_cq(self.operator.callsign, self.operator.grid)
+        self._set_tx(msg)
+        self.state    = QsoState.CQ_SENT
+        self._dx_call = None
+        return msg
+
+    def start_from_received(
+        self,
+        received_msg: str,
+        *,
+        snr_db: int = 0,
+    ) -> Optional[str]:
+        """
+        Select a received message and queue the appropriate response.
+
+        Call this when the operator clicks on a decoded FT8 line to begin a
+        QSO.  The *snr_db* value should be the SNR reported by the decoder
+        for that message so it can be included in the response.
+
+        Parameters
+        ----------
+        received_msg : str  — raw decoded FT8 message string
+        snr_db       : int  — signal SNR of the received message (dB)
+
+        Returns
+        -------
+        str | None — the message queued for TX, or None if we cannot respond.
+        """
+        self._require_callsign()
+        rx = ReceivedMessage(received_msg)
+
+        if rx.is_cq:
+            # Reply to any CQ
+            self._dx_call = rx.call2
+            self._rx_snr  = rx.snr_db
+            msg = compose_reply(rx.call2, self.operator.callsign, snr_db)
+            self._set_tx(msg)
+            self.state = QsoState.REPLY_SENT
+            return msg
+
+        if rx.is_addressed_to(self.operator.callsign):
+            # Someone is already calling us — delegate to advance()
+            return self.advance(received_msg, snr_db=snr_db)
+
+        return None  # Message not addressed to us
+
+    def advance(
+        self,
+        received_msg: str,
+        *,
+        snr_db: int = 0,
+    ) -> Optional[str]:
+        """
+        Process a received message and advance the QSO state machine.
+
+        Parameters
+        ----------
+        received_msg : str  — decoded FT8 message from the DX station
+        snr_db       : int  — SNR of the received message (dB); used when we
+                              need to include a signal report in our reply
+
+        Returns
+        -------
+        str | None — next TX message, or None when the QSO is complete.
+        """
+        self._require_callsign()
+        rx  = ReceivedMessage(received_msg)
+        msg: Optional[str] = None
+
+        if self.state == QsoState.CQ_SENT:
+            # Waiting for any station to reply to our CQ
+            if rx.is_addressed_to(self.operator.callsign) and rx.call2:
+                self._dx_call = rx.call2
+                self._rx_snr  = rx.snr_db
+                msg = compose_exchange(rx.call2, self.operator.callsign, snr_db)
+                self._set_tx(msg)
+                self.state = QsoState.EXCHANGE_SENT
+
+        elif self.state == QsoState.REPLY_SENT:
+            # We replied to a CQ; waiting for DX to send us an exchange
+            if (
+                self._dx_call
+                and rx.is_addressed_to(self.operator.callsign)
+                and rx.is_from(self._dx_call)
+            ):
+                msg = compose_rr73(self._dx_call, self.operator.callsign)
+                self._set_tx(msg)
+                self.state = QsoState.RRR_SENT
+
+        elif self.state == QsoState.EXCHANGE_SENT:
+            # We sent an exchange; waiting for RRR or RR73
+            if (
+                self._dx_call
+                and rx.is_addressed_to(self.operator.callsign)
+                and (rx.is_rrr or rx.is_rr73)
+            ):
+                msg = compose_73(self._dx_call, self.operator.callsign)
+                self._set_tx(msg)
+                self.state = QsoState.COMPLETE
+
+        elif self.state == QsoState.RRR_SENT:
+            # We sent RR73; optionally wait for their confirming 73
+            if (
+                self._dx_call
+                and rx.is_addressed_to(self.operator.callsign)
+                and rx.is_73
+            ):
+                self._queued_tx = None
+                self.state = QsoState.COMPLETE
+
+        return msg
+
+    def get_queued_tx(self) -> Optional[str]:
+        """Return the message text currently queued for transmission."""
+        return self._queued_tx
+
+    def get_queued_symbols(self) -> Optional[np.ndarray]:
+        """
+        Return the 79-symbol tone sequence for the queued TX message.
+
+        Returns None if no message is queued.  The caller is responsible for
+        audio synthesis (see ft8_encode.ft8_symbols_to_audio).
+        """
+        if self._queued_tx is None:
+            return None
+        return ft8_encode_to_symbols(self._queued_tx)
+
+    def clear_tx(self) -> None:
+        """Clear the queued TX message (call after the transmission completes)."""
+        self._queued_tx = None
+
+    def abort(self) -> None:
+        """Abort the current QSO and return to IDLE."""
+        self.state      = QsoState.ABORTED
+        self._queued_tx = None
+        self._dx_call   = None
+        self._rx_snr    = None
+
+    def reset(self) -> None:
+        """Reset the manager to IDLE state, ready for a new QSO."""
+        self.state      = QsoState.IDLE
+        self._queued_tx = None
+        self._dx_call   = None
+        self._rx_snr    = None
+
+    @property
+    def is_active(self) -> bool:
+        """True when a QSO is in progress (not IDLE, COMPLETE, or ABORTED)."""
+        return self.state not in (
+            QsoState.IDLE, QsoState.COMPLETE, QsoState.ABORTED
+        )
+
+    @property
+    def dx_call(self) -> Optional[str]:
+        """Callsign of the DX station we are working, or None."""
+        return self._dx_call
+
+    # ── Timeslot helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def seconds_to_next_slot(slot_duration_s: float = 15.0) -> float:
+        """
+        Return the number of seconds until the start of the next FT8 UTC slot.
+
+        FT8 uses 15-second slots aligned to UTC: 0, 15, 30, 45 s each minute.
+        This helper lets the application schedule TX to begin at the slot
+        boundary rather than mid-slot.
+        """
+        now     = datetime.now(tz=timezone.utc)
+        elapsed = (now.second % slot_duration_s) + now.microsecond / 1_000_000
+        return slot_duration_s - elapsed
+
+    @staticmethod
+    def current_slot_parity() -> int:
+        """
+        Return 0 for even slots (0 s, 30 s) or 1 for odd slots (15 s, 45 s).
+
+        By WSJT-X convention Station A (CQ caller) transmits in even slots and
+        Station B (answering station) transmits in odd slots.
+        """
+        now        = datetime.now(tz=timezone.utc)
+        slot_index = now.second // 15
+        return slot_index % 2
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _set_tx(self, msg: str) -> None:
+        """Queue a message for transmission."""
+        self._queued_tx = msg
+
+    def _require_callsign(self) -> None:
+        if not self.operator.callsign:
+            raise RuntimeError(
+                "Operator callsign is not configured.  "
+                "Set operator.callsign before starting a QSO."
+            )

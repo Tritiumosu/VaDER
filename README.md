@@ -47,8 +47,11 @@ The project is currently **hardware-specific** (Yaesu FT-991A), but the CAT laye
 | FT8 message log (on-screen + file) | ✅ Working |
 | Settings persistence (vader.cfg) | ✅ Working |
 | Automated test suite (pytest) | ✅ Working |
-| FT8 TX tone generation | 🔲 Not yet implemented |
-| Full FT8 QSO automation | 🔲 Not yet implemented |
+| FT8 TX tone generation | ✅ Working (`ft8_encode.py`) |
+| FT8 message packing & LDPC encode | ✅ Working |
+| FT8 QSO state machine & message composition | ✅ Working (`ft8_qso.py`) |
+| Operator callsign/grid in settings | ✅ Working (`vader.cfg [operator]`) |
+| Full QSO automation | 🔲 Not yet implemented |
 | Contact / QSO logging to file | 🔲 Partial (UI exists, no file save) |
 | Support for radios other than FT-991A | 🔲 Planned |
 
@@ -207,6 +210,8 @@ python -c "from ft8_decode import decode_wav; decode_wav('live_ft8_audio_traffic
 | `main.py` | Main tkinter GUI — radio dashboard, FT8 log, settings |
 | `ft991a_cat.py` | Yaesu FT-991A ASCII CAT library (70+ serial commands) |
 | `ft8_decode.py` | Full FT8 decoder: resample → sync → LDPC → CRC → unpack |
+| `ft8_encode.py` | FT8 encoder: pack → CRC → LDPC → tones → audio synthesis |
+| `ft8_qso.py` | QSO state machine, message composition, received-message parser |
 | `audio_passthrough.py` | Real-time voice audio routing (RX monitor, TX capture) |
 | `digi_input.py` | Soundcard capture front-end for the FT8 decoder |
 | `live_test.py` | Console FT8 decoder — useful without a radio attached |
@@ -232,6 +237,7 @@ pytest test_ft8_decode_output.py -v # Message formatting against live WAV files
 pytest test_msg_unpack.py -v        # Callsign / grid / free-text unpacking
 pytest test_audio_passthrough.py -v # Audio routing with mocked sounddevice
 pytest test_main_gui_mode.py -v     # GUI operating modes and config persistence
+pytest test_ft8_encode.py -v        # FT8 encoder, QSO state machine, round-trip
 ```
 
 All tests run without physical hardware; serial and audio I/O are mocked.
@@ -276,12 +282,20 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] RMS level metering in GUI
 - [x] Audio device selection with persistence
 
-### 🔄 Milestone 4 — FT8 Transmit & Basic QSO (In Progress / Next Up)
-- [ ] FT8 tone generation (8-FSK, 6.25 Hz spacing, 160 ms symbols)
-- [ ] TX sequencing: auto-time transmission to 15-second UTC slots
+### 🔄 Milestone 4 — FT8 Transmit & Basic QSO (In Progress)
+- [x] FT8 message packing (callsign, grid, SNR, special tokens → 77 bits)
+- [x] CRC-14 generation (polynomial 0x2757, matching WSJT-X / ft8_lib)
+- [x] LDPC (174, 91) encoding via GF(2) matrix factorisation
+- [x] Gray-coded 8-FSK tone symbol generation (58 payload + 21 Costas sync)
+- [x] Phase-continuous audio synthesis with configurable base frequency and sample rate
+- [x] Operator callsign and grid persistence in `vader.cfg` (`[operator]` section)
+- [x] Standard QSO message composition helpers (CQ, reply, exchange, RRR, RR73, 73)
+- [x] FT8 QSO state machine (`Ft8QsoManager`) — CQ and reply-to-CQ workflows
+- [x] Decoded-message parser (`ReceivedMessage`) for classifying received FT8 lines
+- [x] Full encode → audio → decode round-trip validation (WSJT-X compatible)
+- [ ] TX sequencing: schedule transmission to 15-second UTC slot boundary
 - [ ] PTT integration for DATA mode (CAT PTT triggered around FT8 TX window)
-- [ ] Minimal FT8 QSO exchange: CQ / reply / RRR / 73
-- [ ] SNR / grid reporting in outbound FT8 messages
+- [ ] GUI integration: callsign/grid settings, TX panel, QSO log, select-and-reply
 
 ### 🗺️ Milestone 5 — QSO Logging
 - [ ] Save completed QSOs to ADIF file format
