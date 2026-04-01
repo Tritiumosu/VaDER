@@ -83,6 +83,15 @@ class AppConfig:
             "callsign": "",   # operator callsign, e.g. W4ABC — used in FT8 messages
             "grid":     "",   # 4-char Maidenhead grid locator, e.g. EN52
         },
+        "ntp": {
+            # Comma-separated list of NTP servers tried in order on startup.
+            # Defaults to NIST, Cloudflare, Google, and the NTP Pool.
+            "servers":          "time.nist.gov,time.cloudflare.com,time.google.com,pool.ntp.org",
+            # Automatically query NTP when the application starts.
+            "sync_on_startup":  "true",
+            # Per-server socket timeout in seconds.
+            "timeout_s":        "3.0",
+        },
     }
 
     def __init__(self, path: str = _CFG_PATH) -> None:
@@ -219,6 +228,50 @@ class AppConfig:
             self._cfg.add_section("operator")
         self._cfg.set("operator", "callsign", callsign.strip().upper())
         self._cfg.set("operator", "grid",     grid.strip().upper())
+        self._write()
+
+    # -- NTP helpers -------------------------------------------------------
+
+    @property
+    def ntp_servers(self) -> list[str]:
+        """
+        Ordered list of NTP servers from vader.cfg.
+
+        Returns the DEFAULT_NTP_SERVERS list from ft8_ntp if the config key
+        is empty or missing.
+        """
+        raw = self._cfg.get("ntp", "servers", fallback="").strip()
+        if not raw:
+            from ft8_ntp import DEFAULT_NTP_SERVERS
+            return list(DEFAULT_NTP_SERVERS)
+        return [s.strip() for s in raw.split(",") if s.strip()]
+
+    @property
+    def ntp_sync_on_startup(self) -> bool:
+        """True when VaDER should run an NTP sync on application startup."""
+        raw = self._cfg.get("ntp", "sync_on_startup", fallback="true").strip().lower()
+        return raw not in ("false", "0", "no", "off")
+
+    @property
+    def ntp_timeout_s(self) -> float:
+        """Per-server NTP socket timeout in seconds."""
+        try:
+            return float(self._cfg.get("ntp", "timeout_s", fallback="3.0"))
+        except ValueError:
+            return 3.0
+
+    def save_ntp(
+        self,
+        servers: list[str],
+        sync_on_startup: bool = True,
+        timeout_s: float = 3.0,
+    ) -> None:
+        """Persist NTP settings to vader.cfg."""
+        if not self._cfg.has_section("ntp"):
+            self._cfg.add_section("ntp")
+        self._cfg.set("ntp", "servers",         ",".join(s.strip() for s in servers))
+        self._cfg.set("ntp", "sync_on_startup", "true" if sync_on_startup else "false")
+        self._cfg.set("ntp", "timeout_s",       str(float(timeout_s)))
         self._write()
 
     # -- Internal ----------------------------------------------------------

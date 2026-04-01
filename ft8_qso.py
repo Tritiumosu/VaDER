@@ -32,6 +32,7 @@ from typing import Optional
 import numpy as np
 
 from ft8_encode import validate_callsign, ft8_encode_to_symbols
+from ft8_ntp import Ft8SlotTimer, default_slot_timer
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -299,13 +300,23 @@ class Ft8QsoManager:
     assert manager.state == QsoState.COMPLETE
     """
 
-    def __init__(self, operator: OperatorConfig) -> None:
+    def __init__(
+        self,
+        operator: OperatorConfig,
+        slot_timer: Optional[Ft8SlotTimer] = None,
+    ) -> None:
         self.operator: OperatorConfig = operator
         self.state: QsoState = QsoState.IDLE
         self._queued_tx: Optional[str] = None
         self._dx_call:   Optional[str] = None
         # SNR reported to us by the DX station (used if we want to echo it)
         self._rx_snr:    Optional[int] = None
+        # NTP-backed slot timer; each manager gets its own instance unless the
+        # caller injects one (e.g. for testing or for sharing a pre-synced timer
+        # across multiple managers in the same session).
+        self._slot_timer: Ft8SlotTimer = (
+            slot_timer if slot_timer is not None else Ft8SlotTimer()
+        )
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -486,30 +497,35 @@ class Ft8QsoManager:
 
     # ── Timeslot helpers ──────────────────────────────────────────────────
 
-    @staticmethod
-    def seconds_to_next_slot(slot_duration_s: float = 15.0) -> float:
+    def seconds_to_next_slot(self) -> float:
         """
         Return the number of seconds until the start of the next FT8 UTC slot.
 
-        FT8 uses 15-second slots aligned to UTC: 0, 15, 30, 45 s each minute.
-        This helper lets the application schedule TX to begin at the slot
-        boundary rather than mid-slot.
+        FT8 slots begin at :00, :15, :30, and :45 of each UTC minute.
+        Delegates to the Ft8SlotTimer so the result uses NTP-corrected time
+        when a sync has been performed, otherwise falls back to local system
+        time.
         """
-        now     = datetime.now(tz=timezone.utc)
-        elapsed = (now.second % slot_duration_s) + now.microsecond / 1_000_000
-        return slot_duration_s - elapsed
+        return self._slot_timer.seconds_to_next_slot()
 
-    @staticmethod
-    def current_slot_parity() -> int:
+    def current_slot_parity(self) -> int:
         """
-        Return 0 for even slots (0 s, 30 s) or 1 for odd slots (15 s, 45 s).
+        Return 0 for even slots (:00, :30) or 1 for odd slots (:15, :45).
 
-        By WSJT-X convention Station A (CQ caller) transmits in even slots and
-        Station B (answering station) transmits in odd slots.
+        By WSJT-X convention Station A (CQ caller) transmits in even slots
+        and Station B (answering station) transmits in odd slots.
+        Delegates to the Ft8SlotTimer for NTP-corrected accuracy.
         """
-        now        = datetime.now(tz=timezone.utc)
-        slot_index = now.second // 15
-        return slot_index % 2
+        return self._slot_timer.current_slot_parity()
+
+    def next_slot_utc(self):
+        """
+        Return a UTC datetime for the start of the next FT8 slot boundary.
+
+        Useful for displaying the scheduled TX time to the operator or for
+        passing to threading.Timer / asyncio.call_at.
+        """
+        return self._slot_timer.next_slot_utc()
 
     # ── Private helpers ───────────────────────────────────────────────────
 

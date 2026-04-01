@@ -51,6 +51,7 @@ The project is currently **hardware-specific** (Yaesu FT-991A), but the CAT laye
 | FT8 message packing & LDPC encode | ✅ Working |
 | FT8 QSO state machine & message composition | ✅ Working (`ft8_qso.py`) |
 | Operator callsign/grid in settings | ✅ Working (`vader.cfg [operator]`) |
+| NTP-disciplined TX slot timing | ✅ Working (`ft8_ntp.py`) |
 | Full QSO automation | 🔲 Not yet implemented |
 | Contact / QSO logging to file | 🔲 Partial (UI exists, no file save) |
 | Support for radios other than FT-991A | 🔲 Planned |
@@ -143,11 +144,12 @@ Yaesu ASCII CAT          FT8 decoder            Voice audio routing
 
 | Requirement | Version |
 |-------------|---------|
-| Python | 3.9 or newer |
+| Python | 3.10 or newer |
 | numpy | ≥ 1.20 |
 | scipy | ≥ 1.5 |
 | pyserial | ≥ 3.5 |
 | sounddevice | ≥ 0.4.5 |
+| ntplib | ≥ 0.4.0 |
 | Yaesu FT-991A | (or future supported radio) |
 | USB CAT cable | Standard USB-A to USB-B (or built-in USB on FT-991A) |
 
@@ -170,7 +172,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. Install dependencies
-pip install numpy scipy pyserial sounddevice
+pip install numpy scipy pyserial sounddevice ntplib
 
 # 4. Run VaDER
 python main.py
@@ -212,6 +214,7 @@ python -c "from ft8_decode import decode_wav; decode_wav('live_ft8_audio_traffic
 | `ft8_decode.py` | Full FT8 decoder: resample → sync → LDPC → CRC → unpack |
 | `ft8_encode.py` | FT8 encoder: pack → CRC → LDPC → tones → audio synthesis |
 | `ft8_qso.py` | QSO state machine, message composition, received-message parser |
+| `ft8_ntp.py` | NTP-disciplined clock: multi-server sync, offset caching, `Ft8SlotTimer` |
 | `audio_passthrough.py` | Real-time voice audio routing (RX monitor, TX capture) |
 | `digi_input.py` | Soundcard capture front-end for the FT8 decoder |
 | `live_test.py` | Console FT8 decoder — useful without a radio attached |
@@ -224,7 +227,7 @@ python -c "from ft8_decode import decode_wav; decode_wav('live_ft8_audio_traffic
 
 ## Running Tests
 
-VaDER has a growing pytest suite covering the FT8 pipeline, CAT command encoding, audio routing, and GUI modes:
+VaDER has a growing pytest suite covering the FT8 pipeline, CAT command encoding, audio routing, NTP timing, and GUI modes:
 
 ```bash
 # Run all tests
@@ -238,9 +241,10 @@ pytest test_msg_unpack.py -v        # Callsign / grid / free-text unpacking
 pytest test_audio_passthrough.py -v # Audio routing with mocked sounddevice
 pytest test_main_gui_mode.py -v     # GUI operating modes and config persistence
 pytest test_ft8_encode.py -v        # FT8 encoder, QSO state machine, round-trip
+pytest test_ft8_ntp.py -v           # NTP sync, slot math, AppConfig NTP settings
 ```
 
-All tests run without physical hardware; serial and audio I/O are mocked.
+All tests run without physical hardware; serial, audio I/O, and NTP network calls are mocked.
 
 ---
 
@@ -293,7 +297,9 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] FT8 QSO state machine (`Ft8QsoManager`) — CQ and reply-to-CQ workflows
 - [x] Decoded-message parser (`ReceivedMessage`) for classifying received FT8 lines
 - [x] Full encode → audio → decode round-trip validation (WSJT-X compatible)
-- [ ] TX sequencing: schedule transmission to 15-second UTC slot boundary
+- [x] NTP-disciplined slot timer (`ft8_ntp.py`) — queries NIST and other public NTP servers, caches clock offset, `Ft8SlotTimer` exposes corrected `seconds_to_next_slot()` / `current_slot_parity()` / `next_slot_utc()`
+- [x] NTP server list configurable in `vader.cfg` (`[ntp]` section), with graceful fallback to system clock
+- [x] `Ft8QsoManager` wired to `Ft8SlotTimer` for accurate TX scheduling
 - [ ] PTT integration for DATA mode (CAT PTT triggered around FT8 TX window)
 - [ ] GUI integration: callsign/grid settings, TX panel, QSO log, select-and-reply
 
