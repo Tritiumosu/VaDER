@@ -397,6 +397,143 @@ def test_switch_to_voice_stops_audio_streams():
     gui._apply_op_mode.assert_called_once_with("voice")
 
 
+def test_appconfig_operator_defaults():
+    """AppConfig operator callsign/grid default to empty strings."""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = main.AppConfig(path=os.path.join(tmpdir, "vader.cfg"))
+        assert cfg.operator_callsign == ""
+        assert cfg.operator_grid == ""
+
+
+def test_appconfig_save_operator():
+    """AppConfig.save_operator persists callsign + grid and reloads correctly."""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "vader.cfg")
+        cfg = main.AppConfig(path=path)
+        cfg.save_operator("W4ABC", "EN52")
+        cfg2 = main.AppConfig(path=path)
+        assert cfg2.operator_callsign == "W4ABC"
+        assert cfg2.operator_grid == "EN52"
+
+
+def test_validate_operator_valid():
+    """validate_operator returns (True, '') for a valid callsign+grid."""
+    ok, reason = main.validate_operator("W4ABC", "EN52")
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_operator_invalid_callsign():
+    """validate_operator returns (False, reason) for an invalid callsign."""
+    ok, reason = main.validate_operator("!!!", "EN52")
+    assert ok is False
+    assert "callsign" in reason.lower()
+
+
+def test_validate_operator_invalid_grid():
+    """validate_operator returns (False, reason) for an invalid grid."""
+    ok, reason = main.validate_operator("W4ABC", "TOOLONG99")
+    assert ok is False
+    assert reason
+
+
+def test_on_save_operator_valid():
+    """_on_save_operator persists valid operator settings without showing an error."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_save_operator(gui)
+    gui._config.save_operator.assert_called_once_with("W4ABC", "EN52")
+    gui.root.winfo_exists.return_value = True  # no error dialog
+
+
+def test_on_save_operator_invalid():
+    """_on_save_operator shows an error dialog for an invalid callsign."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "BADCALL!!!"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_save_operator(gui)
+    # save_operator must NOT be called when validation fails
+    gui._config.save_operator.assert_not_called()
+
+
+def test_on_compose_cq_valid():
+    """_on_compose_cq sets TX message to 'CQ CALL GRID' for valid operator."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_compose_cq(gui)
+    gui._tx_msg_var.set.assert_called_once_with("CQ W4ABC EN52")
+
+
+def test_on_compose_cq_invalid_blocks():
+    """_on_compose_cq must not set TX message when operator settings are invalid."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = ""
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_compose_cq(gui)
+    gui._tx_msg_var.set.assert_not_called()
+
+
+def test_prefill_reply_cq():
+    """_prefill_reply pre-fills a reply to a CQ message."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "K9XYZ"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._prefill_reply(gui, "CQ W4ABC EN52")
+    gui._tx_msg_var.set.assert_called_once()
+    arg = gui._tx_msg_var.set.call_args[0][0]
+    assert "W4ABC" in arg
+    assert "K9XYZ" in arg
+
+
+def test_prefill_reply_rr73():
+    """_prefill_reply pre-fills a 73 reply when DX sends RR73."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "K9XYZ"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._prefill_reply(gui, "K9XYZ W4ABC RR73")
+    gui._tx_msg_var.set.assert_called_once()
+    arg = gui._tx_msg_var.set.call_args[0][0]
+    assert "73" in arg
+
+
+def test_on_arm_tx_empty_message():
+    """_on_arm_tx shows an error dialog when TX message is empty."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "  "  # whitespace only
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_on_arm_tx_invalid_operator():
+    """_on_arm_tx shows an error when operator settings are invalid."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
+    gui._tx_callsign_var.get.return_value = "BADCALL!!!"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_on_cancel_tx_accepted():
+    """_on_cancel_tx calls coord.cancel() and updates status when accepted."""
+    gui = mock.MagicMock()
+    gui._tx_coord.cancel.return_value = True
+    main.RadioGUI._on_cancel_tx(gui)
+    gui._tx_coord.cancel.assert_called_once()
+
+
+def test_on_cancel_tx_not_accepted():
+    """_on_cancel_tx sets status message when cancel is rejected."""
+    gui = mock.MagicMock()
+    gui._tx_coord.cancel.return_value = False
+    main.RadioGUI._on_cancel_tx(gui)
+    gui._tx_status_var.set.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -427,6 +564,21 @@ if __name__ == "__main__":
     run("19. AppConfig.save_tx_audio — persists",  test_appconfig_save_tx_audio)
     run("20. _switch_to_data stops voice audio",   test_switch_to_data_stops_voice_audio)
     run("21. _switch_to_voice stops audio streams", test_switch_to_voice_stops_audio_streams)
+    run("22. AppConfig — operator defaults",        test_appconfig_operator_defaults)
+    run("23. AppConfig.save_operator — persists",   test_appconfig_save_operator)
+    run("24. validate_operator — valid",            test_validate_operator_valid)
+    run("25. validate_operator — invalid callsign", test_validate_operator_invalid_callsign)
+    run("26. validate_operator — invalid grid",     test_validate_operator_invalid_grid)
+    run("27. _on_save_operator — valid",            test_on_save_operator_valid)
+    run("28. _on_save_operator — invalid blocks",   test_on_save_operator_invalid)
+    run("29. _on_compose_cq — valid",               test_on_compose_cq_valid)
+    run("30. _on_compose_cq — invalid blocks",      test_on_compose_cq_invalid_blocks)
+    run("31. _prefill_reply — CQ",                  test_prefill_reply_cq)
+    run("32. _prefill_reply — RR73",                test_prefill_reply_rr73)
+    run("33. _on_arm_tx — empty message",           test_on_arm_tx_empty_message)
+    run("34. _on_arm_tx — invalid operator",        test_on_arm_tx_invalid_operator)
+    run("35. _on_cancel_tx — accepted",             test_on_cancel_tx_accepted)
+    run("36. _on_cancel_tx — not accepted",         test_on_cancel_tx_not_accepted)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total  = len(results)

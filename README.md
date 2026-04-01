@@ -52,6 +52,10 @@ The project is currently **hardware-specific** (Yaesu FT-991A), but the CAT laye
 | FT8 QSO state machine & message composition | ✅ Working (`ft8_qso.py`) |
 | Operator callsign/grid in settings | ✅ Working (`vader.cfg [operator]`) |
 | NTP-disciplined TX slot timing | ✅ Working (`ft8_ntp.py`) |
+| Manual-assisted FT8 TX orchestration | ✅ Working (`ft8_tx.py`) |
+| GUI TX panel (arm/cancel/status/countdown) | ✅ Working (`main.py`) |
+| Select-and-reply from decoded messages | ✅ Working (`main.py`) |
+| CAT PTT key/unkey around FT8 TX window | ✅ Working (`ft8_tx.py`) |
 | Full QSO automation | 🔲 Not yet implemented |
 | Contact / QSO logging to file | 🔲 Partial (UI exists, no file save) |
 | Support for radios other than FT-991A | 🔲 Planned |
@@ -300,8 +304,45 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] NTP-disciplined slot timer (`ft8_ntp.py`) — queries NIST and other public NTP servers, caches clock offset, `Ft8SlotTimer` exposes corrected `seconds_to_next_slot()` / `current_slot_parity()` / `next_slot_utc()`
 - [x] NTP server list configurable in `vader.cfg` (`[ntp]` section), with graceful fallback to system clock
 - [x] `Ft8QsoManager` wired to `Ft8SlotTimer` for accurate TX scheduling
-- [ ] PTT integration for DATA mode (CAT PTT triggered around FT8 TX window)
-- [ ] GUI integration: callsign/grid settings, TX panel, QSO log, select-and-reply
+- [x] **Manual-assisted TX orchestration** (`ft8_tx.py`) — `Ft8TxCoordinator` with IDLE → ARMED → TX_PREP → TX_ACTIVE → COMPLETE / ERROR / CANCELED state machine; PTT always unkeyed in `finally`; missed-slot detection; cancel before slot start
+- [x] **GUI TX panel** (DATA/FT8 mode) — operator callsign/grid entry + Save, TX message field, CQ quick-fill, Arm TX / Cancel TX buttons, live countdown to next slot, colour-coded TX state indicator
+- [x] **Select-and-reply assist** — double-click any decoded FT8 line to pre-populate the TX message with the recommended reply; manual confirmation (Arm TX) still required before any transmission
+- [x] **CAT PTT integration** — `Ft8TxCoordinator` keys and unkeys CAT PTT around the FT8 audio window with configurable pre-key and post-key guard intervals
+- [x] TX guardrails: blocks arm if CAT disconnected, invalid callsign/grid, empty message, negative audio device, or another TX already active/armed
+- [ ] Full QSO automation (Milestone 5 / later)
+
+#### Milestone 4 Usage Notes
+
+**Quick start (DATA mode)**
+
+1. Connect to radio and switch to **DATA / FT8** mode.
+2. In the **FT8 Transmit** panel: enter your callsign and grid, then click **Save**.
+3. Type a message in the **TX Msg** field, or click **CQ** to auto-fill `CQ MYCALL MYGRID`, or double-click a decoded message to pre-fill a reply.
+4. Click **Arm TX (next slot)** — the status label will count down to the next 15-second boundary.
+5. The coordinator automatically keys PTT, plays the FT8 tones, then unkeys PTT.
+6. Click **Cancel TX** at any time before the slot fires to abort without transmitting.
+
+**Safety behaviour**
+- PTT is always unkeyed in a `finally` block — a Python exception, audio failure, or serial error will not leave the rig stuck in TX.
+- If the OS scheduler wakes the TX thread more than 0.5 s late, the job is aborted and reported as `ERROR` rather than starting a late transmission.
+- Only one TX job can be armed at a time; arming a second job while one is active raises an error visible in the status label.
+
+**Configuration (`vader.cfg`)**
+```ini
+[operator]
+callsign = W4ABC
+grid     = EN52
+```
+Saved automatically when you click **Save** in the TX panel.
+
+**Module structure**
+| Module | Responsibility |
+|--------|----------------|
+| `ft8_tx.py` | TX orchestration: state machine, slot timing, PTT, audio dispatch |
+| `ft8_encode.py` | FT8 tone generation and audio synthesis |
+| `ft8_ntp.py` | NTP-corrected slot timer |
+| `ft8_qso.py` | Message composition helpers and QSO state machine |
+| `main.py` | GUI TX panel, select-and-reply assist, UI queue dispatch |
 
 ### 🗺️ Milestone 5 — QSO Logging
 - [ ] Save completed QSOs to ADIF file format
