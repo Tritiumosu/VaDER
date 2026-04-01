@@ -22,6 +22,8 @@ from ft991a_cat import Yaesu991AControl
 from digi_input import SoundCardAudioSource
 from ft8_decode import FT8ConsoleDecoder, format_ft8_message
 from audio_passthrough import AudioPassthrough, AudioTxCapture
+from ft8_tx import Ft8TxCoordinator, TxJob, TxState, validate_operator
+from ft8_ntp import Ft8SlotTimer, default_slot_timer
 
 # --- Constants & Band Plans ---
 BANDS = {
@@ -767,6 +769,16 @@ class RadioGUI:
         # FT8 decoder -- created once, started/stopped with operating mode
         self._ft8 = FT8ConsoleDecoder(on_decode=self._on_ft8_decode)
 
+        # FT8 TX coordinator (manual-assisted TX, Milestone 4)
+        self._slot_timer = default_slot_timer
+        self._tx_coord = Ft8TxCoordinator(
+            radio=self.radio,
+            slot_timer=self._slot_timer,
+        )
+        self._tx_coord.on_state_change = self._on_tx_state_change
+        # Countdown refresh timer handle (stored so it can be cancelled)
+        self._tx_countdown_after: str | None = None
+
         self.root.title("FT-991A Command Center")
         self.root.geometry("500x900")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -984,6 +996,200 @@ class RadioGUI:
         except Exception as e:
             print(f"[FT8 Log] Could not save: {e}", flush=True)
 
+    # -- FT8 TX helpers ----------------------------------------------------
+
+    def _on_save_operator(self) -> None:
+        """Validate and persist the operator callsign/grid from the TX panel."""
+        call = self._tx_callsign_var.get().strip().upper()
+        grid = self._tx_grid_var.get().strip().upper()
+        ok, reason = validate_operator(call, grid)
+        if not ok:
+            messagebox.showerror("Operator Settings", reason, parent=self.root)
+            return
+        self._config.save_operator(call, grid)
+        self._tx_status_var.set(f"Operator saved: {call} / {grid}")
+
+    def _on_compose_cq(self) -> None:
+        """Pre-fill TX message with a CQ using the current operator settings."""
+        call = self._tx_callsign_var.get().strip().upper()
+        grid = self._tx_grid_var.get().strip().upper()
+        ok, reason = validate_operator(call, grid)
+        if not ok:
+            messagebox.showerror(
+                "Operator Settings",
+                f"Cannot compose CQ: {reason}",
+                parent=self.root,
+            )
+            return
+        self._tx_msg_var.set(f"CQ {call} {grid}")
+
+    def _on_ft8_log_double_click(self, event) -> None:
+        """
+        Double-click on a decoded FT8 log line to pre-fill the TX message
+        with an appropriate reply.
+
+        The raw line format from format_ft8_message is:
+            HH:MM:SS  SNR dB  freq Hz  message
+        The FT8 message text is everything after the third whitespace-delimited
+        field.  We extract it and pass it to the reply helper.
+        """
+        try:
+            # Get the line that was double-clicked
+            index = self.ft8_log.index(f"@{event.x},{event.y}")
+            line_start = self.ft8_log.index(f"{index} linestart")
+            line_end   = self.ft8_log.index(f"{index} lineend")
+            raw_line   = self.ft8_log.get(line_start, line_end).strip()
+            if not raw_line:
+                return
+            # Extract the FT8 message: everything from the 4th token onward
+            parts = raw_line.split()
+            if len(parts) < 4:
+                return
+            ft8_msg = " ".join(parts[3:])
+            self._prefill_reply(ft8_msg)
+        except Exception:
+            pass  # Ignore parse errors silently
+
+    def _prefill_reply(self, received_msg: str) -> None:
+        """
+        Given a received FT8 message, pre-fill the TX message box with the
+        recommended reply.
+
+        Only pre-fills; the operator must still press "Arm TX" to transmit.
+        Validates operator settings before composing.
+        """
+        call = self._tx_callsign_var.get().strip().upper()
+        grid = self._tx_grid_var.get().strip().upper()
+        ok, reason = validate_operator(call, grid)
+        if not ok:
+            self._tx_status_var.set(f"Cannot reply: {reason}")
+            return
+
+        parts = received_msg.strip().upper().split()
+        if not parts:
+            return
+
+        if parts[0] in ("CQ", "QRZ") and len(parts) >= 3:
+            # CQ DX_CALL GRID — reply: DX_CALL OUR_CALL +00
+            dx_call = parts[1]
+            self._tx_msg_var.set(f"{dx_call} {call} +00")
+        elif len(parts) >= 3 and parts[0] == call:
+            # DX is calling us: OUR_CALL DX_CALL REPORT or RR73/RRR/73
+            dx_call = parts[1]
+            extra   = parts[2] if len(parts) > 2 else ""
+            if extra in ("RRR", "RR73"):
+                self._tx_msg_var.set(f"{dx_call} {call} 73")
+            elif extra == "73":
+                self._tx_msg_var.set("")  # QSO complete — clear field
+            elif extra.startswith("R"):
+                self._tx_msg_var.set(f"{dx_call} {call} RR73")
+            else:
+                self._tx_msg_var.set(f"{dx_call} {call} R+00")
+        else:
+            # Generic: just copy the message so operator can edit
+            self._tx_msg_var.set(received_msg.strip())
+
+        self._tx_status_var.set(f"Reply pre-filled from: {received_msg.strip()}")
+
+    def _on_arm_tx(self) -> None:
+        """Arm the TX coordinator for the next FT8 slot."""
+        msg = self._tx_msg_var.get().strip()
+        if not msg:
+            messagebox.showerror("TX Error", "TX message is empty.", parent=self.root)
+            return
+
+        # Validate operator settings
+        call = self._tx_callsign_var.get().strip().upper()
+        grid = self._tx_grid_var.get().strip().upper()
+        ok, reason = validate_operator(call, grid)
+        if not ok:
+            messagebox.showerror(
+                "Operator Settings",
+                f"Cannot arm TX: {reason}",
+                parent=self.root,
+            )
+            return
+
+        # Persist operator settings
+        self._config.save_operator(call, grid)
+
+        # Build TxJob with the configured radio output device
+        dev = self.tx_radio_out_device_index
+        job = TxJob(
+            msg,
+            audio_device=dev,
+        )
+
+        try:
+            self._tx_coord.arm(job)
+        except RuntimeError as exc:
+            messagebox.showerror("TX Error", str(exc), parent=self.root)
+            return
+
+        # Update button states
+        self._arm_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+        # Start countdown display
+        self._update_tx_countdown()
+
+    def _on_cancel_tx(self) -> None:
+        """Cancel the armed TX job before slot start."""
+        accepted = self._tx_coord.cancel()
+        if not accepted:
+            self._tx_status_var.set("TX: Cannot cancel — already active or idle")
+
+    def _on_tx_state_change(self, state: TxState, message: str) -> None:
+        """
+        Callback from Ft8TxCoordinator (worker thread) — marshals update to GUI.
+        """
+        self._ui_queue.put(("tx_state", state, message))
+
+    def _apply_tx_state_update(self, state: TxState, message: str) -> None:
+        """
+        Update TX panel widgets based on a new TxState (GUI thread only).
+        """
+        state_colors = {
+            TxState.IDLE:      "gray",
+            TxState.ARMED:     "#4a90d9",
+            TxState.TX_PREP:   "orange",
+            TxState.TX_ACTIVE: "red",
+            TxState.COMPLETE:  "green",
+            TxState.ERROR:     "red",
+            TxState.CANCELED:  "gray",
+        }
+        color = state_colors.get(state, "gray")
+        self._tx_status_lbl.config(fg=color)
+        self._tx_status_var.set(f"TX: {message}")
+
+        if state in (TxState.IDLE, TxState.COMPLETE, TxState.ERROR, TxState.CANCELED):
+            self._arm_btn.config(state=tk.NORMAL)
+            self._cancel_btn.config(state=tk.DISABLED)
+            # Auto-reset coordinator to IDLE so next arm() works immediately
+            self._tx_coord.reset()
+        elif state == TxState.ARMED:
+            self._arm_btn.config(state=tk.DISABLED)
+            self._cancel_btn.config(state=tk.NORMAL)
+        else:  # TX_PREP or TX_ACTIVE
+            self._arm_btn.config(state=tk.DISABLED)
+            self._cancel_btn.config(state=tk.DISABLED)
+
+    def _update_tx_countdown(self) -> None:
+        """
+        Periodic GUI-thread callback that updates the TX status label with a
+        live countdown when the coordinator is ARMED.
+        """
+        state = self._tx_coord.state
+        if state == TxState.ARMED:
+            try:
+                secs = self._tx_coord.seconds_to_next_slot()
+                self._tx_status_var.set(f"TX: Armed — slot in {secs:.1f} s")
+            except Exception:
+                pass
+            # Reschedule every 250 ms
+            self._tx_countdown_after = self.root.after(250, self._update_tx_countdown)
+        else:
+            self._tx_countdown_after = None
+
     # -- Operating mode helpers --------------------------------------------
 
     def _switch_to_voice(self) -> None:
@@ -1036,6 +1242,7 @@ class RadioGUI:
         self.log_frame.pack_forget()
         self._audio_ctrl_frame.pack_forget()
         self.ft8_frame.pack_forget()
+        self._tx_frame.pack_forget()
 
         if mode == "voice":
             self._ptt_frame.pack(pady=5, fill=tk.X, padx=20)
@@ -1046,7 +1253,8 @@ class RadioGUI:
             self._audio_start_btn.config(state=tk.NORMAL)
             self._audio_stop_btn.config(state=tk.DISABLED)
             self._audio_ctrl_frame.pack(padx=20, pady=10, fill=tk.X)
-            self.ft8_frame.pack(padx=20, pady=(0, 10), fill=tk.BOTH, expand=True)
+            self.ft8_frame.pack(padx=20, pady=(0, 4), fill=tk.BOTH, expand=True)
+            self._tx_frame.pack(padx=20, pady=(0, 10), fill=tk.X)
 
     # -- Frequency step helpers --------------------------------------------
 
@@ -1353,6 +1561,77 @@ class RadioGUI:
         ft8_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.ft8_log.pack(padx=5, pady=(2, 5), fill=tk.BOTH, expand=True)
 
+        # Bind double-click on a decoded message to pre-fill the TX message
+        self.ft8_log.bind("<Double-Button-1>", self._on_ft8_log_double_click)
+
+        # -- FT8 TX Panel (data-only section) ------------------------------
+        self._tx_frame = tk.LabelFrame(self.root, text="FT8 Transmit")
+
+        # Row 1: Operator callsign + grid
+        op_row = tk.Frame(self._tx_frame)
+        op_row.pack(fill=tk.X, padx=5, pady=(4, 0))
+        tk.Label(op_row, text="My Call:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._tx_callsign_var = tk.StringVar(
+            value=self._config.operator_callsign
+        )
+        self._tx_callsign_entry = tk.Entry(
+            op_row, textvariable=self._tx_callsign_var, width=10,
+            font=("Consolas", 9),
+        )
+        self._tx_callsign_entry.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(op_row, text="Grid:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._tx_grid_var = tk.StringVar(
+            value=self._config.operator_grid
+        )
+        self._tx_grid_entry = tk.Entry(
+            op_row, textvariable=self._tx_grid_var, width=6,
+            font=("Consolas", 9),
+        )
+        self._tx_grid_entry.pack(side=tk.LEFT, padx=(2, 0))
+        tk.Button(
+            op_row, text="Save", font=("Arial", 8),
+            command=self._on_save_operator,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Row 2: TX message entry
+        msg_row = tk.Frame(self._tx_frame)
+        msg_row.pack(fill=tk.X, padx=5, pady=(4, 0))
+        tk.Label(msg_row, text="TX Msg:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._tx_msg_var = tk.StringVar()
+        self._tx_msg_entry = tk.Entry(
+            msg_row, textvariable=self._tx_msg_var, width=30,
+            font=("Consolas", 9),
+        )
+        self._tx_msg_entry.pack(side=tk.LEFT, padx=(2, 4), fill=tk.X, expand=True)
+        tk.Button(
+            msg_row, text="CQ", font=("Arial", 8),
+            command=self._on_compose_cq,
+        ).pack(side=tk.LEFT, padx=(0, 2))
+
+        # Row 3: Arm / Cancel buttons + status
+        ctrl_row = tk.Frame(self._tx_frame)
+        ctrl_row.pack(fill=tk.X, padx=5, pady=(4, 2))
+        self._arm_btn = tk.Button(
+            ctrl_row, text="Arm TX (next slot)", bg="lightgreen",
+            font=("Arial", 9, "bold"),
+            command=self._on_arm_tx,
+        )
+        self._arm_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._cancel_btn = tk.Button(
+            ctrl_row, text="Cancel TX", bg="orange", state=tk.DISABLED,
+            font=("Arial", 9),
+            command=self._on_cancel_tx,
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        # Status label (shows countdown + TX state)
+        self._tx_status_var = tk.StringVar(value="TX: Idle")
+        self._tx_status_lbl = tk.Label(
+            self._tx_frame, textvariable=self._tx_status_var,
+            font=("Consolas", 9), fg="gray", anchor="w",
+        )
+        self._tx_status_lbl.pack(padx=5, pady=(0, 4), fill=tk.X)
+
     # -- Connection helpers ------------------------------------------------
 
     def refresh_connection_ui(self):
@@ -1409,6 +1688,17 @@ class RadioGUI:
         """Save FT8 log, stop worker threads, and close serial cleanly before exiting."""
         self.scanning = False
         self._shutdown.set()
+
+        # Cancel any armed TX and cancel the countdown timer
+        try:
+            self._tx_coord.cancel()
+        except Exception:
+            pass
+        if self._tx_countdown_after is not None:
+            try:
+                self.root.after_cancel(self._tx_countdown_after)
+            except Exception:
+                pass
 
         # Save any pending FT8 messages before exit
         try:
@@ -1559,6 +1849,10 @@ class RadioGUI:
                     self.ft8_log.insert(tk.END, line)
                     self.ft8_log.see(tk.END)
                     self.ft8_log.config(state=tk.DISABLED)
+
+                elif kind == "tx_state":
+                    _, state, message = item
+                    self._apply_tx_state_update(state, message)
 
         except queue.Empty:
             pass
