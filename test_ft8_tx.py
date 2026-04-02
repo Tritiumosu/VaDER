@@ -707,7 +707,7 @@ class TestFt8TxCoordinatorSlotIntegration(unittest.TestCase):
 # § 13  WASAPI fallback helper and _play_audio Windows fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from ft8_tx import _find_wasapi_output_device
+from ft8_tx import _find_wasapi_output_device, _is_wdm_ks_device
 
 
 class TestFindWasapiOutputDevice(unittest.TestCase):
@@ -912,6 +912,281 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
                 coord._play_audio(audio, device=0)
 
         self.assertEqual(fake_sd.play.call_count, 2, "Both original and fallback attempts made")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 14  _is_wdm_ks_device() helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestIsWdmKsDevice(unittest.TestCase):
+    """Unit tests for _is_wdm_ks_device()."""
+
+    def _make_sd(self, device_hostapi: int, api_name: str):
+        """Return a minimal sounddevice stub for a given host API name."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"hostapi": device_hostapi, "name": "Test Device"}
+        sd.query_hostapis.return_value = {"name": api_name}
+        return sd
+
+    def test_returns_true_for_wdm_ks_device(self):
+        """A device under 'Windows WDM-KS' host API is detected as WDM-KS."""
+        sd = self._make_sd(device_hostapi=2, api_name="Windows WDM-KS")
+        self.assertTrue(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_true_for_wdm_ks_lowercase(self):
+        """Case-insensitive match: 'windows wdm-ks' is still WDM-KS."""
+        sd = self._make_sd(device_hostapi=0, api_name="windows wdm-ks")
+        self.assertTrue(_is_wdm_ks_device(sd, 1))
+
+    def test_returns_false_for_wasapi_device(self):
+        """A device under WASAPI is NOT a WDM-KS device."""
+        sd = self._make_sd(device_hostapi=1, api_name="Windows WASAPI")
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_false_for_mme_device(self):
+        """A device under MME is NOT a WDM-KS device."""
+        sd = self._make_sd(device_hostapi=0, api_name="MME")
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_false_for_directsound_device(self):
+        """A device under DirectSound is NOT a WDM-KS device."""
+        sd = self._make_sd(device_hostapi=0, api_name="Windows DirectSound")
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_false_when_device_index_is_none(self):
+        """device_index=None returns False without calling sounddevice APIs."""
+        sd = mock.MagicMock()
+        self.assertFalse(_is_wdm_ks_device(sd, None))
+        sd.query_devices.assert_not_called()
+
+    def test_returns_false_when_device_index_is_negative(self):
+        """device_index < 0 returns False without calling sounddevice APIs."""
+        sd = mock.MagicMock()
+        self.assertFalse(_is_wdm_ks_device(sd, -1))
+        sd.query_devices.assert_not_called()
+
+    def test_returns_false_when_no_hostapi_key(self):
+        """If device info lacks 'hostapi' key, returns False gracefully."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"name": "Some Device"}
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_false_when_query_devices_raises(self):
+        """If query_devices raises, returns False without propagating."""
+        sd = mock.MagicMock()
+        sd.query_devices.side_effect = RuntimeError("no device")
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+    def test_returns_false_when_query_hostapis_raises(self):
+        """If query_hostapis raises, returns False without propagating."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"hostapi": 0, "name": "Dev"}
+        sd.query_hostapis.side_effect = KeyError("unknown api")
+        self.assertFalse(_is_wdm_ks_device(sd, 0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 15  Proactive WDM-KS → WASAPI swap in _play_audio
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
+    """
+    Verify that _play_audio proactively replaces a WDM-KS device with its
+    WASAPI equivalent on Windows before any stream is opened, so that
+    KSPROPERTY_AUDIO_SAMPLING_FREQ / WDM-KS PortAudio errors are avoided
+    entirely rather than discovered on the first failed sd.play() call.
+    """
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def test_proactive_swap_uses_wasapi_device_on_first_play(self):
+        """
+        When the configured device is WDM-KS on Windows, sd.play should be
+        called with the WASAPI device index on the *first* attempt — no
+        WDM-KS attempt is made at all.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Audio Device",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        # _is_wdm_ks_device will detect WDM-KS; _find_wasapi_output_device
+        # is patched to return 5 (the WASAPI equivalent device index).
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(play_calls), 1,
+                         "sd.play should be called exactly once (no WDM-KS attempt)")
+        self.assertEqual(play_calls[0], 5,
+                         "The WASAPI device (5) should be used on the first call")
+
+    def test_proactive_swap_skipped_for_non_wdm_ks_device(self):
+        """
+        When the configured device is NOT WDM-KS, no proactive swap occurs
+        and sd.play is called with the original device index.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Speaker",
+            "hostapi": 1,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WASAPI"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=2)
+
+        self.assertEqual(len(play_calls), 1)
+        self.assertEqual(play_calls[0], 2,
+                         "Original (non-WDM-KS) device should be used unchanged")
+
+    def test_proactive_swap_skipped_on_non_windows(self):
+        """
+        On non-Windows platforms, no proactive WDM-KS swap should occur
+        even if the device would be WDM-KS on Windows.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "Device",
+        }
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        wasapi_called = []
+
+        with mock.patch("ft8_tx.platform.system", return_value="Linux"), \
+             mock.patch("ft8_tx._is_wdm_ks_device",
+                        side_effect=lambda *a, **kw: wasapi_called.append(1) or True), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=3)
+
+        self.assertEqual(len(wasapi_called), 0,
+                         "_is_wdm_ks_device must not be called on non-Windows")
+        self.assertEqual(play_calls[0], 3)
+
+    def test_proactive_swap_falls_back_to_original_when_no_wasapi_found(self):
+        """
+        If _find_wasapi_output_device returns None during the proactive check,
+        the original device is used unchanged (no swap, no crash).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Dev",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        # No WASAPI equivalent found
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=4)
+
+        self.assertEqual(len(play_calls), 1)
+        self.assertEqual(play_calls[0], 4,
+                         "Original device used when no WASAPI equivalent found")
+
+    def test_proactive_swap_no_double_retry_if_wasapi_fails(self):
+        """
+        If the proactively-selected WASAPI device raises PortAudioError, the
+        reactive fallback must NOT retry with the same WASAPI device again
+        (it would be a pointless duplicate attempt).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Dev",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+        # All play attempts fail
+        fake_sd.play.side_effect = RuntimeError("stream error")
+        fake_sd.wait = mock.MagicMock()
+
+        # Both proactive and reactive helpers return the same WASAPI device (5)
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        # Only one play attempt — the proactive WASAPI attempt; no duplicate retry
+        self.assertEqual(fake_sd.play.call_count, 1,
+                         "Must not retry with the same WASAPI device twice")
 
 
 if __name__ == "__main__":

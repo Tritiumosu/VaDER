@@ -181,6 +181,71 @@ def _find_wasapi_output_device(sd, device_index: Optional[int]) -> Optional[int]
         return None
 
 
+def _is_wdm_ks_device(sd, device_index: Optional[int]) -> bool:
+    """
+    Return True if the device at *device_index* is exposed through the
+    WDM-KS (Windows Driver Model – Kernel Streaming) host API.
+
+    WDM-KS requires kernel-level exclusive access and frequently fails with
+    ``KSPROPERTY_AUDIO_SAMPLING_FREQ`` (prop_id=10) / ``ERROR_NOT_FOUND``
+    (GLE=0x490) errors on USB audio interfaces.  Use this helper to detect
+    WDM-KS devices proactively so that a more compatible host API (WASAPI)
+    can be selected before the stream is opened.
+
+    Returns False whenever the check cannot be performed (``device_index``
+    is None or negative, the device info is unavailable, or any unexpected
+    error occurs).
+    """
+    try:
+        if device_index is None or device_index < 0:
+            return False
+        device_info = sd.query_devices(device_index)
+        host_api_idx = device_info.get("hostapi")
+        if host_api_idx is None:
+            return False
+        host_api_info = sd.query_hostapis(host_api_idx)
+        api_name = host_api_info.get("name", "").lower()
+        # PortAudio reports this host API as "Windows WDM-KS"; match the
+        # canonical hyphenated form to avoid false positives.
+        return "wdm-ks" in api_name
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+        logger.debug("_is_wdm_ks_device: lookup failed (%s)", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_is_wdm_ks_device: unexpected error (%s)", exc)
+        return False
+
+
+def _resample_audio(
+    audio: "np.ndarray",
+    from_fs: int,
+    to_fs: int,
+) -> "tuple[np.ndarray, int]":
+    """
+    Resample *audio* from *from_fs* to *to_fs* Hz using polyphase filtering.
+
+    Returns ``(resampled_audio, to_fs)`` on success, or ``(audio, from_fs)``
+    if ``scipy`` is unavailable or resampling fails.
+    """
+    if from_fs == to_fs:
+        return audio, from_fs
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(to_fs, from_fs)
+        resampled = resample_poly(
+            audio, to_fs // g, from_fs // g
+        ).astype(np.float32)
+        return resampled, to_fs
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_resample_audio: resample %d → %d Hz failed (%s) — "
+            "using original rate",
+            from_fs, to_fs, exc,
+        )
+        return audio, from_fs
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 1  TX State
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -553,7 +618,28 @@ class Ft8TxCoordinator:
             )
             return
 
-        dev_kwarg: dict = {} if (device is None or device < 0) else {"device": device}
+        # ── On Windows, proactively swap WDM-KS device for WASAPI ───────────
+        # WDM-KS requires kernel-level exclusive access and frequently fails
+        # with KSPROPERTY_AUDIO_SAMPLING_FREQ (prop_id=10) / ERROR_NOT_FOUND
+        # (GLE=0x490) errors on USB audio interfaces.  If the configured
+        # device is a WDM-KS device, replace it with the WASAPI equivalent
+        # before attempting to open any stream — this eliminates the error
+        # entirely rather than waiting for the stream to fail and retrying.
+        effective_device = device
+        if platform.system() == "Windows" and _is_wdm_ks_device(sd, device):
+            wasapi_candidate = _find_wasapi_output_device(sd, device)
+            if wasapi_candidate is not None:
+                logger.info(
+                    "_play_audio: device %d is WDM-KS — proactively using "
+                    "WASAPI device %d instead",
+                    device, wasapi_candidate,
+                )
+                effective_device = wasapi_candidate
+
+        dev_kwarg: dict = (
+            {} if (effective_device is None or effective_device < 0)
+            else {"device": effective_device}
+        )
 
         # ── Determine the device's native sample rate ─────────────────────
         # FT8_FS (12 000 Hz) is not supported by many soundcard drivers.
@@ -561,8 +647,8 @@ class Ft8TxCoordinator:
         native_fs = FT8_FS
         try:
             dev_idx = (
-                device
-                if (device is not None and device >= 0)
+                effective_device
+                if (effective_device is not None and effective_device >= 0)
                 else sd.default.device[1]
             )
             dev_info = sd.query_devices(dev_idx)
@@ -572,51 +658,52 @@ class Ft8TxCoordinator:
         except Exception as exc:
             logger.debug(
                 "_play_audio: could not query device %s (%s); using FT8_FS",
-                device, exc,
+                effective_device, exc,
             )
 
-        play_audio = audio
-        play_fs = FT8_FS
-        if native_fs != FT8_FS:
-            try:
-                from math import gcd
-                from scipy.signal import resample_poly
-                g = gcd(native_fs, FT8_FS)
-                play_audio = resample_poly(
-                    audio, native_fs // g, FT8_FS // g
-                ).astype(np.float32)
-                play_fs = native_fs
-                logger.debug(
-                    "_play_audio: resampled %d → %d Hz for device %s",
-                    FT8_FS, native_fs, device,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "_play_audio: resample failed (%s) — attempting %d Hz directly",
-                    exc, FT8_FS,
-                )
-                # Fall back to original audio at FT8_FS; device may still fail
+        play_audio, play_fs = _resample_audio(audio, FT8_FS, native_fs)
+        if play_fs != FT8_FS:
+            logger.debug(
+                "_play_audio: resampled %d → %d Hz for device %s",
+                FT8_FS, play_fs, effective_device,
+            )
 
         try:
             sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
-            # On Windows, the selected device may be opened via the WDM-KS
-            # host API, which can fail with paUnanticipatedHostError (-9999)
-            # when the driver rejects the stream configuration.  Try to find
-            # the same physical device exposed through the WASAPI host API and
-            # retry once before giving up.
+            # Reactive WASAPI fallback: if a PortAudioError still occurs
+            # (e.g. the proactive WDM-KS swap was not triggered, or the
+            # WASAPI device itself has a stream-open problem), find the
+            # WASAPI counterpart for the *original* device and retry once.
+            # Skip the retry if we already swapped to WASAPI proactively
+            # (effective_device != device) to avoid playing to the same
+            # device twice.
             if platform.system() == "Windows":
                 wasapi_dev = _find_wasapi_output_device(sd, device)
-                if wasapi_dev is not None:
+                if wasapi_dev is not None and wasapi_dev != effective_device:
                     logger.info(
-                        "_play_audio: WDM-KS failed — retrying with WASAPI "
-                        "device index %d",
-                        wasapi_dev,
+                        "_play_audio: PortAudioError on device %s — retrying "
+                        "with WASAPI device %d",
+                        effective_device, wasapi_dev,
+                    )
+                    # Re-query the native rate for the WASAPI device; it may
+                    # differ from the original device's rate, so re-resample
+                    # from the raw FT8_FS audio rather than from play_audio.
+                    wasapi_native_fs = FT8_FS
+                    try:
+                        wasapi_info = sd.query_devices(wasapi_dev)
+                        raw = wasapi_info.get("default_samplerate")
+                        if raw:
+                            wasapi_native_fs = int(raw)
+                    except Exception:
+                        pass
+                    wasapi_audio, wasapi_fs = _resample_audio(
+                        audio, FT8_FS, wasapi_native_fs
                     )
                     try:
-                        sd.play(play_audio, samplerate=play_fs, device=wasapi_dev)
+                        sd.play(wasapi_audio, samplerate=wasapi_fs, device=wasapi_dev)
                         sd.wait()
                         return
                     except sd.PortAudioError as exc2:
