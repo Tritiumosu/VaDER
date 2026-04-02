@@ -895,8 +895,9 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
 
     def test_wasapi_fallback_raises_if_fallback_also_fails(self):
         """
-        On Windows, if WASAPI retry also raises PortAudioError, a RuntimeError
-        is raised (not a bare PortAudioError propagation).
+        On Windows, when all three attempts fail (original, WASAPI exclusive,
+        and WASAPI shared-mode), a RuntimeError is raised rather than a bare
+        PortAudioError propagation.
         """
         import numpy as np
 
@@ -916,7 +917,9 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 coord._play_audio(audio, device=0)
 
-        self.assertEqual(fake_sd.play.call_count, 2, "Both original and fallback attempts made")
+        # 3 attempts: original + WASAPI exclusive + WASAPI shared mode
+        self.assertEqual(fake_sd.play.call_count, 3,
+                         "Expected original + WASAPI exclusive + WASAPI shared attempts")
 
     def test_retry_after_delay_succeeds_when_no_wasapi_device(self):
         """
@@ -1661,6 +1664,236 @@ class TestPlayAudioMmeFallback(unittest.TestCase):
         self.assertEqual(len(mme_called), 0,
                          "_find_mme_output_device must not be called when WASAPI is available")
         self.assertEqual(play_calls[0], 5, "WASAPI device used (not MME)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 20  WASAPI shared-mode fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWasapiSharedModeFallback(unittest.TestCase):
+    """
+    Verify that _play_audio tries WASAPI shared mode (WasapiSettings(exclusive=False))
+    when WASAPI exclusive mode fails, before giving up.
+    """
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def test_wasapi_shared_mode_succeeds_after_exclusive_fails(self):
+        """
+        When WASAPI exclusive mode raises PortAudioError, _play_audio should
+        retry with WasapiSettings(exclusive=False) and succeed.
+        Sequence: original → WASAPI exclusive (fails) → WASAPI shared (succeeds).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.wait = mock.MagicMock()
+
+        # Calls 1 and 2 raise; call 3 (WASAPI shared mode) succeeds.
+        fake_sd.play.side_effect = [
+            RuntimeError("stream error"),   # original attempt
+            RuntimeError("stream error"),   # WASAPI exclusive
+            None,                           # WASAPI shared mode — succeeds
+        ]
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=7), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        # original (fails) + WASAPI exclusive (fails) + WASAPI shared (succeeds) = 3
+        self.assertEqual(fake_sd.play.call_count, 3)
+        # The third call must include extra_settings for shared mode
+        third_call_kwargs = fake_sd.play.call_args_list[2][1]
+        self.assertIn("extra_settings", third_call_kwargs,
+                      "Third call must pass extra_settings for WASAPI shared mode")
+
+    def test_wasapi_shared_mode_raises_if_all_fail(self):
+        """
+        When WASAPI exclusive AND shared mode both fail, RuntimeError is raised.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("stream error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=7), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        # original + WASAPI exclusive + WASAPI shared = 3 total
+        self.assertEqual(fake_sd.play.call_count, 3)
+
+    def test_wasapi_shared_mode_skipped_when_wasapi_settings_unavailable(self):
+        """
+        If sounddevice lacks WasapiSettings (older version), the shared-mode
+        step is skipped and RuntimeError is raised after the exclusive attempt.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock(spec=["PortAudioError", "play", "wait",
+                                        "query_devices", "default", "query_hostapis"])
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("stream error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=7), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        # Only 2 attempts: original + WASAPI exclusive (no shared-mode step)
+        self.assertEqual(fake_sd.play.call_count, 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 21  Bidirectional WASAPI name matching
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFindWasapiOutputDeviceBidirectional(unittest.TestCase):
+    """
+    Verify that _find_wasapi_output_device matches device names bidirectionally:
+    the WASAPI name can be a substring of the WDM-KS name, or vice versa.
+    """
+
+    def _make_sd(self, host_apis, devices):
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else host_apis
+        )
+        sd.query_devices.side_effect = lambda idx=None: (
+            devices[idx] if idx is not None else devices
+        )
+        sd.default.device = (0, 1)
+        return sd
+
+    def test_wasapi_name_shorter_than_wdm_ks_name(self):
+        """
+        WASAPI device name is a prefix of the WDM-KS device name.
+        e.g. WDM-KS: "USB Audio Device" → WASAPI: "USB Audio"
+        The bidirectional check must catch this case.
+        """
+        from ft8_tx import _find_wasapi_output_device
+
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": -1},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio Device", "hostapi": 0, "max_output_channels": 2},
+            {"index": 1, "name": "USB Audio",         "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 1,
+                         "Should match 'USB Audio' (WASAPI) against 'USB Audio Device' (WDM-KS)")
+
+    def test_wdm_ks_name_shorter_than_wasapi_name(self):
+        """
+        WDM-KS device name is a prefix of the WASAPI device name.
+        e.g. WDM-KS: "USB Audio" → WASAPI: "USB Audio Device (WASAPI)"
+        The original one-directional check already handles this; confirm it still works.
+        """
+        from ft8_tx import _find_wasapi_output_device
+
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI",  "default_output_device": -1},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio",                  "hostapi": 0, "max_output_channels": 2},
+            {"index": 1, "name": "USB Audio Device (WASAPI)",  "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 22  Audio pre-generation during ARMED phase
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAudioPregeneration(unittest.TestCase):
+    """
+    Verify that FT8 audio is pre-generated during the ARMED phase
+    (before the slot-wait loop) so that encoding errors surface early
+    and encoding latency is eliminated from the critical TX window.
+    """
+
+    def test_audio_pregenerated_before_ptt_on(self):
+        """
+        ft8_encode_message must be called before ptt_on() so that an encoding
+        failure puts the coordinator into ERROR without keying PTT.
+        """
+        import ft8_tx as _ft8_tx
+
+        radio = _make_radio()
+        timer = _make_timer(seconds_to_next=0.05 + PRE_KEY_S)
+        coord = Ft8TxCoordinator(radio=radio, slot_timer=timer)
+
+        original_encode = _ft8_tx.ft8_encode_message
+        coord._play_audio = mock.MagicMock()
+
+        encode_call_count = [0]
+
+        with mock.patch.object(
+            _ft8_tx, "ft8_encode_message",
+            side_effect=lambda *a, **kw: (
+                encode_call_count.__setitem__(0, encode_call_count[0] + 1)
+                or original_encode(*a, **kw)
+            ),
+        ):
+            final = _arm_and_wait(coord, msg="CQ W4ABC EN52")
+
+        self.assertEqual(final, TxState.COMPLETE)
+        # Encoding should have been called exactly once
+        self.assertEqual(encode_call_count[0], 1)
+
+    def test_encoding_error_before_slot_transitions_to_error_without_ptt(self):
+        """
+        If ft8_encode_message raises during the ARMED phase (before the slot
+        boundary), the coordinator must transition to ERROR without keying PTT.
+        """
+        import ft8_tx as _ft8_tx
+
+        radio = _make_radio()
+        timer = _make_timer(seconds_to_next=0.05 + PRE_KEY_S)
+        coord = Ft8TxCoordinator(radio=radio, slot_timer=timer)
+        coord._play_audio = mock.MagicMock()
+
+        ptt_keyed = []
+        coord._ptt_on = mock.MagicMock(side_effect=lambda: ptt_keyed.append(True))
+
+        with mock.patch.object(_ft8_tx, "ft8_encode_message",
+                                side_effect=RuntimeError("encoding failed")):
+            final = _arm_and_wait(coord, msg="CQ W4ABC EN52")
+
+        self.assertEqual(final, TxState.ERROR,
+                         "Encoding failure must put coordinator into ERROR")
+        self.assertEqual(len(ptt_keyed), 0,
+                         "PTT must NOT be keyed when encoding fails")
 
 
 if __name__ == "__main__":

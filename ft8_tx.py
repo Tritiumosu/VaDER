@@ -161,10 +161,17 @@ def _find_wasapi_output_device(sd, device_index: Optional[int]) -> Optional[int]
             # name in parentheses (e.g. "USB Audio Device (WDM-KS)").
             # Strip the parenthesised suffix so we can match just the base
             # device name ("USB Audio Device") against the WASAPI entry.
+            # The check is bidirectional: the stripped WDM-KS name may be
+            # longer than the WASAPI name (e.g. "USB Audio Device" vs
+            # "USB Audio"), so we match if either is contained in the other.
             target_stripped = target_name.split("(")[0].strip().lower()
             if target_stripped:
                 for d in wasapi_out_devices:
-                    if target_stripped in d.get("name", "").lower():
+                    candidate_name = d.get("name", "").lower()
+                    candidate_stripped = candidate_name.split("(")[0].strip()
+                    if target_stripped in candidate_name or (
+                        candidate_stripped and candidate_stripped in target_stripped
+                    ):
                         return d["index"]
 
         # Fall back to the default WASAPI output device
@@ -579,6 +586,23 @@ class Ft8TxCoordinator:
 
         ptt_keyed = False
         try:
+            # ── Pre-phase: Pre-generate audio during ARMED period ─────────
+            # Generate the FT8 audio waveform immediately — the message is
+            # already fixed at arm() time so there is no reason to defer
+            # encoding to TX_PREP.  Doing it here:
+            #   • surfaces encoding errors before PTT is keyed,
+            #   • eliminates encoding latency from the critical TX window.
+            audio = ft8_encode_message(
+                job.message,
+                f0_hz=job.f0_hz,
+                fs=FT8_FS,
+                amplitude=job.amplitude,
+            )
+            logger.debug(
+                "_worker_main: audio pre-generated (%d samples) during ARMED phase",
+                len(audio),
+            )
+
             # ── Phase 1: Wait for slot boundary - PRE_KEY_S ──────────────
             wait = self._timer.seconds_to_next_slot() - self._pre_key_s
             if wait > 0:
@@ -621,13 +645,8 @@ class Ft8TxCoordinator:
             # ── Phase 3: TX_PREP ─────────────────────────────────────────
             self._transition(TxState.TX_PREP, "Preparing TX…")
 
-            # Generate audio
-            audio = ft8_encode_message(
-                job.message,
-                f0_hz=job.f0_hz,
-                fs=FT8_FS,
-                amplitude=job.amplitude,
-            )
+            # Audio was already generated during the ARMED phase (see
+            # pre-phase above), so TX_PREP is now just a state-change marker.
 
             # ── Phase 4: Key PTT ─────────────────────────────────────────
             self._transition(TxState.TX_ACTIVE, f"TX active: {job.message!r}")
@@ -837,6 +856,38 @@ class Ft8TxCoordinator:
                         logger.error(
                             "_play_audio: WASAPI fallback also failed: %s", exc2
                         )
+                        # WASAPI exclusive mode failed — retry in shared mode.
+                        # Some devices reject exclusive streams (e.g. when
+                        # another application holds exclusive access), but
+                        # accept shared-mode WASAPI where audio is routed
+                        # through the Windows Audio Session API (WASAPI) mixer.
+                        # WasapiSettings was added in sounddevice 0.4.0; skip
+                        # the shared-mode step on older versions that lack it.
+                        if hasattr(sd, "WasapiSettings"):
+                            logger.info(
+                                "_play_audio: retrying WASAPI device %d in "
+                                "shared mode",
+                                wasapi_dev,
+                            )
+                            try:
+                                ws = sd.WasapiSettings(exclusive=False)
+                                sd.play(
+                                    wasapi_audio,
+                                    samplerate=wasapi_fs,
+                                    device=wasapi_dev,
+                                    extra_settings=ws,
+                                )
+                                sd.wait()
+                                return
+                            except sd.PortAudioError as exc_shared:
+                                logger.error(
+                                    "_play_audio: WASAPI shared mode also "
+                                    "failed: %s",
+                                    exc_shared,
+                                )
+                                raise RuntimeError(
+                                    f"Audio output failed: {exc_shared}"
+                                ) from exc_shared
                         raise RuntimeError(f"Audio output failed: {exc2}") from exc2
                 # No different WASAPI device available — try MME as a last-resort
                 # alternative output device. Some USB audio codecs for ham radio
