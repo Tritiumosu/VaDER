@@ -37,6 +37,7 @@ from ft8_tx import (
     PRE_KEY_S,
     POST_KEY_S,
     MISSED_SLOT_THRESHOLD_S,
+    USB_AUDIO_SWITCH_DELAY_S,
 )
 from ft8_ntp import Ft8SlotTimer, NtpTimeSync
 
@@ -865,8 +866,9 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
 
     def test_wasapi_fallback_raises_if_no_wasapi_device_found(self):
         """
-        On Windows, if no WASAPI device is found, the original PortAudioError
-        is re-raised as RuntimeError without a retry.
+        On Windows, if no WASAPI device is found the code performs a single
+        retry after a 200 ms pause before giving up.  When the retry also
+        fails, a RuntimeError is raised.
         """
         import numpy as np
 
@@ -882,11 +884,14 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
 
         with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
              mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep"), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             with self.assertRaises(RuntimeError):
                 coord._play_audio(audio, device=0)
 
-        self.assertEqual(fake_sd.play.call_count, 1, "No retry when WASAPI device not found")
+        # Two play attempts: initial try + one retry after the 200 ms pause
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "One retry expected after transient failure when no WASAPI found")
 
     def test_wasapi_fallback_raises_if_fallback_also_fails(self):
         """
@@ -912,6 +917,47 @@ class TestPlayAudioWasapiFallback(unittest.TestCase):
                 coord._play_audio(audio, device=0)
 
         self.assertEqual(fake_sd.play.call_count, 2, "Both original and fallback attempts made")
+
+    def test_retry_after_delay_succeeds_when_no_wasapi_device(self):
+        """
+        On Windows, when no WASAPI device is found and the first sd.play call
+        raises PortAudioError, the code waits 200 ms and retries.  If the
+        retry succeeds, _play_audio returns without raising.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.wait = mock.MagicMock()
+
+        call_count = [0]
+
+        def _play_side_effect(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("WDM-KS transient error")
+            # Second attempt succeeds (no raise)
+
+        fake_sd.play.side_effect = _play_side_effect
+
+        sleep_calls = []
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            # Should NOT raise — second attempt succeeds
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 2, "Retry should be attempted")
+        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                        "A ≥200 ms sleep must precede the retry")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1153,11 +1199,13 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         self.assertEqual(play_calls[0], 4,
                          "Original device used when no WASAPI equivalent found")
 
-    def test_proactive_swap_no_double_retry_if_wasapi_fails(self):
+    def test_proactive_swap_retry_after_delay_if_wasapi_fails(self):
         """
         If the proactively-selected WASAPI device raises PortAudioError, the
-        reactive fallback must NOT retry with the same WASAPI device again
-        (it would be a pointless duplicate attempt).
+        code must NOT immediately retry with the same device (pointless), but
+        instead wait 200 ms and retry once, since the USB audio codec may need
+        time to switch to TX mode after PTT is keyed.  When both attempts fail
+        the error is raised as RuntimeError.
         """
         import numpy as np
 
@@ -1177,16 +1225,70 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         fake_sd.play.side_effect = RuntimeError("stream error")
         fake_sd.wait = mock.MagicMock()
 
+        sleep_calls = []
+
         # Both proactive and reactive helpers return the same WASAPI device (5)
         with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
              mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             with self.assertRaises(RuntimeError):
                 coord._play_audio(audio, device=0)
 
-        # Only one play attempt — the proactive WASAPI attempt; no duplicate retry
-        self.assertEqual(fake_sd.play.call_count, 1,
-                         "Must not retry with the same WASAPI device twice")
+        # Proactive WASAPI attempt + one delayed retry = 2 total
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "Expected proactive attempt + one retry after pause")
+        # A 200 ms sleep must have been inserted between the two attempts
+        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                        "A ≥200 ms sleep must occur before the retry")
+
+    def test_proactive_swap_retry_succeeds_after_transient_error(self):
+        """
+        If the proactively-selected WASAPI device fails on the first attempt
+        (transient error) but succeeds on the retry after a 200 ms pause,
+        _play_audio must return without raising.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Dev",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.wait = mock.MagicMock()
+
+        call_count = [0]
+
+        def _play_side_effect(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("stream error")
+            # Second attempt succeeds
+
+        fake_sd.play.side_effect = _play_side_effect
+        sleep_calls = []
+
+        # Both proactive and reactive helpers return the same WASAPI device (5)
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            # Must not raise — retry succeeds
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "Proactive attempt + successful retry = 2 calls")
+        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                        "A ≥200 ms sleep must occur before the retry")
 
     def test_proactive_swap_default_output_wdm_ks(self):
         """

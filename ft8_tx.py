@@ -91,6 +91,12 @@ MISSED_SLOT_THRESHOLD_S: float = 0.5
 #: while still catching any overrun well before the next slot starts.
 SLOT_OVERRUN_DETECTION_BUFFER_S: float = 1.0
 
+#: Pause inserted before retrying audio playback after a transient
+#: PortAudioError on Windows.  USB audio codecs used in ham radio
+#: transceivers need time to switch from RX to TX mode after PTT is keyed;
+#: 200 ms is sufficient for this settling period.
+USB_AUDIO_SWITCH_DELAY_S: float = 0.20
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 0  Module-level audio helpers
@@ -725,6 +731,24 @@ class Ft8TxCoordinator:
                             "_play_audio: WASAPI fallback also failed: %s", exc2
                         )
                         raise RuntimeError(f"Audio output failed: {exc2}") from exc2
+                # No different WASAPI device is available (either none found or the
+                # proactive WDM-KS→WASAPI swap was already applied and also failed).
+                # USB audio codecs in ham radio transceivers often need a short
+                # settling time to switch from RX to TX mode after PTT is keyed.
+                # A single retry after a brief pause recovers from this transient
+                # condition without requiring a different audio device.
+                logger.info(
+                    "_play_audio: retrying after 200 ms pause for device %s "
+                    "(transient stream-start error)",
+                    effective_device,
+                )
+                time.sleep(USB_AUDIO_SWITCH_DELAY_S)
+                try:
+                    sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
+                    sd.wait()
+                    return
+                except sd.PortAudioError as exc_retry:
+                    raise RuntimeError(f"Audio output failed: {exc_retry}") from exc_retry
             raise RuntimeError(f"Audio output failed: {exc}") from exc
 
     # ── State management ───────────────────────────────────────────────────
