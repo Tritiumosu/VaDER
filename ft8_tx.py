@@ -445,6 +445,15 @@ class Ft8TxCoordinator:
 
         If sounddevice is unavailable, logs a warning and returns immediately
         (this allows unit tests to run without a soundcard).
+
+        Many audio devices (particularly USB audio interfaces used with
+        amateur radio transceivers) do not support 12 000 Hz (FT8_FS) as a
+        native output sample rate, causing ``paInvalidSampleRate``
+        (PAErrorCode -9997) when that rate is requested directly.  This
+        method queries the device's default sample rate via
+        ``sounddevice.query_devices()`` and, if it differs from FT8_FS,
+        resamples the audio with ``scipy.signal.resample_poly`` before
+        opening the output stream.
         """
         try:
             import sounddevice as sd  # local import — optional dependency
@@ -456,8 +465,50 @@ class Ft8TxCoordinator:
 
         dev_kwarg: dict = {} if (device is None or device < 0) else {"device": device}
 
+        # ── Determine the device's native sample rate ─────────────────────
+        # FT8_FS (12 000 Hz) is not supported by many soundcard drivers.
+        # Query the device info and resample if the native rate differs.
+        native_fs = FT8_FS
         try:
-            sd.play(audio, samplerate=FT8_FS, **dev_kwarg)
+            dev_idx = (
+                device
+                if (device is not None and device >= 0)
+                else sd.default.device[1]
+            )
+            dev_info = sd.query_devices(dev_idx)
+            raw_fs = dev_info.get("default_samplerate")
+            if raw_fs:
+                native_fs = int(raw_fs)
+        except Exception as exc:
+            logger.debug(
+                "_play_audio: could not query device %s (%s); using FT8_FS",
+                device, exc,
+            )
+
+        play_audio = audio
+        play_fs = FT8_FS
+        if native_fs != FT8_FS:
+            try:
+                from math import gcd
+                from scipy.signal import resample_poly
+                g = gcd(native_fs, FT8_FS)
+                play_audio = resample_poly(
+                    audio, native_fs // g, FT8_FS // g
+                ).astype(np.float32)
+                play_fs = native_fs
+                logger.debug(
+                    "_play_audio: resampled %d → %d Hz for device %s",
+                    FT8_FS, native_fs, device,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_play_audio: resample failed (%s) — attempting %d Hz directly",
+                    exc, FT8_FS,
+                )
+                # Fall back to original audio at FT8_FS; device may still fail
+
+        try:
+            sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
