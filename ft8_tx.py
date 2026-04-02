@@ -97,6 +97,21 @@ SLOT_OVERRUN_DETECTION_BUFFER_S: float = 1.0
 #: 200 ms is sufficient for this settling period.
 USB_AUDIO_SWITCH_DELAY_S: float = 0.20
 
+# ---------------------------------------------------------------------------
+# TX audio format constants
+# ---------------------------------------------------------------------------
+
+#: Output sample rate sent to the soundcard for every TX transmission.
+#: 48 000 Hz is universally supported by USB audio codecs used in ham radio
+#: transceivers and avoids the ``paInvalidSampleRate`` (PaErrorCode -9997)
+#: error that occurs when 12 000 Hz (FT8_FS) is requested directly.
+TX_OUTPUT_SAMPLE_RATE: int = 48_000
+
+#: Bit depth (dtype) sent to the soundcard.  16-bit PCM is the lowest common
+#: denominator for USB audio class devices and avoids driver-level format
+#: conversion that can introduce latency or fail outright on some hardware.
+TX_OUTPUT_DTYPE: str = "int16"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 0  Module-level audio helpers
@@ -355,6 +370,18 @@ def _resample_audio(
             from_fs, to_fs, exc,
         )
         return audio, from_fs
+
+
+def _to_int16(audio: "np.ndarray") -> "np.ndarray":
+    """
+    Convert a float32 audio array (values in [-1.0, 1.0]) to int16 PCM.
+
+    Clips the signal before conversion to prevent wrap-around distortion on
+    samples that exceed the normalised range.  The result dtype is
+    ``numpy.int16``.
+    """
+    clipped = np.clip(audio, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -724,14 +751,12 @@ class Ft8TxCoordinator:
         If sounddevice is unavailable, logs a warning and returns immediately
         (this allows unit tests to run without a soundcard).
 
-        Many audio devices (particularly USB audio interfaces used with
-        amateur radio transceivers) do not support 12 000 Hz (FT8_FS) as a
-        native output sample rate, causing ``paInvalidSampleRate``
-        (PAErrorCode -9997) when that rate is requested directly.  This
-        method queries the device's default sample rate via
-        ``sounddevice.query_devices()`` and, if it differs from FT8_FS,
-        resamples the audio with ``scipy.signal.resample_poly`` before
-        opening the output stream.
+        The audio is always resampled to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
+        converted to TX_OUTPUT_DTYPE (int16, 16-bit PCM) before opening the
+        stream.  This fixed format is universally supported by USB audio codecs
+        used in ham radio transceivers and avoids ``paInvalidSampleRate``
+        (PaErrorCode -9997) errors that occur when the FT8 native rate
+        (12 000 Hz) or float32 data are passed directly.
         """
         try:
             import sounddevice as sd  # local import — optional dependency
@@ -787,35 +812,21 @@ class Ft8TxCoordinator:
             else {"device": effective_device}
         )
 
-        # ── Determine the device's native sample rate ─────────────────────
-        # FT8_FS (12 000 Hz) is not supported by many soundcard drivers.
-        # Query the device info and resample if the native rate differs.
-        native_fs = FT8_FS
-        try:
-            dev_idx = (
-                effective_device
-                if (effective_device is not None and effective_device >= 0)
-                else sd.default.device[1]
-            )
-            dev_info = sd.query_devices(dev_idx)
-            raw_fs = dev_info.get("default_samplerate")
-            if raw_fs:
-                native_fs = int(raw_fs)
-        except Exception as exc:
-            logger.debug(
-                "_play_audio: could not query device %s (%s); using FT8_FS",
-                effective_device, exc,
-            )
-
-        play_audio, play_fs = _resample_audio(audio, FT8_FS, native_fs)
-        if play_fs != FT8_FS:
-            logger.debug(
-                "_play_audio: resampled %d → %d Hz for device %s",
-                FT8_FS, play_fs, effective_device,
-            )
+        # ── Prepare fixed-format audio buffer ─────────────────────────────
+        # Always resample to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and convert to
+        # TX_OUTPUT_DTYPE (int16).  This fixed format is universally supported
+        # by USB audio codecs and avoids driver-level format-negotiation errors
+        # (paInvalidSampleRate / paUnanticipatedHostError) that occur when the
+        # FT8 native rate (12 000 Hz) or float32 data are passed directly.
+        play_audio_f32, play_fs = _resample_audio(audio, FT8_FS, TX_OUTPUT_SAMPLE_RATE)
+        play_audio = _to_int16(play_audio_f32)
+        logger.debug(
+            "_play_audio: prepared %d samples at %d Hz, dtype=%s for device %s",
+            len(play_audio), play_fs, TX_OUTPUT_DTYPE, effective_device,
+        )
 
         try:
-            sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
+            sd.play(play_audio, samplerate=play_fs, dtype=TX_OUTPUT_DTYPE, **dev_kwarg)
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
@@ -834,22 +845,15 @@ class Ft8TxCoordinator:
                         "with WASAPI device %d",
                         effective_device, wasapi_dev,
                     )
-                    # Re-query the native rate for the WASAPI device; it may
-                    # differ from the original device's rate, so re-resample
-                    # from the raw FT8_FS audio rather than from play_audio.
-                    wasapi_native_fs = FT8_FS
+                    # play_audio is already at TX_OUTPUT_SAMPLE_RATE / int16;
+                    # no re-resampling needed for the fallback device.
                     try:
-                        wasapi_info = sd.query_devices(wasapi_dev)
-                        raw = wasapi_info.get("default_samplerate")
-                        if raw:
-                            wasapi_native_fs = int(raw)
-                    except Exception:
-                        pass
-                    wasapi_audio, wasapi_fs = _resample_audio(
-                        audio, FT8_FS, wasapi_native_fs
-                    )
-                    try:
-                        sd.play(wasapi_audio, samplerate=wasapi_fs, device=wasapi_dev)
+                        sd.play(
+                            play_audio,
+                            samplerate=play_fs,
+                            dtype=TX_OUTPUT_DTYPE,
+                            device=wasapi_dev,
+                        )
                         sd.wait()
                         return
                     except sd.PortAudioError as exc2:
@@ -872,8 +876,9 @@ class Ft8TxCoordinator:
                             try:
                                 ws = sd.WasapiSettings(exclusive=False)
                                 sd.play(
-                                    wasapi_audio,
-                                    samplerate=wasapi_fs,
+                                    play_audio,
+                                    samplerate=play_fs,
+                                    dtype=TX_OUTPUT_DTYPE,
                                     device=wasapi_dev,
                                     extra_settings=ws,
                                 )
@@ -905,19 +910,14 @@ class Ft8TxCoordinator:
                         "with MME device %d",
                         effective_device, mme_dev,
                     )
-                    mme_native_fs = FT8_FS
+                    # play_audio is already at TX_OUTPUT_SAMPLE_RATE / int16.
                     try:
-                        mme_info = sd.query_devices(mme_dev)
-                        raw = mme_info.get("default_samplerate")
-                        if raw:
-                            mme_native_fs = int(raw)
-                    except Exception:
-                        pass
-                    mme_audio, mme_fs = _resample_audio(
-                        audio, FT8_FS, mme_native_fs
-                    )
-                    try:
-                        sd.play(mme_audio, samplerate=mme_fs, device=mme_dev)
+                        sd.play(
+                            play_audio,
+                            samplerate=play_fs,
+                            dtype=TX_OUTPUT_DTYPE,
+                            device=mme_dev,
+                        )
                         sd.wait()
                         return
                     except sd.PortAudioError as exc_mme:
@@ -939,7 +939,7 @@ class Ft8TxCoordinator:
                 )
                 time.sleep(USB_AUDIO_SWITCH_DELAY_S)
                 try:
-                    sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
+                    sd.play(play_audio, samplerate=play_fs, dtype=TX_OUTPUT_DTYPE, **dev_kwarg)
                     sd.wait()
                     return
                 except sd.PortAudioError as exc_retry:
