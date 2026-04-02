@@ -52,6 +52,7 @@ leaving PTT stuck.
 from __future__ import annotations
 
 import logging
+import platform
 import threading
 import time
 from enum import Enum, auto
@@ -89,6 +90,95 @@ MISSED_SLOT_THRESHOLD_S: float = 0.5
 #: condition.  Set to 1 s to give a comfortable margin above normal jitter
 #: while still catching any overrun well before the next slot starts.
 SLOT_OVERRUN_DETECTION_BUFFER_S: float = 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 0  Module-level audio helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_wasapi_output_device(sd, device_index: Optional[int]) -> Optional[int]:
+    """
+    On Windows, return the WASAPI output-device index that corresponds to
+    the physical device at *device_index*.
+
+    The same physical soundcard often appears under multiple host APIs
+    (WDM-KS, WASAPI, MME, …).  If the caller-supplied *device_index* points
+    to a WDM-KS device, opening a stream through it may trigger
+    ``paUnanticipatedHostError`` (PaErrorCode -9999) when the driver rejects
+    the requested stream configuration.  This helper locates the equivalent
+    WASAPI device so the caller can retry.
+
+    Returns the WASAPI device index on success, or ``None`` if no WASAPI
+    host API or no matching device is found.
+    """
+    try:
+        # Locate the WASAPI host API
+        wasapi_api_idx: Optional[int] = None
+        for api in sd.query_hostapis():
+            if "wasapi" in api.get("name", "").lower():
+                wasapi_api_idx = api["index"]
+                break
+
+        if wasapi_api_idx is None:
+            return None
+
+        # Determine the name of the requested device so we can match it
+        target_name: Optional[str] = None
+        if device_index is not None and device_index >= 0:
+            try:
+                target_name = sd.query_devices(device_index).get("name", "")
+            except Exception:
+                pass
+
+        # Collect WASAPI output devices
+        all_devices = sd.query_devices()
+        if not isinstance(all_devices, list):
+            # Single-device systems return a dict — wrap it
+            all_devices = [all_devices]
+
+        wasapi_out_devices = [
+            d for d in all_devices
+            if d.get("hostapi") == wasapi_api_idx
+            and d.get("max_output_channels", 0) > 0
+        ]
+
+        if not wasapi_out_devices:
+            return None
+
+        # If we have a target name, try to find the best match
+        if target_name:
+            # Exact name match first
+            for d in wasapi_out_devices:
+                if d.get("name", "") == target_name:
+                    return d["index"]
+            # Partial name match: sounddevice sometimes appends the host-API
+            # name in parentheses (e.g. "USB Audio Device (WDM-KS)").
+            # Strip the parenthesised suffix so we can match just the base
+            # device name ("USB Audio Device") against the WASAPI entry.
+            target_stripped = target_name.split("(")[0].strip().lower()
+            if target_stripped:
+                for d in wasapi_out_devices:
+                    if target_stripped in d.get("name", "").lower():
+                        return d["index"]
+
+        # Fall back to the default WASAPI output device
+        default_out = sd.query_hostapis(wasapi_api_idx).get("default_output_device", -1)
+        if default_out is not None and default_out >= 0:
+            return default_out
+
+        # Last resort: first available WASAPI output device
+        return wasapi_out_devices[0]["index"]
+
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+        # This is a best-effort helper — if the sounddevice API returns
+        # unexpected data structures we catch the common dict/list access
+        # errors and fall back to returning None so the caller can surface
+        # the original PortAudioError rather than an unrelated lookup error.
+        logger.debug("_find_wasapi_output_device: lookup failed (%s)", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001  (sounddevice may raise custom types)
+        logger.warning("_find_wasapi_output_device: unexpected error (%s)", exc)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -512,6 +602,28 @@ class Ft8TxCoordinator:
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
+            # On Windows, the selected device may be opened via the WDM-KS
+            # host API, which can fail with paUnanticipatedHostError (-9999)
+            # when the driver rejects the stream configuration.  Try to find
+            # the same physical device exposed through the WASAPI host API and
+            # retry once before giving up.
+            if platform.system() == "Windows":
+                wasapi_dev = _find_wasapi_output_device(sd, device)
+                if wasapi_dev is not None:
+                    logger.info(
+                        "_play_audio: WDM-KS failed — retrying with WASAPI "
+                        "device index %d",
+                        wasapi_dev,
+                    )
+                    try:
+                        sd.play(play_audio, samplerate=play_fs, device=wasapi_dev)
+                        sd.wait()
+                        return
+                    except sd.PortAudioError as exc2:
+                        logger.error(
+                            "_play_audio: WASAPI fallback also failed: %s", exc2
+                        )
+                        raise RuntimeError(f"Audio output failed: {exc2}") from exc2
             raise RuntimeError(f"Audio output failed: {exc}") from exc
 
     # ── State management ───────────────────────────────────────────────────

@@ -703,5 +703,216 @@ class TestFt8TxCoordinatorSlotIntegration(unittest.TestCase):
         self.assertLessEqual(elapsed, SLOT_WAIT + 0.30)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 13  WASAPI fallback helper and _play_audio Windows fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from ft8_tx import _find_wasapi_output_device
+
+
+class TestFindWasapiOutputDevice(unittest.TestCase):
+    """Unit tests for _find_wasapi_output_device()."""
+
+    def _make_sd(self, host_apis, devices, default_device=(0, 1)):
+        """Build a minimal sounddevice stub."""
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else host_apis
+        )
+        sd.query_devices.side_effect = lambda idx=None: (
+            devices[idx] if idx is not None else devices
+        )
+        sd.default.device = default_device
+        return sd
+
+    def test_returns_none_when_no_wasapi_host_api(self):
+        """If no WASAPI host API is present, return None."""
+        host_apis = [{"index": 0, "name": "MME", "default_output_device": 0}]
+        devices = [{"index": 0, "name": "Speaker", "hostapi": 0, "max_output_channels": 2}]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertIsNone(result)
+
+    def test_returns_exact_name_match_in_wasapi(self):
+        """If the device name matches a WASAPI device exactly, return that index."""
+        host_apis = [
+            {"index": 0, "name": "MME", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "Speaker", "hostapi": 0, "max_output_channels": 2},
+            {"index": 1, "name": "Microphone", "hostapi": 0, "max_output_channels": 0},
+            {"index": 2, "name": "Speaker", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    def test_returns_partial_name_match_in_wasapi(self):
+        """If full name doesn't match but a partial (stripped) name does, return it."""
+        host_apis = [
+            {"index": 0, "name": "WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio Device (WDM-KS)", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "USB Audio Device (WASAPI)", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        # The WDM-KS device name is "USB Audio Device (WDM-KS)"; stripped → "USB Audio Device"
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    def test_returns_wasapi_default_when_no_name_match(self):
+        """When no name match is found, fall back to WASAPI default output."""
+        host_apis = [
+            {"index": 0, "name": "WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 5},
+        ]
+        devices = [
+            {"index": 0, "name": "Foo", "hostapi": 0, "max_output_channels": 2},
+            {"index": 5, "name": "Bar", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 5)
+
+    def test_returns_none_when_sd_raises(self):
+        """If sounddevice raises unexpectedly, return None (no propagation)."""
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = RuntimeError("boom")
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_no_wasapi_output_devices(self):
+        """WASAPI host API exists but has no output devices → return None."""
+        host_apis = [
+            {"index": 0, "name": "Windows WASAPI", "default_output_device": -1},
+        ]
+        devices = [
+            {"index": 0, "name": "Mic", "hostapi": 0, "max_output_channels": 0},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_wasapi_output_device(sd, None)
+        self.assertIsNone(result)
+
+
+class TestPlayAudioWasapiFallback(unittest.TestCase):
+    """Tests for the WASAPI fallback path inside _play_audio."""
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def test_wasapi_fallback_triggered_on_windows_portaudio_error(self):
+        """
+        When sd.play raises PortAudioError on Windows and a WASAPI device is
+        found, _play_audio retries with the WASAPI device index and succeeds.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        # Fake sounddevice: first play raises, second succeeds
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Speaker"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+            if len(play_calls) == 1:
+                raise RuntimeError("WDM-KS error")
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        # _find_wasapi_output_device will be called — patch it to return 3
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=3), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(play_calls), 2, "sd.play should be called twice (original + fallback)")
+        self.assertEqual(play_calls[1], 3, "Second call should use WASAPI device 3")
+
+    def test_no_wasapi_fallback_on_non_windows(self):
+        """
+        On non-Windows platforms, a PortAudioError should NOT trigger the
+        WASAPI fallback; it should propagate as RuntimeError immediately.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("PA error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Linux"), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        # play should only be called once — no retry on Linux
+        self.assertEqual(fake_sd.play.call_count, 1)
+
+    def test_wasapi_fallback_raises_if_no_wasapi_device_found(self):
+        """
+        On Windows, if no WASAPI device is found, the original PortAudioError
+        is re-raised as RuntimeError without a retry.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("WDM-KS error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 1, "No retry when WASAPI device not found")
+
+    def test_wasapi_fallback_raises_if_fallback_also_fails(self):
+        """
+        On Windows, if WASAPI retry also raises PortAudioError, a RuntimeError
+        is raised (not a bare PortAudioError propagation).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "Speaker"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("audio error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=7), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 2, "Both original and fallback attempts made")
+
+
 if __name__ == "__main__":
     unittest.main()
