@@ -1190,15 +1190,16 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         fake_sd.play.side_effect = _play
         fake_sd.wait = mock.MagicMock()
 
-        # No WASAPI equivalent found
+        # Neither WASAPI nor MME equivalent found — original device must be used unchanged
         with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
              mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=4)
 
         self.assertEqual(len(play_calls), 1)
         self.assertEqual(play_calls[0], 4,
-                         "Original device used when no WASAPI equivalent found")
+                         "Original device used when no WASAPI or MME equivalent found")
 
     def test_proactive_swap_retry_after_delay_if_wasapi_fails(self):
         """
