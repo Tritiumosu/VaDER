@@ -491,6 +491,134 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
             # Should not raise
             coord._play_audio(np.zeros(10, dtype=np.float32), device=None)
 
+    def _make_fake_sd(self, device_samplerate: int):
+        """Return a minimal sounddevice stub with the given device sample rate."""
+        import numpy as np
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = Exception
+        fake_sd.query_devices.return_value = {"default_samplerate": device_samplerate}
+        fake_sd.default.device = (0, 1)
+
+        played_calls = []
+
+        def _fake_play(data, samplerate, **kwargs):
+            played_calls.append({"data": data, "samplerate": samplerate})
+
+        fake_sd.play.side_effect = _fake_play
+        fake_sd.wait = mock.MagicMock()
+        return fake_sd, played_calls
+
+    def test_play_audio_resamples_to_device_native_rate(self):
+        """
+        When the device's default_samplerate (48 000 Hz) differs from FT8_FS
+        (12 000 Hz), _play_audio must resample and call sd.play at the
+        native rate so that paInvalidSampleRate is avoided.
+        """
+        import numpy as np
+        from ft8_encode import FT8_FS
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd, played_calls = self._make_fake_sd(device_samplerate=48_000)
+
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=1)
+
+        self.assertEqual(len(played_calls), 1, "sd.play should be called exactly once")
+        self.assertEqual(played_calls[0]["samplerate"], 48_000)
+        # 48 000 / 12 000 = ×4 upsampling → output should be ≈ 4 × input length
+        self.assertEqual(len(played_calls[0]["data"]), 400)
+
+    def test_play_audio_no_resample_when_rates_match(self):
+        """
+        When the device's default_samplerate already equals FT8_FS,
+        _play_audio should call sd.play with the original audio unchanged.
+        """
+        import numpy as np
+        from ft8_encode import FT8_FS
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.ones(200, dtype=np.float32) * 0.5
+        fake_sd, played_calls = self._make_fake_sd(device_samplerate=FT8_FS)
+
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(played_calls), 1)
+        self.assertEqual(played_calls[0]["samplerate"], FT8_FS)
+        self.assertEqual(len(played_calls[0]["data"]), 200)
+
+    def test_play_audio_resample_44100(self):
+        """
+        Verify resampling works for a 44 100 Hz device (gcd=300 with 12 000).
+        """
+        import numpy as np
+        from ft8_encode import FT8_FS
+        from math import gcd
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.zeros(120, dtype=np.float32)
+        fake_sd, played_calls = self._make_fake_sd(device_samplerate=44_100)
+
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=2)
+
+        self.assertEqual(len(played_calls), 1)
+        self.assertEqual(played_calls[0]["samplerate"], 44_100)
+        # Expected length: 120 × 44100 / 12000 = 120 × 3.675 = 441
+        g = gcd(44_100, FT8_FS)
+        expected_len = 120 * (44_100 // g) // (FT8_FS // g)
+        self.assertEqual(len(played_calls[0]["data"]), expected_len)
+
+    def test_play_audio_uses_default_output_when_device_none(self):
+        """
+        When device is None, _play_audio queries the default output device
+        (sd.default.device[1]) to determine the native sample rate.
+        """
+        import numpy as np
+        from ft8_encode import FT8_FS
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.zeros(60, dtype=np.float32)
+        fake_sd, played_calls = self._make_fake_sd(device_samplerate=48_000)
+
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=None)
+
+        # Should have queried sd.default.device[1] = 1
+        fake_sd.query_devices.assert_called_once_with(1)
+        self.assertEqual(played_calls[0]["samplerate"], 48_000)
+
+    def test_play_audio_falls_back_on_query_error(self):
+        """
+        If sd.query_devices raises, _play_audio falls back to FT8_FS and
+        still calls sd.play (no exception propagated from the query failure).
+        """
+        import numpy as np
+        from ft8_encode import FT8_FS
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.zeros(50, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = Exception
+        fake_sd.query_devices.side_effect = RuntimeError("device query failed")
+        fake_sd.default.device = (0, 1)
+        played_calls = []
+
+        def _fake_play(data, samplerate, **kwargs):
+            played_calls.append(samplerate)
+
+        fake_sd.play.side_effect = _fake_play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=None)
+
+        self.assertEqual(len(played_calls), 1)
+        self.assertEqual(played_calls[0], FT8_FS)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 11  Exception safety — PTT unkey on error
