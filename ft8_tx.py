@@ -819,6 +819,16 @@ class Ft8TxCoordinator:
         # (paInvalidSampleRate / paUnanticipatedHostError) that occur when the
         # FT8 native rate (12 000 Hz) or float32 data are passed directly.
         play_audio_f32, play_fs = _resample_audio(audio, FT8_FS, TX_OUTPUT_SAMPLE_RATE)
+        if play_fs != TX_OUTPUT_SAMPLE_RATE:
+            logger.error(
+                "_play_audio: resampling failed to produce required output rate: "
+                "expected %d Hz, got %d Hz; refusing playback",
+                TX_OUTPUT_SAMPLE_RATE, play_fs,
+            )
+            raise RuntimeError(
+                f"_play_audio requires {TX_OUTPUT_SAMPLE_RATE} Hz output, "
+                f"but resampler returned {play_fs} Hz"
+            )
         play_audio = _to_int16(play_audio_f32)
         logger.debug(
             "_play_audio: prepared %d samples at %d Hz, dtype=%s for device %s",

@@ -728,10 +728,32 @@ class TestTxAudioFixedFormat(unittest.TestCase):
 
         fake_sd.query_devices.assert_not_called()
 
+    def test_play_audio_raises_if_resample_fails(self):
+        """
+        If _resample_audio returns the original FT8_FS rate instead of
+        TX_OUTPUT_SAMPLE_RATE (e.g. scipy unavailable), _play_audio must raise
+        RuntimeError immediately rather than passing 12 kHz audio to the driver.
+        """
+        import numpy as np
+        from ft8_tx import TX_OUTPUT_SAMPLE_RATE
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# § 11  Exception safety — PTT unkey on error
-# ═══════════════════════════════════════════════════════════════════════════════
+        coord = self._make_coord()
+        audio = np.zeros(50, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = Exception
+        fake_sd.default.device = (0, 0)
+        fake_sd.wait = mock.MagicMock()
+        fake_sd.play = mock.MagicMock()
+
+        with mock.patch("ft8_tx._resample_audio", return_value=(audio, 12_000)), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError) as ctx:
+                coord._play_audio(audio, device=0)
+
+        self.assertIn(str(TX_OUTPUT_SAMPLE_RATE), str(ctx.exception))
+        # sd.play must NOT have been called
+        fake_sd.play.assert_not_called()
 
 class TestFt8TxCoordinatorExceptionSafety(unittest.TestCase):
     def test_ptt_unkeyed_if_audio_raises(self):
@@ -1962,20 +1984,34 @@ class TestAudioPregeneration(unittest.TestCase):
         original_encode = _ft8_tx.ft8_encode_message
         coord._play_audio = mock.MagicMock()
 
-        encode_call_count = [0]
+        call_order: list[str] = []
 
         with mock.patch.object(
             _ft8_tx, "ft8_encode_message",
             side_effect=lambda *a, **kw: (
-                encode_call_count.__setitem__(0, encode_call_count[0] + 1)
+                call_order.append("encode")
                 or original_encode(*a, **kw)
             ),
         ):
+            # Wrap ptt_on to record the call order
+            original_ptt_on = coord._ptt_on
+            def _ptt_on_recording():
+                call_order.append("ptt_on")
+                return original_ptt_on()
+            coord._ptt_on = _ptt_on_recording
+
             final = _arm_and_wait(coord, msg="CQ W4ABC EN52")
 
         self.assertEqual(final, TxState.COMPLETE)
         # Encoding should have been called exactly once
-        self.assertEqual(encode_call_count[0], 1)
+        self.assertIn("encode", call_order)
+        self.assertIn("ptt_on", call_order)
+        # encode must appear before ptt_on in the call sequence
+        self.assertLess(
+            call_order.index("encode"),
+            call_order.index("ptt_on"),
+            "ft8_encode_message must be called before _ptt_on",
+        )
 
     def test_encoding_error_before_slot_transitions_to_error_without_ptt(self):
         """
