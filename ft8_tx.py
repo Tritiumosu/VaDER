@@ -187,6 +187,87 @@ def _find_wasapi_output_device(sd, device_index: Optional[int]) -> Optional[int]
         return None
 
 
+def _find_mme_output_device(sd, device_index: Optional[int]) -> Optional[int]:
+    """
+    On Windows, return the MME output-device index that corresponds to
+    the physical device at *device_index*.
+
+    MME (MultiMedia Extensions) is the oldest Windows audio API and is
+    supported by virtually all audio devices.  This function is used as a
+    secondary fallback (after WASAPI) when the WDM-KS host API fails with
+    ``paUnanticipatedHostError`` (-9999) and no WASAPI equivalent can be
+    found.  Unlike WDM-KS, MME routes audio through the Windows audio
+    mixer (wdmaud.sys) and does not attempt kernel-level sample-rate
+    negotiation via ``KSPROPERTY_AUDIO_SAMPLING_FREQ``.
+
+    Returns the MME device index on success, or ``None`` if no MME host
+    API or no matching device is found.
+    """
+    try:
+        # Locate the MME host API
+        mme_api_idx: Optional[int] = None
+        for api in sd.query_hostapis():
+            if api.get("name", "").lower() == "mme":
+                mme_api_idx = api["index"]
+                break
+
+        if mme_api_idx is None:
+            return None
+
+        # Determine the name of the requested device so we can match it
+        target_name: Optional[str] = None
+        if device_index is not None and device_index >= 0:
+            try:
+                target_name = sd.query_devices(device_index).get("name", "")
+            except Exception:
+                pass
+
+        # Collect MME output devices
+        all_devices = sd.query_devices()
+        if not isinstance(all_devices, list):
+            all_devices = [all_devices]
+
+        mme_out_devices = [
+            d for d in all_devices
+            if d.get("hostapi") == mme_api_idx
+            and d.get("max_output_channels", 0) > 0
+        ]
+
+        if not mme_out_devices:
+            return None
+
+        # If we have a target name, try to find the best match
+        if target_name:
+            # Exact name match first
+            for d in mme_out_devices:
+                if d.get("name", "") == target_name:
+                    return d["index"]
+            # Partial name match: MME device names may have a numeric prefix
+            # (e.g. "5- USB Audio CODEC") while the WDM-KS name is plain
+            # ("USB Audio CODEC").  Strip leading digits and the
+            # host-API suffix in parentheses from both sides before comparing.
+            target_stripped = target_name.split("(")[0].strip().lower()
+            if target_stripped:
+                for d in mme_out_devices:
+                    if target_stripped in d.get("name", "").lower():
+                        return d["index"]
+
+        # Fall back to the default MME output device
+        default_out = sd.query_hostapis(mme_api_idx).get("default_output_device", -1)
+        if default_out is not None and default_out >= 0:
+            return default_out
+
+        # Last resort: first available MME output device
+        return mme_out_devices[0]["index"]
+
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+        logger.debug("_find_mme_output_device: lookup failed (%s)", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_find_mme_output_device: unexpected error (%s)", exc)
+        return None
+
+
 def _is_wdm_ks_device(sd, device_index: Optional[int]) -> bool:
     """
     Return True if the device at *device_index* is exposed through the
@@ -647,14 +728,23 @@ class Ft8TxCoordinator:
                 except Exception:
                     pass
             if _is_wdm_ks_device(sd, resolved_device):
-                wasapi_candidate = _find_wasapi_output_device(sd, resolved_device)
-                if wasapi_candidate is not None:
+                alt_candidate = _find_wasapi_output_device(sd, resolved_device)
+                alt_api_name = "WASAPI"
+                if alt_candidate is None:
+                    # WASAPI unavailable — try MME as a secondary fallback.
+                    # MME routes through the Windows audio mixer and avoids
+                    # the kernel-level KSPROPERTY_AUDIO_SAMPLING_FREQ query
+                    # that causes WDM-KS to fail with ERROR_NOT_FOUND (0x490)
+                    # on many USB audio codecs used in ham radio transceivers.
+                    alt_candidate = _find_mme_output_device(sd, resolved_device)
+                    alt_api_name = "MME"
+                if alt_candidate is not None:
                     logger.info(
                         "_play_audio: device %s is WDM-KS — proactively using "
-                        "WASAPI device %d instead",
-                        resolved_device, wasapi_candidate,
+                        "%s device %d instead",
+                        resolved_device, alt_api_name, alt_candidate,
                     )
-                    effective_device = wasapi_candidate
+                    effective_device = alt_candidate
 
         dev_kwarg: dict = (
             {} if (effective_device is None or effective_device < 0)
@@ -731,8 +821,43 @@ class Ft8TxCoordinator:
                             "_play_audio: WASAPI fallback also failed: %s", exc2
                         )
                         raise RuntimeError(f"Audio output failed: {exc2}") from exc2
-                # No different WASAPI device is available (either none found or the
-                # proactive WDM-KS→WASAPI swap was already applied and also failed).
+                # No different WASAPI device available — try MME as a last-resort
+                # alternative before falling back to a transient delay-retry on the
+                # same device.  Some USB audio codecs for ham radio transceivers are
+                # only exposed under WDM-KS and MME (not WASAPI); MME routes through
+                # the Windows audio mixer and does not use kernel-level sample-rate
+                # IOCTLs, so it avoids the KSPROPERTY_AUDIO_SAMPLING_FREQ error
+                # that causes WDM-KS to fail permanently on these devices.
+                mme_dev = _find_mme_output_device(sd, resolved_device)
+                if mme_dev is not None and mme_dev != effective_device:
+                    logger.info(
+                        "_play_audio: PortAudioError on device %s — retrying "
+                        "with MME device %d",
+                        effective_device, mme_dev,
+                    )
+                    mme_native_fs = FT8_FS
+                    try:
+                        mme_info = sd.query_devices(mme_dev)
+                        raw = mme_info.get("default_samplerate")
+                        if raw:
+                            mme_native_fs = int(raw)
+                    except Exception:
+                        pass
+                    mme_audio, mme_fs = _resample_audio(
+                        audio, FT8_FS, mme_native_fs
+                    )
+                    try:
+                        sd.play(mme_audio, samplerate=mme_fs, device=mme_dev)
+                        sd.wait()
+                        return
+                    except sd.PortAudioError as exc_mme:
+                        logger.error(
+                            "_play_audio: MME fallback also failed: %s", exc_mme
+                        )
+                        raise RuntimeError(
+                            f"Audio output failed: {exc_mme}"
+                        ) from exc_mme
+                # No different alternative device (WASAPI or MME) is available.
                 # USB audio codecs in ham radio transceivers often need a short
                 # settling time to switch from RX to TX mode after PTT is keyed.
                 # A single retry after a brief pause recovers from this transient
