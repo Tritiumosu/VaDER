@@ -708,7 +708,7 @@ class TestFt8TxCoordinatorSlotIntegration(unittest.TestCase):
 # § 13  WASAPI fallback helper and _play_audio Windows fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from ft8_tx import _find_wasapi_output_device, _is_wdm_ks_device
+from ft8_tx import _find_wasapi_output_device, _find_mme_output_device, _is_wdm_ks_device
 
 
 class TestFindWasapiOutputDevice(unittest.TestCase):
@@ -1164,7 +1164,8 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
     def test_proactive_swap_falls_back_to_original_when_no_wasapi_found(self):
         """
         If _find_wasapi_output_device returns None during the proactive check,
-        the original device is used unchanged (no swap, no crash).
+        _find_mme_output_device is tried next.  When both return None the
+        original device is used unchanged (no swap, no crash).
         """
         import numpy as np
 
@@ -1189,15 +1190,16 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         fake_sd.play.side_effect = _play
         fake_sd.wait = mock.MagicMock()
 
-        # No WASAPI equivalent found
+        # Neither WASAPI nor MME equivalent found — original device must be used unchanged
         with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
              mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=4)
 
         self.assertEqual(len(play_calls), 1)
         self.assertEqual(play_calls[0], 4,
-                         "Original device used when no WASAPI equivalent found")
+                         "Original device used when no WASAPI or MME equivalent found")
 
     def test_proactive_swap_retry_after_delay_if_wasapi_fails(self):
         """
@@ -1370,6 +1372,295 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         # Resolved index should be sd.default.device[1] == 4
         mock_fwod.assert_called_once_with(fake_sd, 4)
         self.assertEqual(play_calls[0], 8)
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 16  _find_mme_output_device() helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFindMmeOutputDevice(unittest.TestCase):
+    """Unit tests for _find_mme_output_device()."""
+
+    def _make_sd(self, host_apis, devices, default_device=(0, 1)):
+        """Build a minimal sounddevice stub."""
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else host_apis
+        )
+        sd.query_devices.side_effect = lambda idx=None: (
+            devices[idx] if idx is not None else devices
+        )
+        sd.default.device = default_device
+        return sd
+
+    def test_returns_none_when_no_mme_host_api(self):
+        """If no MME host API is present, return None."""
+        host_apis = [{"index": 0, "name": "Windows WASAPI", "default_output_device": 0}]
+        devices = [{"index": 0, "name": "Speaker", "hostapi": 0, "max_output_channels": 2}]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_mme_output_device(sd, 0)
+        self.assertIsNone(result)
+
+    def test_returns_exact_name_match_in_mme(self):
+        """If the device name matches an MME device exactly, return that index."""
+        host_apis = [
+            {"index": 0, "name": "MME", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "Speaker", "hostapi": 0, "max_output_channels": 2},
+            {"index": 1, "name": "Microphone", "hostapi": 0, "max_output_channels": 0},
+            {"index": 2, "name": "Speaker", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        # Request device 2 (WASAPI "Speaker") → match MME "Speaker" at index 0
+        result = _find_mme_output_device(sd, 2)
+        self.assertEqual(result, 0)
+
+    def test_returns_partial_name_match_in_mme(self):
+        """If full name doesn't match but a partial (stripped) name does, return it."""
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "MME", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio Device (WDM-KS)", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "USB Audio Device", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_mme_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    def test_returns_mme_default_when_no_name_match(self):
+        """When no name match is found, fall back to MME default output."""
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "MME", "default_output_device": 5},
+        ]
+        devices = [
+            {"index": 0, "name": "Foo", "hostapi": 0, "max_output_channels": 2},
+            {"index": 5, "name": "Bar", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_mme_output_device(sd, 0)
+        self.assertEqual(result, 5)
+
+    def test_returns_none_when_sd_raises(self):
+        """If sounddevice raises unexpectedly, return None (no propagation)."""
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = RuntimeError("boom")
+        result = _find_mme_output_device(sd, 0)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_no_mme_output_devices(self):
+        """MME host API exists but has no output devices → return None."""
+        host_apis = [
+            {"index": 0, "name": "MME", "default_output_device": -1},
+        ]
+        devices = [
+            {"index": 0, "name": "Mic", "hostapi": 0, "max_output_channels": 0},
+        ]
+        sd = self._make_sd(host_apis, devices)
+        result = _find_mme_output_device(sd, None)
+        self.assertIsNone(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 17  MME fallback paths in _play_audio
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlayAudioMmeFallback(unittest.TestCase):
+    """
+    Verify that _play_audio uses MME as a secondary fallback (after WASAPI)
+    both proactively (when device is WDM-KS) and reactively (after a
+    PortAudioError).
+    """
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def test_proactive_swap_uses_mme_when_no_wasapi_found(self):
+        """
+        When device is WDM-KS and _find_wasapi_output_device returns None,
+        _find_mme_output_device is tried and sd.play should be called with
+        the MME device on the FIRST attempt (no WDM-KS attempt).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Audio CODEC",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=6), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(play_calls), 1,
+                         "sd.play should be called exactly once (MME, no WDM-KS attempt)")
+        self.assertEqual(play_calls[0], 6,
+                         "The MME device (6) should be used on the first call")
+
+    def test_reactive_mme_fallback_triggered_when_no_wasapi(self):
+        """
+        When sd.play raises PortAudioError on Windows, no WASAPI device is
+        found, but an MME device is found, _play_audio retries with the MME
+        device and succeeds.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Dev"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+            if len(play_calls) == 1:
+                raise RuntimeError("WDM-KS error")
+            # Second attempt on MME device succeeds
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=9), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(play_calls), 2, "original attempt + MME retry")
+        self.assertEqual(play_calls[1], 9, "Second call should use MME device 9")
+
+    def test_reactive_mme_fallback_raises_if_mme_also_fails(self):
+        """
+        When both the original device and the MME fallback raise PortAudioError,
+        a RuntimeError is raised.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Dev"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.play.side_effect = RuntimeError("audio error")
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=9), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "original attempt + MME fallback attempt")
+
+    def test_mme_fallback_skipped_when_same_as_effective_device(self):
+        """
+        If _find_mme_output_device returns the same index as effective_device,
+        the MME retry is skipped and the 200 ms delay path is taken instead.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {"default_samplerate": 48_000, "name": "USB Dev"}
+        fake_sd.default.device = (0, 0)
+
+        call_count = [0]
+
+        def _play(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("transient error")
+            # Second attempt (delay retry) succeeds
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=0), \
+             mock.patch("ft8_tx.time.sleep"), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            # device=0, mme returns 0 → same device → skip MME → delay retry
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "original attempt + delay-retry (MME skipped — same device)")
+
+    def test_wasapi_preferred_over_mme_in_proactive_swap(self):
+        """
+        When both WASAPI and MME alternatives exist, WASAPI should be used
+        (higher priority) and _find_mme_output_device should NOT be called.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Audio",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        mme_called = []
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx._find_mme_output_device",
+                        side_effect=lambda *a, **kw: mme_called.append(1) or 10), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)
+
+        self.assertEqual(len(mme_called), 0,
+                         "_find_mme_output_device must not be called when WASAPI is available")
+        self.assertEqual(play_calls[0], 5, "WASAPI device used (not MME)")
 
 
 if __name__ == "__main__":
