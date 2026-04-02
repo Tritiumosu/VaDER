@@ -246,10 +246,27 @@ def _find_mme_output_device(sd, device_index: Optional[int]) -> Optional[int]:
             # (e.g. "5- USB Audio CODEC") while the WDM-KS name is plain
             # ("USB Audio CODEC").  Strip leading digits and the
             # host-API suffix in parentheses from both sides before comparing.
-            target_stripped = target_name.split("(")[0].strip().lower()
+            def _normalize_device_name(name: str) -> str:
+                if not isinstance(name, str):
+                    return ""
+                # Drop any host-API suffix in parentheses.
+                base = name.split("(")[0]
+                base = base.lstrip()
+                # Strip leading digits and common delimiter characters.
+                i = 0
+                while i < len(base) and (base[i].isdigit() or base[i] in "-. "):
+                    i += 1
+                return base[i:].strip().lower()
+
+            target_stripped = _normalize_device_name(target_name)
             if target_stripped:
                 for d in mme_out_devices:
-                    if target_stripped in d.get("name", "").lower():
+                    candidate_stripped = _normalize_device_name(d.get("name", ""))
+                    if candidate_stripped and (
+                        target_stripped == candidate_stripped
+                        or target_stripped in candidate_stripped
+                        or candidate_stripped in target_stripped
+                    ):
                         return d["index"]
 
         # Fall back to the default MME output device
