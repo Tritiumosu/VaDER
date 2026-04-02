@@ -625,16 +625,30 @@ class Ft8TxCoordinator:
         # device is a WDM-KS device, replace it with the WASAPI equivalent
         # before attempting to open any stream — this eliminates the error
         # entirely rather than waiting for the stream to fail and retrying.
+        #
+        # Resolve the device index to check: use the caller-supplied index if
+        # valid; otherwise look up the system default output.  This ensures
+        # the swap also fires when device=None/negative and the default system
+        # output happens to be a WDM-KS device.
         effective_device = device
-        if platform.system() == "Windows" and _is_wdm_ks_device(sd, device):
-            wasapi_candidate = _find_wasapi_output_device(sd, device)
-            if wasapi_candidate is not None:
-                logger.info(
-                    "_play_audio: device %d is WDM-KS — proactively using "
-                    "WASAPI device %d instead",
-                    device, wasapi_candidate,
-                )
-                effective_device = wasapi_candidate
+        resolved_device: Optional[int] = (
+            device if (device is not None and device >= 0) else None
+        )
+        if platform.system() == "Windows":
+            if resolved_device is None:
+                try:
+                    resolved_device = sd.default.device[1]
+                except Exception:
+                    pass
+            if _is_wdm_ks_device(sd, resolved_device):
+                wasapi_candidate = _find_wasapi_output_device(sd, resolved_device)
+                if wasapi_candidate is not None:
+                    logger.info(
+                        "_play_audio: device %s is WDM-KS — proactively using "
+                        "WASAPI device %d instead",
+                        resolved_device, wasapi_candidate,
+                    )
+                    effective_device = wasapi_candidate
 
         dev_kwarg: dict = (
             {} if (effective_device is None or effective_device < 0)
@@ -681,7 +695,7 @@ class Ft8TxCoordinator:
             # (effective_device != device) to avoid playing to the same
             # device twice.
             if platform.system() == "Windows":
-                wasapi_dev = _find_wasapi_output_device(sd, device)
+                wasapi_dev = _find_wasapi_output_device(sd, resolved_device)
                 if wasapi_dev is not None and wasapi_dev != effective_device:
                     logger.info(
                         "_play_audio: PortAudioError on device %s — retrying "

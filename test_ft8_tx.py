@@ -1188,6 +1188,87 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         self.assertEqual(fake_sd.play.call_count, 1,
                          "Must not retry with the same WASAPI device twice")
 
+    def test_proactive_swap_default_output_wdm_ks(self):
+        """
+        When device=None (default output) and the system default output is a
+        WDM-KS device, _play_audio must proactively swap to WASAPI — using
+        sd.default.device[1] as the source index for WDM-KS detection.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        # sd.default.device[1] == 3 is the default output
+        fake_sd.default.device = (0, 3)
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "Default Speaker (WDM-KS)",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        # _find_wasapi_output_device should be called with the resolved index (3)
+        # and returns WASAPI device 7.
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=7) as mock_fwod, \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=None)
+
+        # Should have looked up the WASAPI counterpart for the default device (3)
+        mock_fwod.assert_called_once_with(fake_sd, 3)
+        self.assertEqual(len(play_calls), 1,
+                         "sd.play should be called exactly once")
+        self.assertEqual(play_calls[0], 7,
+                         "WASAPI device (7) should be used for the default WDM-KS output")
+
+    def test_proactive_swap_negative_device_default_wdm_ks(self):
+        """
+        When device=-1 (sentinel for 'use default'), the same default-output
+        WDM-KS detection path applies and the swap fires correctly.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.default.device = (0, 4)
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Out (WDM-KS)",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+
+        play_calls = []
+
+        def _play(data, samplerate, **kwargs):
+            play_calls.append(kwargs.get("device"))
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=8) as mock_fwod, \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=-1)
+
+        # Resolved index should be sd.default.device[1] == 4
+        mock_fwod.assert_called_once_with(fake_sd, 4)
+        self.assertEqual(play_calls[0], 8)
+
 
 if __name__ == "__main__":
     unittest.main()
