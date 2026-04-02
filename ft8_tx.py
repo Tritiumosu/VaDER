@@ -839,12 +839,14 @@ class Ft8TxCoordinator:
                         )
                         raise RuntimeError(f"Audio output failed: {exc2}") from exc2
                 # No different WASAPI device available — try MME as a last-resort
-                # alternative before falling back to a transient delay-retry on the
-                # same device.  Some USB audio codecs for ham radio transceivers are
-                # only exposed under WDM-KS and MME (not WASAPI); MME routes through
-                # the Windows audio mixer and does not use kernel-level sample-rate
-                # IOCTLs, so it avoids the KSPROPERTY_AUDIO_SAMPLING_FREQ error
-                # that causes WDM-KS to fail permanently on these devices.
+                # alternative output device. Some USB audio codecs for ham radio
+                # transceivers are only exposed under WDM-KS and MME (not WASAPI);
+                # MME routes through the Windows audio mixer and does not use
+                # kernel-level sample-rate IOCTLs, so it avoids the
+                # KSPROPERTY_AUDIO_SAMPLING_FREQ error that causes WDM-KS to fail
+                # permanently on these devices. If no different alternative device
+                # (WASAPI or MME) is available, we fall back to a transient
+                # delay-retry on the same device below.
                 mme_dev = _find_mme_output_device(sd, resolved_device)
                 if mme_dev is not None and mme_dev != effective_device:
                     logger.info(
