@@ -6,7 +6,7 @@ import os
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import datetime
+from datetime import datetime, timezone
 import queue
 
 try:
@@ -989,7 +989,7 @@ class RadioGUI:
                 return
             with open(FT8_LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(
-                    f"\n--- Session {datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} ---\n"
+                    f"\n--- Session {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} ---\n"
                 )
                 fh.write(content + "\n")
             print(f"[FT8 Log] Saved to {FT8_LOG_PATH}", flush=True)
