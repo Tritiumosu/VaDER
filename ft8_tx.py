@@ -836,7 +836,7 @@ class Ft8TxCoordinator:
         )
 
         try:
-            sd.play(play_audio, samplerate=play_fs, dtype=TX_OUTPUT_DTYPE, **dev_kwarg)
+            sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
@@ -861,7 +861,6 @@ class Ft8TxCoordinator:
                         sd.play(
                             play_audio,
                             samplerate=play_fs,
-                            dtype=TX_OUTPUT_DTYPE,
                             device=wasapi_dev,
                         )
                         sd.wait()
@@ -888,7 +887,6 @@ class Ft8TxCoordinator:
                                 sd.play(
                                     play_audio,
                                     samplerate=play_fs,
-                                    dtype=TX_OUTPUT_DTYPE,
                                     device=wasapi_dev,
                                     extra_settings=ws,
                                 )
@@ -925,7 +923,6 @@ class Ft8TxCoordinator:
                         sd.play(
                             play_audio,
                             samplerate=play_fs,
-                            dtype=TX_OUTPUT_DTYPE,
                             device=mme_dev,
                         )
                         sd.wait()
@@ -949,7 +946,7 @@ class Ft8TxCoordinator:
                 )
                 time.sleep(USB_AUDIO_SWITCH_DELAY_S)
                 try:
-                    sd.play(play_audio, samplerate=play_fs, dtype=TX_OUTPUT_DTYPE, **dev_kwarg)
+                    sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
                     sd.wait()
                     return
                 except sd.PortAudioError as exc_retry:

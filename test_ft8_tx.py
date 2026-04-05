@@ -513,7 +513,7 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         fake_sd.wait = mock.MagicMock()
         return fake_sd, played_calls
 
-    def test_play_audio_resamples_to_device_native_rate(self):
+    def test_play_audio_always_outputs_at_tx_output_sample_rate(self):
         """
         _play_audio always resamples to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
         calls sd.play at that rate regardless of the device's reported native
@@ -532,12 +532,12 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         self.assertEqual(played_calls[0]["samplerate"], TX_OUTPUT_SAMPLE_RATE)
         # 48 000 / 12 000 = ×4 upsampling → output should be ≈ 4 × input length
         self.assertEqual(len(played_calls[0]["data"]), 400)
-        # dtype kwarg must be TX_OUTPUT_DTYPE (int16)
-        self.assertEqual(played_calls[0]["kwargs"].get("dtype"), TX_OUTPUT_DTYPE)
+        # dtype must NOT be passed as a kwarg; sounddevice infers it from the array
+        self.assertNotIn("dtype", played_calls[0]["kwargs"])
         # Output data must be int16
         self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
-    def test_play_audio_no_resample_when_rates_match(self):
+    def test_play_audio_resamples_even_when_device_reports_ft8_native_rate(self):
         """
         Even when the device's default_samplerate equals FT8_FS (12 000 Hz),
         _play_audio resamples to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
@@ -555,8 +555,9 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
 
         self.assertEqual(len(played_calls), 1)
         self.assertEqual(played_calls[0]["samplerate"], TX_OUTPUT_SAMPLE_RATE)
-        # dtype must be int16
-        self.assertEqual(played_calls[0]["kwargs"].get("dtype"), TX_OUTPUT_DTYPE)
+        # dtype must NOT be passed as a kwarg; array is already int16
+        self.assertNotIn("dtype", played_calls[0]["kwargs"])
+        self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
     def test_play_audio_resample_44100(self):
         """
@@ -575,8 +576,9 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         self.assertEqual(len(played_calls), 1)
         # Always 48 000 Hz regardless of device native rate
         self.assertEqual(played_calls[0]["samplerate"], TX_OUTPUT_SAMPLE_RATE)
-        # dtype kwarg must be TX_OUTPUT_DTYPE
-        self.assertEqual(played_calls[0]["kwargs"].get("dtype"), TX_OUTPUT_DTYPE)
+        # dtype must NOT be passed as a kwarg; array is already int16
+        self.assertNotIn("dtype", played_calls[0]["kwargs"])
+        self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
     def test_play_audio_uses_default_output_when_device_none(self):
         """
@@ -595,7 +597,9 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         # Device query is no longer needed — sd.query_devices should NOT be called
         fake_sd.query_devices.assert_not_called()
         self.assertEqual(played_calls[0]["samplerate"], TX_OUTPUT_SAMPLE_RATE)
-        self.assertEqual(played_calls[0]["kwargs"].get("dtype"), TX_OUTPUT_DTYPE)
+        # dtype must NOT be passed as a kwarg; array is already int16
+        self.assertNotIn("dtype", played_calls[0]["kwargs"])
+        self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
     def test_play_audio_falls_back_on_query_error(self):
         """
@@ -615,7 +619,7 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         played_calls = []
 
         def _fake_play(data, samplerate, **kwargs):
-            played_calls.append({"samplerate": samplerate, "kwargs": kwargs})
+            played_calls.append({"data": data, "samplerate": samplerate, "kwargs": kwargs})
 
         fake_sd.play.side_effect = _fake_play
         fake_sd.wait = mock.MagicMock()
@@ -625,7 +629,9 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
 
         self.assertEqual(len(played_calls), 1)
         self.assertEqual(played_calls[0]["samplerate"], TX_OUTPUT_SAMPLE_RATE)
-        self.assertEqual(played_calls[0]["kwargs"].get("dtype"), TX_OUTPUT_DTYPE)
+        # dtype must NOT be passed as a kwarg; array is already int16
+        self.assertNotIn("dtype", played_calls[0]["kwargs"])
+        self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -665,7 +671,8 @@ class TestTxAudioFixedFormat(unittest.TestCase):
         data, sr, kw = captured[0]
         self.assertEqual(data.dtype, np.int16, "Output array must be int16")
         self.assertEqual(sr, TX_OUTPUT_SAMPLE_RATE, "Sample rate must be TX_OUTPUT_SAMPLE_RATE")
-        self.assertEqual(kw.get("dtype"), TX_OUTPUT_DTYPE, "dtype kwarg must be TX_OUTPUT_DTYPE")
+        # dtype must NOT be passed as a kwarg; sounddevice infers it from the int16 array
+        self.assertNotIn("dtype", kw, "dtype must not be passed as a kwarg to sd.play")
 
     def test_output_sample_rate_is_48000(self):
         """samplerate passed to sd.play must always be TX_OUTPUT_SAMPLE_RATE (48 000)."""
