@@ -513,7 +513,7 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         fake_sd.wait = mock.MagicMock()
         return fake_sd, played_calls
 
-    def test_play_audio_resamples_to_device_native_rate(self):
+    def test_play_audio_always_outputs_at_tx_output_sample_rate(self):
         """
         _play_audio always resamples to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
         calls sd.play at that rate regardless of the device's reported native
@@ -537,7 +537,7 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         # Output data must be int16
         self.assertEqual(played_calls[0]["data"].dtype, np.int16)
 
-    def test_play_audio_no_resample_when_rates_match(self):
+    def test_play_audio_resamples_even_when_device_reports_ft8_native_rate(self):
         """
         Even when the device's default_samplerate equals FT8_FS (12 000 Hz),
         _play_audio resamples to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
