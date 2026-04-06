@@ -1629,6 +1629,173 @@ class TestPlayAudioProactiveWdmKsSharedModeFallback(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# § 15c  _stream_play() unit tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStreamPlay(unittest.TestCase):
+    """
+    Unit tests for the _stream_play() module-level helper.
+
+    _stream_play() uses sd.OutputStream with a float32 callback to play audio —
+    the same technique as SoundCardAudioOutput / AudioTxCapture in voice mode.
+    These tests mock sd.OutputStream to verify the interface contract without
+    requiring actual audio hardware.
+    """
+
+    def _make_fake_sd(self, raise_on_stream_open=False):
+        """
+        Build a minimal sounddevice stub whose OutputStream context manager
+        immediately calls `finished_callback` (simulating instant playback).
+        """
+        import contextlib
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.CallbackStop = StopIteration
+
+        # Track all OutputStream() calls
+        stream_opens = []
+
+        @contextlib.contextmanager
+        def _fake_output_stream(**kwargs):
+            if raise_on_stream_open:
+                raise RuntimeError("PortAudio error opening stream")
+            stream_opens.append(kwargs)
+            # Simulate instant playback completion by calling finished_callback
+            cb = kwargs.get("finished_callback")
+            if cb:
+                cb()
+            yield mock.MagicMock()
+
+        fake_sd.OutputStream = _fake_output_stream
+        return fake_sd, stream_opens
+
+    def test_opens_output_stream_with_float32_and_48khz(self):
+        """
+        _stream_play must open sd.OutputStream with dtype='float32' and
+        samplerate=TX_OUTPUT_SAMPLE_RATE (48 000 Hz) — same as SoundCardAudioOutput.
+        """
+        import numpy as np
+
+        fake_sd, stream_opens = self._make_fake_sd()
+        audio = np.zeros(100, dtype=np.float32)
+
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=1)
+
+        self.assertEqual(len(stream_opens), 1)
+        kw = stream_opens[0]
+        self.assertEqual(kw.get("dtype"), "float32",
+                         "OutputStream must use float32 (same as voice mode)")
+        self.assertEqual(kw.get("samplerate"), TX_OUTPUT_SAMPLE_RATE)
+        self.assertEqual(kw.get("channels"), 1)
+
+    def test_passes_device_kwarg_when_device_valid(self):
+        """When device >= 0, it must be passed as a keyword arg to OutputStream."""
+        import numpy as np
+
+        fake_sd, stream_opens = self._make_fake_sd()
+        audio = np.zeros(50, dtype=np.float32)
+
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=3)
+
+        self.assertEqual(stream_opens[0].get("device"), 3)
+
+    def test_omits_device_kwarg_when_device_none(self):
+        """When device is None, no 'device' kwarg should be passed to OutputStream."""
+        import numpy as np
+
+        fake_sd, stream_opens = self._make_fake_sd()
+        audio = np.zeros(50, dtype=np.float32)
+
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=None)
+
+        self.assertNotIn("device", stream_opens[0])
+
+    def test_omits_device_kwarg_when_device_negative(self):
+        """When device < 0, no 'device' kwarg should be passed to OutputStream."""
+        import numpy as np
+
+        fake_sd, stream_opens = self._make_fake_sd()
+        audio = np.zeros(50, dtype=np.float32)
+
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=-1)
+
+        self.assertNotIn("device", stream_opens[0])
+
+    def test_passes_extra_settings_when_provided(self):
+        """When extra_settings is given, it must be forwarded to OutputStream."""
+        import numpy as np
+
+        fake_sd, stream_opens = self._make_fake_sd()
+        audio = np.zeros(50, dtype=np.float32)
+        ws = mock.MagicMock(name="WasapiSettings")
+
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=0,
+                     extra_settings=ws)
+
+        self.assertIs(stream_opens[0].get("extra_settings"), ws)
+
+    def test_propagates_portaudio_error_from_stream_open(self):
+        """
+        If sd.OutputStream raises PortAudioError on open, _stream_play must
+        propagate it without catching it.
+        """
+        import numpy as np
+
+        fake_sd, _ = self._make_fake_sd(raise_on_stream_open=True)
+        audio = np.zeros(50, dtype=np.float32)
+
+        with self.assertRaises(RuntimeError):
+            _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=0)
+
+    def test_audio_reshaped_to_column_vector(self):
+        """
+        _stream_play must reshape a 1-D audio array to (N, 1) before feeding
+        it to OutputStream, and the callback must correctly copy audio data
+        into the outdata buffer.
+        """
+        import numpy as np
+
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.CallbackStop = StopIteration
+
+        callback_outdata_snapshot = []
+        import contextlib
+
+        @contextlib.contextmanager
+        def _fake_output_stream(**kwargs):
+            cb = kwargs.get("callback")
+            # Call the callback with a dummy outdata to verify audio shape
+            # and that audio data is correctly written into the buffer.
+            outdata = np.zeros((200, 1), dtype=np.float32)
+            if cb:
+                try:
+                    cb(outdata, 200, None, None)
+                except StopIteration:
+                    pass
+                callback_outdata_snapshot.append(outdata.copy())
+            fcb = kwargs.get("finished_callback")
+            if fcb:
+                fcb()
+            yield mock.MagicMock()
+
+        fake_sd.OutputStream = _fake_output_stream
+
+        # Use non-zero audio so we can verify the data was actually copied
+        audio = np.linspace(0.1, 0.9, 100, dtype=np.float32)
+        _stream_play(fake_sd, audio, TX_OUTPUT_SAMPLE_RATE, device=0)
+
+        # outdata passed to callback must be 2-D (n_frames, channels)
+        self.assertTrue(len(callback_outdata_snapshot) > 0)
+        result = callback_outdata_snapshot[0]
+        self.assertEqual(result.ndim, 2, "outdata must be 2-D (n_frames, 1)")
+        # Audio data must have been copied into the first 100 frames
+        np.testing.assert_allclose(result[:100, 0], audio,
+                                   err_msg="Callback must copy audio samples into outdata")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # § 16  _find_mme_output_device() helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
