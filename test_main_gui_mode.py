@@ -62,6 +62,7 @@ def _import_main_no_gui():
     tk_stub.Spinbox  = mock.MagicMock()
     tk_stub.StringVar = mock.MagicMock
     tk_stub.IntVar   = mock.MagicMock
+    tk_stub.Scale    = mock.MagicMock
     tk_stub.NORMAL   = "normal"
     tk_stub.DISABLED = "disabled"
     tk_stub.LEFT     = "left"

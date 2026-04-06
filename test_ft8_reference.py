@@ -383,6 +383,17 @@ passed = sum(1 for _, ok, _ in results if ok)
 failed = sum(1 for _, ok, _ in results if not ok)
 print(f"Results: {passed}/{len(results)} passed", end="")
 if failed:
-    print(f"  ({failed} FAILED)"); sys.exit(1)
+    print(f"  ({failed} FAILED)")
 else:
-    print("  — all tests passed ✓"); sys.exit(0)
+    print("  — all tests passed ✓")
+
+# --------------------------------------------------------------------------
+# pytest entry-point: collected when run via `pytest test_ft8_reference.py`
+# The run() calls above have already executed; this just asserts the results.
+# --------------------------------------------------------------------------
+def test_all_pass():
+    failures = [(name, detail) for name, ok, detail in results if not ok]
+    assert not failures, "Failed tests:\n" + "\n".join(f"  {n}: {d}" for n, d in failures)
+
+if __name__ == "__main__":
+    sys.exit(1 if failed else 0)

@@ -146,5 +146,12 @@ print(f"[{p}] CRC round-trip: calc=0x{crc5:04X} from_cw=0x{crc_from_cw:04X}")
 # ── Summary ────────────────────────────────────────────────────────────────
 n_pass = results.count(PASS)
 print(f"\n{n_pass}/{len(results)} tests passed")
-sys.exit(0 if n_pass == len(results) else 1)
+
+
+def test_all_pass():
+    assert n_pass == len(results), f"{n_pass}/{len(results)} tests passed"
+
+
+if __name__ == "__main__":
+    sys.exit(0 if n_pass == len(results) else 1)
 
