@@ -779,6 +779,7 @@ class Ft8TxCoordinator:
         # the swap also fires when device=None/negative and the default system
         # output happens to be a WDM-KS device.
         effective_device = device
+        _proactive_swap_occurred = False
         resolved_device: Optional[int] = (
             device if (device is not None and device >= 0) else None
         )
@@ -805,6 +806,7 @@ class Ft8TxCoordinator:
                         "%s device %d instead",
                         resolved_device, alt_api_name, alt_candidate,
                     )
+                    _proactive_swap_occurred = True
                     effective_device = alt_candidate
 
         dev_kwarg: dict = (
@@ -840,13 +842,18 @@ class Ft8TxCoordinator:
             sd.wait()
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
-            # Reactive WASAPI fallback: if a PortAudioError still occurs
-            # (e.g. the proactive WDM-KS swap was not triggered, or the
-            # WASAPI device itself has a stream-open problem), find the
-            # WASAPI counterpart for the *original* device and retry once.
-            # Skip the retry if we already swapped to WASAPI proactively
-            # (effective_device != device) to avoid playing to the same
-            # device twice.
+            # Reactive fallback chain (Windows only):
+            # 1. If a different WASAPI device is available (reactive swap not
+            #    yet tried), attempt it in sounddevice's default WASAPI mode
+            #    (exclusive), then retry in shared mode if that also fails.
+            #    sounddevice does not pass WasapiSettings here, so the first
+            #    attempt uses PortAudio's WASAPI default (exclusive mode).
+            # 2. If the proactive WDM-KS swap already selected this WASAPI
+            #    device (_proactive_swap_occurred, wasapi_dev == effective_device),
+            #    the first WASAPI attempt already failed; go straight to shared
+            #    mode to bypass the KSPROPERTY_AUDIO_SAMPLING_FREQ IOCTL.
+            # 3. Try MME as a last-resort alternative audio path.
+            # 4. Delay-retry the same device once for transient errors.
             if platform.system() == "Windows":
                 wasapi_dev = _find_wasapi_output_device(sd, resolved_device)
                 if wasapi_dev is not None and wasapi_dev != effective_device:
@@ -869,13 +876,15 @@ class Ft8TxCoordinator:
                         logger.error(
                             "_play_audio: WASAPI fallback also failed: %s", exc2
                         )
-                        # WASAPI exclusive mode failed — retry in shared mode.
-                        # Some devices reject exclusive streams (e.g. when
-                        # another application holds exclusive access), but
-                        # accept shared-mode WASAPI where audio is routed
-                        # through the Windows Audio Session API (WASAPI) mixer.
+                        # First WASAPI attempt failed — retry in shared mode.
+                        # Some devices reject the default (exclusive) WASAPI
+                        # stream, but accept shared-mode WASAPI where audio is
+                        # routed through the Windows Audio Session API mixer.
                         # WasapiSettings was added in sounddevice 0.4.0; skip
                         # the shared-mode step on older versions that lack it.
+                        # If shared mode also fails, fall through to the MME
+                        # and delay-retry paths below rather than raising
+                        # immediately — the device may still respond to those.
                         if hasattr(sd, "WasapiSettings"):
                             logger.info(
                                 "_play_audio: retrying WASAPI device %d in "
@@ -898,11 +907,49 @@ class Ft8TxCoordinator:
                                     "failed: %s",
                                     exc_shared,
                                 )
-                                raise RuntimeError(
-                                    f"Audio output failed: {exc_shared}"
-                                ) from exc_shared
-                        raise RuntimeError(f"Audio output failed: {exc2}") from exc2
-                # No different WASAPI device available — try MME as a last-resort
+                                # Fall through to MME / delay-retry below.
+                        # Fall through to MME / delay-retry — all WASAPI
+                        # attempts for this device failed.
+                elif _proactive_swap_occurred and wasapi_dev is not None and hasattr(sd, "WasapiSettings"):
+                    # NOTE: `_proactive_swap_occurred` guards this branch so
+                    # it only fires when a WDM-KS device was detected and
+                    # swapped to WASAPI proactively.  Without this guard the
+                    # branch would also fire when the user directly selected a
+                    # WASAPI device (wasapi_dev == effective_device but no swap
+                    # occurred), resulting in an unexpected extra play attempt
+                    # and a misleading log message.
+                    #
+                    # The proactive WDM-KS swap selected this WASAPI device and
+                    # the first play attempt (sounddevice's default WASAPI mode,
+                    # which is exclusive) just failed.  The default WASAPI mode
+                    # can still trigger the same KSPROPERTY_AUDIO_SAMPLING_FREQ
+                    # IOCTL (prop_id=10) as WDM-KS on some USB audio codecs.
+                    # WASAPI shared mode routes audio through the Windows Audio
+                    # Session API mixer and avoids that IOCTL entirely.  Try
+                    # shared mode before falling back to MME or the delay-retry.
+                    logger.info(
+                        "_play_audio: proactive WASAPI device %d also failed "
+                        "— retrying in shared mode",
+                        wasapi_dev,
+                    )
+                    try:
+                        ws = sd.WasapiSettings(exclusive=False)
+                        sd.play(
+                            play_audio,
+                            samplerate=play_fs,
+                            device=wasapi_dev,
+                            extra_settings=ws,
+                        )
+                        sd.wait()
+                        return
+                    except sd.PortAudioError as exc_shared:
+                        logger.error(
+                            "_play_audio: WASAPI shared mode also failed on "
+                            "device %d: %s",
+                            wasapi_dev, exc_shared,
+                        )
+                        # Fall through to MME / delay-retry below.
+                # No WASAPI alternative succeeded — try MME as a last-resort
                 # alternative output device. Some USB audio codecs for ham radio
                 # transceivers are only exposed under WDM-KS and MME (not WASAPI);
                 # MME routes through the Windows audio mixer and does not use
