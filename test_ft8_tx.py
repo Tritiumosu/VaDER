@@ -1343,11 +1343,10 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
 
     def test_proactive_swap_retry_after_delay_if_wasapi_fails(self):
         """
-        If the proactively-selected WASAPI device raises PortAudioError, the
-        code must NOT immediately retry with the same device (pointless), but
-        instead wait 200 ms and retry once, since the USB audio codec may need
-        time to switch to TX mode after PTT is keyed.  When both attempts fail
-        the error is raised as RuntimeError.
+        If the proactively-selected WASAPI device raises PortAudioError on the
+        first attempt, the reactive path tries WASAPI shared mode next, then
+        falls back to a 200 ms delay-retry on the same device.  When all three
+        attempts fail the error is raised as RuntimeError.
         """
         import numpy as np
 
@@ -1378,18 +1377,19 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 coord._play_audio(audio, device=0)
 
-        # Proactive WASAPI attempt + one delayed retry = 2 total
-        self.assertEqual(fake_sd.play.call_count, 2,
-                         "Expected proactive attempt + one retry after pause")
-        # A 200 ms sleep must have been inserted between the two attempts
+        # proactive WASAPI exclusive + WASAPI shared mode + delay-retry = 3
+        self.assertEqual(fake_sd.play.call_count, 3,
+                         "Expected proactive exclusive + shared mode + delay-retry")
+        # A 200 ms sleep must have been inserted before the final delay-retry
         self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
-                        "A ≥200 ms sleep must occur before the retry")
+                        "A ≥200 ms sleep must occur before the delay-retry")
 
     def test_proactive_swap_retry_succeeds_after_transient_error(self):
         """
         If the proactively-selected WASAPI device fails on the first attempt
-        (transient error) but succeeds on the retry after a 200 ms pause,
-        _play_audio must return without raising.
+        (transient error), the reactive path tries WASAPI shared mode next.
+        When shared mode succeeds, _play_audio returns without raising and
+        without inserting a 200 ms delay (shared mode is tried immediately).
         """
         import numpy as np
 
@@ -1413,7 +1413,7 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("stream error")
-            # Second attempt succeeds
+            # Second attempt (WASAPI shared mode) succeeds
 
         fake_sd.play.side_effect = _play_side_effect
         sleep_calls = []
@@ -1424,13 +1424,14 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
              mock.patch("ft8_tx.time.sleep",
                         side_effect=lambda t: sleep_calls.append(t)), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
-            # Must not raise — retry succeeds
+            # Must not raise — WASAPI shared mode retry succeeds
             coord._play_audio(audio, device=0)
 
         self.assertEqual(fake_sd.play.call_count, 2,
-                         "Proactive attempt + successful retry = 2 calls")
-        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
-                        "A ≥200 ms sleep must occur before the retry")
+                         "Proactive exclusive attempt + WASAPI shared mode = 2 calls")
+        # WASAPI shared mode is tried immediately (no sleep before it)
+        self.assertFalse(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                         "No 200 ms sleep should occur when shared mode succeeds")
 
     def test_proactive_swap_default_output_wdm_ks(self):
         """
@@ -1514,6 +1515,172 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
         self.assertEqual(play_calls[0], 8)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 15b  Proactive WDM-KS → WASAPI shared-mode fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlayAudioProactiveWdmKsSharedModeFallback(unittest.TestCase):
+    """
+    Verify that when the proactive WDM-KS swap selects a WASAPI device and
+    WASAPI exclusive mode fails, _play_audio retries in WASAPI shared mode
+    before falling back to MME or the delay-retry.
+
+    This covers the specific bug where WASAPI exclusive mode propagates the
+    same WdmSyncIoctl / KSPROPERTY_AUDIO_SAMPLING_FREQ error that caused the
+    original WDM-KS failure (because WASAPI exclusive still uses kernel-level
+    IOCTLs on some USB audio codecs).  WASAPI shared mode routes audio through
+    the Windows Audio Session API mixer and avoids those IOCTLs.
+    """
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def _make_fake_sd_wdm_ks(self):
+        """Return a fake sounddevice that looks like a WDM-KS device."""
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Audio CODEC",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+        fake_sd.wait = mock.MagicMock()
+        return fake_sd
+
+    def test_proactive_wasapi_exclusive_fails_shared_mode_succeeds(self):
+        """
+        When the proactive WASAPI swap selects device 5 and exclusive mode
+        fails, _play_audio must retry in shared mode (WasapiSettings) and
+        succeed — without inserting a 200 ms delay.
+
+        Play call sequence: exclusive (fails) → shared (succeeds).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_fake_sd_wdm_ks()
+
+        call_count = [0]
+
+        def _play(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError(
+                    "WdmSyncIoctl: DeviceIoControl GLE = 0x00000490 "
+                    "(prop_set = {8C134960-51AD-11CF-878A-94F801C10000}, prop_id = 10)"
+                )
+            # Second attempt (shared mode) succeeds
+
+        fake_sd.play.side_effect = _play
+        sleep_calls = []
+
+        # Proactive & reactive both return WASAPI device 5 (same device).
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)   # Must not raise
+
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "WASAPI exclusive (fails) + WASAPI shared (succeeds) = 2 calls")
+        # Shared mode is tried immediately — no 200 ms sleep needed
+        self.assertFalse(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                         "No delay sleep should occur when WASAPI shared mode succeeds")
+        # The second call must use extra_settings for WasapiSettings
+        second_call_kwargs = fake_sd.play.call_args_list[1][1]
+        self.assertIn("extra_settings", second_call_kwargs,
+                      "Shared-mode retry must pass WasapiSettings via extra_settings")
+        self.assertEqual(second_call_kwargs.get("device"), 5,
+                         "Shared-mode retry must use the same WASAPI device index")
+
+    def test_proactive_wasapi_shared_mode_fails_falls_through_to_delay_retry(self):
+        """
+        When proactive WASAPI exclusive fails AND WASAPI shared mode also fails,
+        the code falls through to the delay-retry on the same device.
+        If the delay-retry succeeds, _play_audio returns without raising.
+
+        Play call sequence: exclusive (fails) → shared (fails) → delay-retry (succeeds).
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_fake_sd_wdm_ks()
+
+        call_count = [0]
+
+        def _play(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                raise RuntimeError("WDM-KS / WASAPI error")
+            # Third attempt (delay-retry) succeeds
+
+        fake_sd.play.side_effect = _play
+        sleep_calls = []
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)   # Must not raise
+
+        self.assertEqual(fake_sd.play.call_count, 3,
+                         "exclusive + shared mode + delay-retry = 3 calls")
+        # The 200 ms sleep must occur before the delay-retry (3rd attempt)
+        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                        "A ≥200 ms sleep must precede the delay-retry")
+
+    def test_proactive_wasapi_shared_mode_not_tried_without_wasapi_settings(self):
+        """
+        When sounddevice lacks WasapiSettings (old version), the shared-mode
+        step is skipped and the code falls straight through to MME / delay-retry.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+
+        # MagicMock with spec: no WasapiSettings attribute
+        fake_sd = mock.MagicMock(
+            spec=["PortAudioError", "play", "wait", "default",
+                  "query_devices", "query_hostapis"]
+        )
+        fake_sd.PortAudioError = RuntimeError
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB CODEC",
+            "hostapi": 2,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        fake_sd.default.device = (0, 0)
+
+        call_count = [0]
+
+        def _play(data, samplerate, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("WDM-KS error")
+            # Second attempt (delay-retry) succeeds
+
+        fake_sd.play.side_effect = _play
+        fake_sd.wait = mock.MagicMock()
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep"), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=0)   # Must not raise
+
+        # No shared mode tried → exclusive (fails) + delay-retry (succeeds) = 2
+        self.assertEqual(fake_sd.play.call_count, 2,
+                         "Without WasapiSettings: exclusive + delay-retry = 2 calls")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
