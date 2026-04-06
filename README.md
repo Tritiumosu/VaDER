@@ -158,7 +158,7 @@ Yaesu ASCII CAT          FT8 decoder            Voice audio routing
 | Yaesu FT-991A | (or future supported radio) |
 | USB CAT cable | Standard USB-A to USB-B (or built-in USB on FT-991A) |
 
-On Windows, VaDER uses WASAPI for audio device enumeration. Linux and macOS should work but are less tested.
+On Windows, VaDER uses WASAPI for audio device enumeration. Linux and macOS should work but are untested.
 
 ---
 
