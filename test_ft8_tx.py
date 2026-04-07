@@ -2641,7 +2641,7 @@ class TestLogAudioDiagnostics(unittest.TestCase):
         # it can never crash the TX path.
         try:
             _log_audio_diagnostics(fake_sd, device_index=None)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # broad catch is intentional: any raise is a test failure
             self.fail(f"_log_audio_diagnostics raised unexpectedly: {exc}")
 
 
