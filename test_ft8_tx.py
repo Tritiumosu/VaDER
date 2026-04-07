@@ -1790,7 +1790,7 @@ class TestPlayAudioDirectWasapiSharedModeFallback(unittest.TestCase):
              mock.patch("ft8_tx.time.sleep"), \
              mock.patch("ft8_tx._stream_play", side_effect=_fake_stream) as mock_stream, \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
-            with self.assertRaises(RuntimeError, msg="RuntimeError expected when all attempts fail"):
+            with self.assertRaises(RuntimeError):
                 coord._play_audio(audio, device=5)
 
         # exclusive + shared mode + delay-retry = 3 attempts
