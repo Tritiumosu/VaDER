@@ -161,7 +161,7 @@ def _find_wasapi_output_device(sd, device_index: Optional[int]) -> Optional[int]
 
         # Collect WASAPI output devices
         all_devices = sd.query_devices()
-        if not isinstance(all_devices, list):
+        if isinstance(all_devices, dict):
             # Single-device systems return a dict — wrap it
             all_devices = [all_devices]
 
@@ -254,7 +254,7 @@ def _find_mme_output_device(sd, device_index: Optional[int]) -> Optional[int]:
 
         # Collect MME output devices
         all_devices = sd.query_devices()
-        if not isinstance(all_devices, list):
+        if isinstance(all_devices, dict):
             all_devices = [all_devices]
 
         mme_out_devices = [
@@ -407,8 +407,10 @@ def _log_audio_diagnostics(sd, device_index: Optional[int]) -> None:
         # --- Host APIs --------------------------------------------------------
         try:
             apis = sd.query_hostapis()
-            if not isinstance(apis, list):
+            if isinstance(apis, dict):
                 apis = [apis]
+            elif not isinstance(apis, list):
+                apis = list(apis)
             lines.append(f"  Host APIs ({len(apis)}):")
             for api_idx, api in enumerate(apis):
                 default_out = api.get("default_output_device", -1)
@@ -431,7 +433,7 @@ def _log_audio_diagnostics(sd, device_index: Optional[int]) -> None:
         # --- Output devices ---------------------------------------------------
         try:
             all_devs = sd.query_devices()
-            if not isinstance(all_devs, list):
+            if isinstance(all_devs, dict):
                 all_devs = [all_devs]
             out_devs = [d for d in all_devs if d.get("max_output_channels", 0) > 0]
             lines.append(f"  Output devices ({len(out_devs)}):")
