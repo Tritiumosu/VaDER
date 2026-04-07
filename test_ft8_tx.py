@@ -855,7 +855,12 @@ class TestFt8TxCoordinatorSlotIntegration(unittest.TestCase):
 # § 13  WASAPI fallback helper and _play_audio Windows fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from ft8_tx import _find_wasapi_output_device, _find_mme_output_device, _is_wdm_ks_device
+from ft8_tx import (
+    _find_wasapi_output_device,
+    _find_mme_output_device,
+    _is_wdm_ks_device,
+    _is_wasapi_device,
+)
 
 
 class TestFindWasapiOutputDevice(unittest.TestCase):
@@ -1169,6 +1174,77 @@ class TestIsWdmKsDevice(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# § 14b  _is_wasapi_device() helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestIsWasapiDevice(unittest.TestCase):
+    """Unit tests for _is_wasapi_device()."""
+
+    def _make_sd(self, device_hostapi: int, api_name: str):
+        """Return a minimal sounddevice stub for a given host API name."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"hostapi": device_hostapi, "name": "Test Device"}
+        sd.query_hostapis.return_value = {"name": api_name}
+        return sd
+
+    def test_returns_true_for_wasapi_device(self):
+        """A device under 'Windows WASAPI' host API is detected as WASAPI."""
+        sd = self._make_sd(device_hostapi=1, api_name="Windows WASAPI")
+        self.assertTrue(_is_wasapi_device(sd, 0))
+
+    def test_returns_true_for_wasapi_lowercase(self):
+        """Case-insensitive match: 'windows wasapi' is still WASAPI."""
+        sd = self._make_sd(device_hostapi=1, api_name="windows wasapi")
+        self.assertTrue(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_for_wdm_ks_device(self):
+        """A device under WDM-KS is NOT a WASAPI device."""
+        sd = self._make_sd(device_hostapi=2, api_name="Windows WDM-KS")
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_for_mme_device(self):
+        """A device under MME is NOT a WASAPI device."""
+        sd = self._make_sd(device_hostapi=0, api_name="MME")
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_for_directsound_device(self):
+        """A device under DirectSound is NOT a WASAPI device."""
+        sd = self._make_sd(device_hostapi=0, api_name="Windows DirectSound")
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_when_device_index_is_none(self):
+        """device_index=None returns False without calling sounddevice APIs."""
+        sd = mock.MagicMock()
+        self.assertFalse(_is_wasapi_device(sd, None))
+        sd.query_devices.assert_not_called()
+
+    def test_returns_false_when_device_index_is_negative(self):
+        """device_index < 0 returns False without calling sounddevice APIs."""
+        sd = mock.MagicMock()
+        self.assertFalse(_is_wasapi_device(sd, -1))
+        sd.query_devices.assert_not_called()
+
+    def test_returns_false_when_no_hostapi_key(self):
+        """If device info lacks 'hostapi' key, returns False gracefully."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"name": "Some Device"}
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_when_query_devices_raises(self):
+        """If query_devices raises, returns False without propagating."""
+        sd = mock.MagicMock()
+        sd.query_devices.side_effect = RuntimeError("no device")
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+    def test_returns_false_when_query_hostapis_raises(self):
+        """If query_hostapis raises, returns False without propagating."""
+        sd = mock.MagicMock()
+        sd.query_devices.return_value = {"hostapi": 0, "name": "Dev"}
+        sd.query_hostapis.side_effect = KeyError("unknown api")
+        self.assertFalse(_is_wasapi_device(sd, 0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # § 15  Proactive WDM-KS → WASAPI swap in _play_audio
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1434,7 +1510,9 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             coord._play_audio(audio, device=None)
 
         # Should have looked up the WASAPI counterpart for the default device (3)
-        mock_fwod.assert_called_once_with(fake_sd, 3)
+        # Note: _find_wasapi_output_device is called both in the proactive swap
+        # and in the pre-computation of the reactive fallback target.
+        mock_fwod.assert_any_call(fake_sd, 3)
         self.assertEqual(len(stream_calls), 1,
                          "_stream_play should be called exactly once")
         self.assertEqual(stream_calls[0], 7,
@@ -1472,7 +1550,9 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             coord._play_audio(audio, device=-1)
 
         # Resolved index should be sd.default.device[1] == 4
-        mock_fwod.assert_called_once_with(fake_sd, 4)
+        # Note: _find_wasapi_output_device is called both in the proactive swap
+        # and in the pre-computation of the reactive fallback target.
+        mock_fwod.assert_any_call(fake_sd, 4)
         self.assertEqual(stream_calls[0], 8)
 
 
@@ -1798,7 +1878,77 @@ class TestPlayAudioDirectWasapiSharedModeFallback(unittest.TestCase):
         self.assertEqual(mock_stream.call_count, 3,
                          "exclusive + shared mode + delay-retry = 3 attempts before giving up")
 
+    def test_wasapi_device_find_returns_none_shared_mode_still_tried(self):
+        """
+        Regression test for the field-observed failure where:
+          1. The user configures a WASAPI device (e.g., device 30).
+          2. The first play attempt fails with PaErrorCode -9999
+             (WdmSyncIoctl KSPROPERTY_AUDIO_SAMPLING_FREQ).
+          3. _find_wasapi_output_device returns None (simulating post-
+             PortAudioError sounddevice degraded query state).
+          4. Without the fix the elif condition 'wasapi_dev is not None and ...'
+             evaluated to False, WASAPI shared mode was skipped entirely, and
+             the code fell straight through to the useless 200 ms delay-retry
+             on the same failing device.
 
+        With the fix, _effective_is_wasapi is pre-computed (before the first
+        attempt when sounddevice is healthy) and acts as a backup condition:
+          elif hasattr(sd, "WasapiSettings") and (
+              wasapi_dev == effective_device or _effective_is_wasapi
+          ):
+        This ensures shared mode is tried even when wasapi_dev is None.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_wasapi_fake_sd()
+
+        call_count = [0]
+        stream_calls = []
+
+        def _fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            call_count[0] += 1
+            stream_calls.append({"device": device, "extra_settings": extra_settings})
+            if call_count[0] == 1:
+                raise RuntimeError(
+                    "WdmSyncIoctl: DeviceIoControl GLE = 0x00000490 "
+                    "(prop_set = {8C134960-51AD-11CF-878A-94F801C10000}, prop_id = 10)"
+                )
+            # Second attempt (WASAPI shared mode) succeeds
+
+        sleep_calls = []
+
+        # _find_wasapi_output_device returns None — simulates the post-error
+        # sounddevice degraded state that caused the observed field failure.
+        # _effective_is_wasapi must still trigger the shared-mode path because
+        # _is_wasapi_device is called before the first attempt.
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._is_wdm_ks_device", return_value=False), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx._is_wasapi_device", return_value=True), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=5)   # Must not raise
+
+        self.assertEqual(call_count[0], 2,
+                         "first WASAPI attempt (fails) + shared mode (succeeds) = 2 calls")
+        # Shared mode was tried (second call has WasapiSettings)
+        self.assertIsNotNone(stream_calls[1]["extra_settings"],
+                             "Shared-mode retry must pass WasapiSettings via extra_settings")
+        self.assertEqual(stream_calls[1]["device"], 5,
+                         "Shared-mode retry must use the same WASAPI device")
+        # No 200 ms delay should occur — shared mode succeeded immediately
+        self.assertFalse(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                         "No delay sleep should occur when WASAPI shared mode succeeds")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 16  _stream_play() unit tests
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestStreamPlay(unittest.TestCase):
     """
@@ -2236,9 +2386,14 @@ class TestPlayAudioMmeFallback(unittest.TestCase):
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=0)
 
-        self.assertEqual(len(mme_called), 0,
-                         "_find_mme_output_device must not be called when WASAPI is available")
         self.assertEqual(stream_calls[0], 5, "WASAPI device used (not MME)")
+        # Pre-computation calls _find_mme_output_device to prepare the reactive
+        # fallback target before the first stream attempt.  Verify it was called
+        # (confirming pre-computation ran) but that the MME device index (10) was
+        # never passed to _stream_play — WASAPI succeeded so MME was not needed.
+        self.assertGreater(len(mme_called), 0,
+                           "_find_mme_output_device must be called for pre-computation")
+        self.assertNotIn(10, stream_calls, "MME device must not be used when WASAPI succeeds")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
