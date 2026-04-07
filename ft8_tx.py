@@ -1074,15 +1074,15 @@ class Ft8TxCoordinator:
             # 3. Try MME as a last-resort alternative audio path.
             # 4. Delay-retry the same device once for transient errors.
             if platform.system() == "Windows":
-                wasapi_dev = _reactive_wasapi_dev
-                if wasapi_dev is not None and wasapi_dev != effective_device:
+                reactive_wasapi_dev = _reactive_wasapi_dev
+                if reactive_wasapi_dev is not None and reactive_wasapi_dev != effective_device:
                     logger.info(
                         "_play_audio: PortAudioError on device %s — retrying "
                         "with WASAPI device %d",
-                        effective_device, wasapi_dev,
+                        effective_device, reactive_wasapi_dev,
                     )
                     try:
-                        _stream_play(sd, play_audio_f32, play_fs, wasapi_dev)
+                        _stream_play(sd, play_audio_f32, play_fs, reactive_wasapi_dev)
                         return
                     except sd.PortAudioError as exc2:
                         logger.error(
@@ -1101,12 +1101,12 @@ class Ft8TxCoordinator:
                             logger.info(
                                 "_play_audio: retrying WASAPI device %d in "
                                 "shared mode",
-                                wasapi_dev,
+                                reactive_wasapi_dev,
                             )
                             try:
                                 ws = sd.WasapiSettings(exclusive=False)
                                 _stream_play(
-                                    sd, play_audio_f32, play_fs, wasapi_dev,
+                                    sd, play_audio_f32, play_fs, reactive_wasapi_dev,
                                     extra_settings=ws,
                                 )
                                 return
@@ -1120,7 +1120,7 @@ class Ft8TxCoordinator:
                         # Fall through to MME / delay-retry — all WASAPI
                         # attempts for this device failed.
                 elif hasattr(sd, "WasapiSettings") and (
-                    wasapi_dev == effective_device or _effective_is_wasapi
+                    reactive_wasapi_dev == effective_device or _effective_is_wasapi
                 ):
                     # The effective device is already WASAPI (either because the
                     # proactive WDM-KS swap selected it, or because the user
@@ -1133,8 +1133,8 @@ class Ft8TxCoordinator:
                     # and avoids that IOCTL entirely.  Try shared mode before
                     # falling back to MME or the delay-retry.
                     #
-                    # The combined condition (wasapi_dev == effective_device OR
-                    # _effective_is_wasapi) ensures shared mode is still tried
+                    # The combined condition (reactive_wasapi_dev == effective_device
+                    # OR _effective_is_wasapi) ensures shared mode is still tried
                     # even if _find_wasapi_output_device returned None after a
                     # PortAudioError degraded the sounddevice query state.
                     logger.info(
@@ -1166,15 +1166,15 @@ class Ft8TxCoordinator:
                 # (WASAPI or MME) is available, we fall back to a transient
                 # delay-retry on the same device below.
                 # _reactive_mme_dev is pre-computed before the first attempt.
-                mme_dev = _reactive_mme_dev
-                if mme_dev is not None and mme_dev != effective_device:
+                reactive_mme_dev = _reactive_mme_dev
+                if reactive_mme_dev is not None and reactive_mme_dev != effective_device:
                     logger.info(
                         "_play_audio: PortAudioError on device %s — retrying "
                         "with MME device %d",
-                        effective_device, mme_dev,
+                        effective_device, reactive_mme_dev,
                     )
                     try:
-                        _stream_play(sd, play_audio_f32, play_fs, mme_dev)
+                        _stream_play(sd, play_audio_f32, play_fs, reactive_mme_dev)
                         return
                     except sd.PortAudioError as exc_mme:
                         logger.error(
