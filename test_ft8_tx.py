@@ -1434,7 +1434,9 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             coord._play_audio(audio, device=None)
 
         # Should have looked up the WASAPI counterpart for the default device (3)
-        mock_fwod.assert_called_once_with(fake_sd, 3)
+        # Note: _find_wasapi_output_device is called both in the proactive swap
+        # and in the pre-computation of the reactive fallback target.
+        mock_fwod.assert_any_call(fake_sd, 3)
         self.assertEqual(len(stream_calls), 1,
                          "_stream_play should be called exactly once")
         self.assertEqual(stream_calls[0], 7,
@@ -1472,7 +1474,9 @@ class TestPlayAudioProactiveWdmKsSwap(unittest.TestCase):
             coord._play_audio(audio, device=-1)
 
         # Resolved index should be sd.default.device[1] == 4
-        mock_fwod.assert_called_once_with(fake_sd, 4)
+        # Note: _find_wasapi_output_device is called both in the proactive swap
+        # and in the pre-computation of the reactive fallback target.
+        mock_fwod.assert_any_call(fake_sd, 4)
         self.assertEqual(stream_calls[0], 8)
 
 
@@ -1798,9 +1802,75 @@ class TestPlayAudioDirectWasapiSharedModeFallback(unittest.TestCase):
         self.assertEqual(mock_stream.call_count, 3,
                          "exclusive + shared mode + delay-retry = 3 attempts before giving up")
 
+    def test_wasapi_device_find_returns_none_shared_mode_still_tried(self):
+        """
+        Regression test for the field-observed failure where:
+          1. The user configures a WASAPI device (e.g., device 30).
+          2. The first play attempt fails with PaErrorCode -9999
+             (WdmSyncIoctl KSPROPERTY_AUDIO_SAMPLING_FREQ).
+          3. _find_wasapi_output_device returns None (simulating post-
+             PortAudioError sounddevice degraded query state).
+          4. Without the fix the elif condition 'wasapi_dev is not None and ...'
+             evaluated to False, WASAPI shared mode was skipped entirely, and
+             the code fell straight through to the useless 200 ms delay-retry
+             on the same failing device.
+
+        With the fix, _effective_is_wasapi is pre-computed (before the first
+        attempt when sounddevice is healthy) and acts as a backup condition:
+          elif hasattr(sd, "WasapiSettings") and (
+              wasapi_dev == effective_device or _effective_is_wasapi
+          ):
+        This ensures shared mode is tried even when wasapi_dev is None.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_wasapi_fake_sd()
+
+        call_count = [0]
+        stream_calls = []
+
+        def _fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            call_count[0] += 1
+            stream_calls.append({"device": device, "extra_settings": extra_settings})
+            if call_count[0] == 1:
+                raise RuntimeError(
+                    "WdmSyncIoctl: DeviceIoControl GLE = 0x00000490 "
+                    "(prop_set = {8C134960-51AD-11CF-878A-94F801C10000}, prop_id = 10)"
+                )
+            # Second attempt (WASAPI shared mode) succeeds
+
+        sleep_calls = []
+
+        # _find_wasapi_output_device returns None — simulates the post-error
+        # sounddevice degraded state that caused the observed field failure.
+        # _effective_is_wasapi must still trigger the shared-mode path because
+        # _is_wasapi_device is called before the first attempt.
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._is_wdm_ks_device", return_value=False), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=None), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx._is_wasapi_device", return_value=True), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=5)   # Must not raise
+
+        self.assertEqual(call_count[0], 2,
+                         "first WASAPI attempt (fails) + shared mode (succeeds) = 2 calls")
+        # Shared mode was tried (second call has WasapiSettings)
+        self.assertIsNotNone(stream_calls[1]["extra_settings"],
+                             "Shared-mode retry must pass WasapiSettings via extra_settings")
+        self.assertEqual(stream_calls[1]["device"], 5,
+                         "Shared-mode retry must use the same WASAPI device")
+        # No 200 ms delay should occur — shared mode succeeded immediately
+        self.assertFalse(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                         "No delay sleep should occur when WASAPI shared mode succeeds")
 
 
-class TestStreamPlay(unittest.TestCase):
+
     """
     Unit tests for the _stream_play() module-level helper.
 
@@ -2236,9 +2306,12 @@ class TestPlayAudioMmeFallback(unittest.TestCase):
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=0)
 
-        self.assertEqual(len(mme_called), 0,
-                         "_find_mme_output_device must not be called when WASAPI is available")
         self.assertEqual(stream_calls[0], 5, "WASAPI device used (not MME)")
+        # With pre-computation, _find_mme_output_device is called to prepare
+        # the reactive fallback target even when WASAPI succeeds on the first
+        # attempt.  The important guarantee is that the MME device is never
+        # actually used for audio output when WASAPI works.
+        self.assertNotIn(10, stream_calls, "MME device must not be used when WASAPI succeeds")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
