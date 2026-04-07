@@ -2636,12 +2636,13 @@ class TestLogAudioDiagnostics(unittest.TestCase):
         fake_sd.query_devices.side_effect = RuntimeError("no PortAudio")
         fake_sd.default.device = (None, None)
 
-        # Should not raise; should still emit at least one INFO record
+        # Should not raise regardless of whether any log records are emitted.
+        # _log_audio_diagnostics is designed to absorb all internal failures so
+        # it can never crash the TX path.
         try:
-            with self.assertLogs("ft8_tx", level=logging.INFO) as log_ctx:
-                _log_audio_diagnostics(fake_sd, device_index=None)
-        except AssertionError:
-            pass  # assertLogs raises if no records emitted; that's also acceptable
+            _log_audio_diagnostics(fake_sd, device_index=None)
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"_log_audio_diagnostics raised unexpectedly: {exc}")
 
 
 if __name__ == "__main__":
