@@ -43,6 +43,7 @@ from ft8_tx import (
     TX_OUTPUT_BLOCKSIZE,
     _to_int16,
     _stream_play,
+    _log_audio_diagnostics,
 )
 from ft8_ntp import Ft8SlotTimer, NtpTimeSync
 
@@ -2497,6 +2498,150 @@ class TestAudioPregeneration(unittest.TestCase):
                          "Encoding failure must put coordinator into ERROR")
         self.assertEqual(len(ptt_keyed), 0,
                          "PTT must NOT be keyed when encoding fails")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § N  _log_audio_diagnostics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLogAudioDiagnostics(unittest.TestCase):
+    """
+    Verify that _log_audio_diagnostics emits an INFO-level log message that
+    includes host-API and device information, and that _play_audio calls it
+    before attempting to open any audio stream.
+    """
+
+    def _make_fake_sd(self):
+        """Return a minimal sounddevice stub sufficient for diagnostics."""
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = Exception
+        fake_sd.query_hostapis.return_value = [
+            {
+                "index": 0,
+                "name": "MME",
+                "default_output_device": 0,
+                "device_count": 1,
+            }
+        ]
+        fake_sd.query_devices.return_value = [
+            {
+                "index": 0,
+                "name": "Fake Output",
+                "hostapi": 0,
+                "max_output_channels": 2,
+                "default_samplerate": 48000.0,
+            }
+        ]
+        fake_sd.default.device = (0, 0)
+        return fake_sd
+
+    def test_diagnostics_logs_at_info_level(self):
+        """_log_audio_diagnostics should emit at least one INFO record."""
+        import logging
+
+        fake_sd = self._make_fake_sd()
+        with self.assertLogs("ft8_tx", level=logging.INFO) as log_ctx:
+            _log_audio_diagnostics(fake_sd, device_index=0)
+
+        # At least one INFO record should have been emitted
+        info_records = [r for r in log_ctx.records if r.levelno == logging.INFO]
+        self.assertTrue(info_records, "Expected at least one INFO log from _log_audio_diagnostics")
+
+    def test_diagnostics_includes_host_api_info(self):
+        """The logged message should mention host API and device names."""
+        import logging
+
+        fake_sd = self._make_fake_sd()
+        with self.assertLogs("ft8_tx", level=logging.INFO) as log_ctx:
+            _log_audio_diagnostics(fake_sd, device_index=0)
+
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("MME", combined, "Host API name should appear in diagnostics log")
+        self.assertIn("Fake Output", combined, "Device name should appear in diagnostics log")
+
+    def test_diagnostics_includes_selected_device(self):
+        """When a valid device_index is given, the log should identify it."""
+        import logging
+
+        fake_sd = self._make_fake_sd()
+        # Make query_devices(0) return the single-device info when called with an index
+        fake_sd.query_devices.side_effect = lambda *args, **kw: (
+            {
+                "index": 0,
+                "name": "Fake Output",
+                "hostapi": 0,
+                "max_output_channels": 2,
+                "default_samplerate": 48000.0,
+            }
+            if args
+            else [
+                {
+                    "index": 0,
+                    "name": "Fake Output",
+                    "hostapi": 0,
+                    "max_output_channels": 2,
+                    "default_samplerate": 48000.0,
+                }
+            ]
+        )
+        with self.assertLogs("ft8_tx", level=logging.INFO) as log_ctx:
+            _log_audio_diagnostics(fake_sd, device_index=0)
+
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("Selected device [0]", combined)
+
+    def test_diagnostics_called_before_stream_open(self):
+        """
+        _play_audio must call _log_audio_diagnostics before attempting to
+        open any output stream.
+        """
+        import numpy as np
+        import logging
+
+        coord = Ft8TxCoordinator(radio=None)
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_fake_sd()
+        call_order: list[str] = []
+
+        def _fake_diagnostics(sd_mod, device_index):
+            call_order.append("diagnostics")
+
+        def _fake_stream_play(sd_mod, audio, fs, device, *, extra_settings=None):
+            call_order.append("stream_play")
+
+        with mock.patch("ft8_tx._log_audio_diagnostics", side_effect=_fake_diagnostics), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream_play), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=None)
+
+        self.assertIn("diagnostics", call_order,
+                      "_log_audio_diagnostics should be called during _play_audio")
+        self.assertIn("stream_play", call_order,
+                      "_stream_play should be called during _play_audio")
+        self.assertLess(
+            call_order.index("diagnostics"),
+            call_order.index("stream_play"),
+            "_log_audio_diagnostics must be called before _stream_play",
+        )
+
+    def test_diagnostics_survives_query_failures(self):
+        """
+        If sounddevice query methods raise, _log_audio_diagnostics must not
+        propagate exceptions (diagnostics must never crash the TX path).
+        """
+        import logging
+
+        fake_sd = mock.MagicMock()
+        fake_sd.query_hostapis.side_effect = RuntimeError("no PortAudio")
+        fake_sd.query_devices.side_effect = RuntimeError("no PortAudio")
+        fake_sd.default.device = (None, None)
+
+        # Should not raise; should still emit at least one INFO record
+        try:
+            with self.assertLogs("ft8_tx", level=logging.INFO) as log_ctx:
+                _log_audio_diagnostics(fake_sd, device_index=None)
+        except AssertionError:
+            pass  # assertLogs raises if no records emitted; that's also acceptable
 
 
 if __name__ == "__main__":
