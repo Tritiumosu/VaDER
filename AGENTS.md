@@ -21,7 +21,7 @@
 - The radio polling cadence is deliberate: frequency ~250 ms, S-meter ~200 ms, mode/RF power ~1.5 s (`RadioGUI.radio_poll_thread()`) to reduce CAT contention.
 - `AppConfig` in `main.py` is the source of truth for persisted settings in `vader.cfg`; new persisted settings should follow its “safe defaults + property helpers + save_* methods” pattern.
 - Device selections are stored as both index and human label in `vader.cfg`; GUI code expects `-1` to mean “not configured”.
-- Windows audio behavior matters: several paths prefer WASAPI devices, and `ft8_tx.py` contains Windows-specific WASAPI/MME fallback logic for PortAudio host errors.
+- Windows audio behavior matters: GUI device lists now include both WASAPI and MME endpoints (WASAPI-first ordering), and `ft8_tx.py` contains Windows-specific WASAPI/MME fallback logic for PortAudio host errors.
 - CAT methods in `ft991a_cat.py` are thin command wrappers. Preserve the existing pattern: validate/clamp inputs, call `_execute("CMD...")`, and parse exact Yaesu response shapes.
 - FT8 message composition/validation belongs in `ft8_qso.py` / `ft8_tx.py`, not in the GUI. `main.py` should mostly validate, prefill, and dispatch.
 
@@ -36,6 +36,8 @@
 ## Developer workflows
 - Main app: `python main.py`
 - Live decoder without rig: `python live_test.py --list` or `python live_test.py --device <index> --fs 48000`
+- Live TX preflight (no RF TX): `python live_tx_preflight.py`
+- One-shot manual-gated FT8 TX helper: `python live_ft8_single_tx.py`
 - Offline decoder: `python -c "from ft8_decode import decode_wav; decode_wav('live_ft8_audio_traffic.wav')"`
 - Test suite: `pytest -v`
 - High-value focused tests while editing:

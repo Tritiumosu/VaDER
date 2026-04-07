@@ -10,6 +10,7 @@ Tests:
   5.  AppConfig.save_audio_output — persists and reloads correctly
   6.  AppConfig.save_audio — persists input device (regression check)
   7.  _enum_audio_devices — returns (list, list, str) tuple on any platform
+  7b. _enum_audio_devices — includes validated WASAPI/MME devices (WASAPI first)
   8.  SettingsDialog._parse_device_index — parses labelled index correctly
   9.  SettingsDialog._parse_device_index — returns -1 for malformed labels
   10. _save_ft8_log_to_file — creates log file and appends (not overwrites)
@@ -229,6 +230,34 @@ def test_enum_audio_devices_returns_tuple():
     assert isinstance(ins,  list), "inputs must be a list"
     assert isinstance(outs, list), "outputs must be a list"
     assert isinstance(err,  str),  "error must be a string"
+
+
+def test_enum_audio_devices_includes_wasapi_and_mme_outputs():
+    hostapis = [
+        {"name": "MME"},
+        {"name": "Windows WASAPI"},
+    ]
+    devices = [
+        {"name": "Sound to Radio", "hostapi": 0, "max_input_channels": 0, "max_output_channels": 2,
+         "default_samplerate": 44100.0},
+        {"name": "Sound to Radio", "hostapi": 1, "max_input_channels": 0, "max_output_channels": 2,
+         "default_samplerate": 48000.0},
+    ]
+
+    fake_sd = types.SimpleNamespace()
+    fake_sd.query_devices = lambda: devices
+    fake_sd.query_hostapis = lambda: hostapis
+    fake_sd.check_input_settings = lambda **kwargs: True
+    fake_sd.check_output_settings = lambda **kwargs: True
+
+    with mock.patch.dict(sys.modules, {"sounddevice": fake_sd}):
+        ins, outs, err = main._enum_audio_devices()
+
+    assert err == ""
+    assert ins == []
+    assert len(outs) == 2
+    assert outs[0][1].endswith("(WASAPI)")
+    assert outs[1][1].endswith("(MME)")
 
 
 def test_parse_device_index_valid():
@@ -551,6 +580,7 @@ if __name__ == "__main__":
     run("5.  AppConfig.save_audio_output",        test_appconfig_save_audio_output)
     run("6.  AppConfig — input/output independent", test_appconfig_save_audio_input_regression)
     run("7.  _enum_audio_devices — tuple return", test_enum_audio_devices_returns_tuple)
+    run("7b. _enum_audio_devices — WASAPI/MME list", test_enum_audio_devices_includes_wasapi_and_mme_outputs)
     run("8.  SettingsDialog._parse_device_index valid",   test_parse_device_index_valid)
     run("9.  SettingsDialog._parse_device_index invalid", test_parse_device_index_invalid)
     run("10. _save_ft8_log_to_file — appends",   test_ft8_log_appends)

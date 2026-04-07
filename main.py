@@ -292,7 +292,7 @@ class AppConfig:
 
 def _enum_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]], str]:
     """
-    Enumerate WASAPI audio input and output devices.
+    Enumerate preferred Windows audio input/output devices.
 
     Returns (input_devices, output_devices, error_message).
     Each device list contains (index, display_label) tuples.
@@ -321,46 +321,50 @@ def _enum_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]],
     def _norm(s: str) -> str:
         return " ".join((s or "").strip().lower().split())
 
+    preferred_apis = ("Windows WASAPI", "MME")
+
     inputs:   list[tuple[int, str]] = []
     outputs:  list[tuple[int, str]] = []
-    seen_in:  set[tuple[str, int]]  = set()
-    seen_out: set[tuple[str, int]]  = set()
+    seen_in:  set[tuple[str, int, str]]  = set()
+    seen_out: set[tuple[str, int, str]]  = set()
 
-    for idx, d in enumerate(devices):
-        if _hostapi_name(d) != "Windows WASAPI":
-            continue
+    for api_name in preferred_apis:
+        for idx, d in enumerate(devices):
+            if _hostapi_name(d) != api_name:
+                continue
 
-        name       = str(d.get("name", f"Device {idx}")).strip()
-        norm_name  = _norm(name)
-        default_fs = d.get("default_samplerate", None)
-        fs         = int(default_fs) if default_fs else 48_000
-        label      = f"{idx}: {name} (WASAPI)"
+            name       = str(d.get("name", f"Device {idx}")).strip()
+            norm_name  = _norm(name)
+            default_fs = d.get("default_samplerate", None)
+            fs         = int(default_fs) if default_fs else 48_000
+            api_short  = "WASAPI" if api_name == "Windows WASAPI" else "MME"
+            label      = f"{idx}: {name} ({api_short})"
 
-        max_in = int(d.get("max_input_channels", 0) or 0)
-        if max_in > 0:
-            key = (norm_name, max_in)
-            if key not in seen_in:
-                try:
-                    sd.check_input_settings(device=idx, channels=1, samplerate=fs)
-                    seen_in.add(key)
-                    inputs.append((idx, label))
-                except Exception:
-                    pass
+            max_in = int(d.get("max_input_channels", 0) or 0)
+            if max_in > 0:
+                key = (norm_name, max_in, api_short)
+                if key not in seen_in:
+                    try:
+                        sd.check_input_settings(device=idx, channels=1, samplerate=fs)
+                        seen_in.add(key)
+                        inputs.append((idx, label))
+                    except Exception:
+                        pass
 
-        max_out = int(d.get("max_output_channels", 0) or 0)
-        if max_out > 0:
-            key = (norm_name, max_out)
-            if key not in seen_out:
-                try:
-                    sd.check_output_settings(device=idx, channels=1, samplerate=fs)
-                    seen_out.add(key)
-                    outputs.append((idx, label))
-                except Exception:
-                    pass
+            max_out = int(d.get("max_output_channels", 0) or 0)
+            if max_out > 0:
+                key = (norm_name, max_out, api_short)
+                if key not in seen_out:
+                    try:
+                        sd.check_output_settings(device=idx, channels=1, samplerate=fs)
+                        seen_out.add(key)
+                        outputs.append((idx, label))
+                    except Exception:
+                        pass
 
     err = ""
     if not inputs and not outputs:
-        err = "No usable WASAPI audio devices found"
+        err = "No usable WASAPI/MME audio devices found"
     return inputs, outputs, err
 
 
@@ -621,7 +625,7 @@ class SettingsDialog:
         initial_tx_mic: str = "",
         initial_tx_radio_out: str = "",
     ) -> None:
-        """Query WASAPI devices and populate all four audio dropdowns."""
+        """Query preferred audio devices (WASAPI/MME) and populate all four dropdowns."""
         self._audio_status_lbl.config(text="Scanning audio devices...", fg="gray")
         self._win.update_idletasks()
 
@@ -680,7 +684,7 @@ class SettingsDialog:
 
     @staticmethod
     def _parse_device_index(label: str) -> int:
-        """Extract numeric device index from a '42: Device Name (WASAPI)' label."""
+        """Extract numeric device index from a '42: Device Name (API)' label."""
         try:
             return int((label or "").split(":", 1)[0].strip())
         except Exception:

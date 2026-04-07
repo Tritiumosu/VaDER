@@ -158,7 +158,7 @@ Yaesu ASCII CAT          FT8 decoder            Voice audio routing
 | Yaesu FT-991A | (or future supported radio) |
 | USB CAT cable | Standard USB-A to USB-B (or built-in USB on FT-991A) |
 
-On Windows, VaDER uses WASAPI for audio device enumeration. Linux and macOS should work but are untested.
+On Windows, VaDER now enumerates both WASAPI and MME devices (WASAPI first, MME fallback). Linux and macOS should work but are untested.
 
 ---
 
@@ -207,6 +207,21 @@ python live_test.py --device 3 --fs 48000
 # Decode an offline WAV file
 python -c "from ft8_decode import decode_wav; decode_wav('live_ft8_audio_traffic.wav')"
 ```
+
+### Live TX helper scripts (user-run, supervised)
+
+```bash
+# Preflight checks only (CAT + TX audio stream open), no RF transmission
+python live_tx_preflight.py
+
+# One-shot manual-gated FT8 TX helper (requires typed confirmation)
+python live_ft8_single_tx.py
+```
+
+On some Windows USB audio codecs, WASAPI/WDM-KS stream startup can fail with
+`PaErrorCode -9999` / `WdmSyncIoctl ... GLE=0x00000490`. If that occurs, select
+the matching MME TX output endpoint in Settings or set `[tx_audio]`
+`radio_out_device_index` to the MME device in `vader.cfg`.
 
 ---
 
@@ -292,7 +307,7 @@ Live hardware scripts/checks are post-test validation, not a CI gate.
 - **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains manual-assisted and operator-controlled.
 - **QSO/contact logging is incomplete** — The log UI panel exists but does not yet save contacts to an ADIF or other file format.
 - **Yaesu FT-991A only** — The CAT library is specific to this radio model. Other radios are a future goal.
-- **Windows-first audio** — WASAPI device enumeration is used in the GUI; Linux/macOS audio device discovery is less polished.
+- **Windows-first audio** — GUI enumeration and TX fallback paths are tuned for Windows host APIs (WASAPI first, MME fallback); Linux/macOS audio discovery is less polished.
 - **No rig database / memory management** — Memories and other menu-level settings are accessible via CAT but are not presented in the GUI yet.
 - **I am not a professional developer** — This project makes heavy use of AI assistance, and the code reflects an active learning process. Bugs and rough edges are expected.
 
