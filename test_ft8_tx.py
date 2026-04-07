@@ -2645,5 +2645,177 @@ class TestLogAudioDiagnostics(unittest.TestCase):
             self.fail(f"_log_audio_diagnostics raised unexpectedly: {exc}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 22  Regression: tuple/DeviceList return from query_hostapis / query_devices
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _FakeDeviceList:
+    """
+    Simulates sounddevice.DeviceList — iterable but *not* a subclass of list.
+
+    Real sounddevice versions may return a DeviceList that is not a plain list
+    subclass from query_devices().  Used by TestQueryApisTupleReturn to
+    reproduce the isinstance(x, list) bug.
+    """
+    def __init__(self, items):
+        self._items = items
+    def __iter__(self):
+        return iter(self._items)
+    def __len__(self):
+        return len(self._items)
+    def __getitem__(self, idx):
+        return self._items[idx]
+
+
+class TestQueryApisTupleReturn(unittest.TestCase):
+    """
+    Regression tests for the case where sounddevice returns a tuple from
+    query_hostapis() and a non-list iterable (DeviceList) from query_devices().
+
+    In the real sounddevice library:
+      - query_hostapis() (no index) returns a *tuple* of dicts.
+      - query_devices() (no index) returns a DeviceList which may not be a
+        plain list subclass.
+
+    The fix changes the isinstance(X, list) guards to isinstance(X, dict) so
+    that any iterable-of-dicts (tuple, DeviceList, etc.) is iterated directly
+    instead of being incorrectly wrapped in a single-element list.
+    """
+
+    def _make_sd_with_tuple_apis(self, host_apis, devices):
+        """Return a stub where query_hostapis() returns a *tuple* of dicts."""
+        sd = mock.MagicMock()
+        # Real sounddevice returns a tuple from query_hostapis() (no args)
+        sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else tuple(host_apis)
+        )
+        sd.query_devices.side_effect = lambda idx=None: (
+            devices[idx] if idx is not None else devices
+        )
+        sd.default.device = (0, 1)
+        return sd
+
+    def _make_sd_with_device_list(self, host_apis, devices):
+        """
+        Return a stub where query_devices() returns a _FakeDeviceList —
+        iterable but not a subclass of list.
+        """
+        sd = mock.MagicMock()
+        sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else host_apis
+        )
+        sd.query_devices.side_effect = lambda idx=None: (
+            devices[idx] if idx is not None else _FakeDeviceList(devices)
+        )
+        sd.default.device = (0, 1)
+        return sd
+
+    # -- _find_wasapi_output_device ---------------------------------------------
+
+    def test_wasapi_lookup_works_when_query_devices_returns_device_list(self):
+        """
+        _find_wasapi_output_device must work correctly when query_devices()
+        returns a DeviceList (non-list iterable) instead of a plain list.
+        """
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio CODEC", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "USB Audio CODEC", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd_with_device_list(host_apis, devices)
+        # Must find the WASAPI device (index 2), not return None
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    def test_wasapi_lookup_works_when_query_hostapis_returns_tuple(self):
+        """
+        _find_wasapi_output_device must work correctly when query_hostapis()
+        returns a *tuple* of dicts (the real sounddevice behaviour).
+        """
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "Speakers", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "Speakers", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd_with_tuple_apis(host_apis, devices)
+        result = _find_wasapi_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    # -- _find_mme_output_device -----------------------------------------------
+
+    def test_mme_lookup_works_when_query_devices_returns_device_list(self):
+        """
+        _find_mme_output_device must work correctly when query_devices()
+        returns a DeviceList (non-list iterable) instead of a plain list.
+        """
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "MME", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "USB Audio CODEC", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "USB Audio CODEC", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd_with_device_list(host_apis, devices)
+        result = _find_mme_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    def test_mme_lookup_works_when_query_hostapis_returns_tuple(self):
+        """
+        _find_mme_output_device must work correctly when query_hostapis()
+        returns a *tuple* of dicts.
+        """
+        host_apis = [
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "MME", "default_output_device": 2},
+        ]
+        devices = [
+            {"index": 0, "name": "Speakers", "hostapi": 0, "max_output_channels": 2},
+            {"index": 2, "name": "Speakers", "hostapi": 1, "max_output_channels": 2},
+        ]
+        sd = self._make_sd_with_tuple_apis(host_apis, devices)
+        result = _find_mme_output_device(sd, 0)
+        self.assertEqual(result, 2)
+
+    # -- _log_audio_diagnostics ------------------------------------------------
+
+    def test_diagnostics_survives_tuple_host_apis_and_device_list(self):
+        """
+        _log_audio_diagnostics must not raise when query_hostapis() returns a
+        tuple and query_devices() returns a DeviceList (non-list iterable).
+        Previously the isinstance(x, list) guard would wrap these in a list,
+        causing .get() to fail on the tuple/DeviceList element.
+        """
+        host_apis = (
+            {"index": 0, "name": "Windows WDM-KS", "default_output_device": 0},
+            {"index": 1, "name": "Windows WASAPI", "default_output_device": 2},
+        )
+        raw_devices = [
+            {"index": 0, "name": "USB Audio CODEC", "hostapi": 0,
+             "max_output_channels": 2, "default_samplerate": 48000.0},
+            {"index": 2, "name": "USB Audio CODEC", "hostapi": 1,
+             "max_output_channels": 2, "default_samplerate": 48000.0},
+        ]
+        fake_sd = mock.MagicMock()
+        fake_sd.query_hostapis.side_effect = lambda idx=None: (
+            host_apis[idx] if idx is not None else host_apis
+        )
+        fake_sd.query_devices.side_effect = lambda idx=None: (
+            raw_devices[idx] if idx is not None else _FakeDeviceList(raw_devices)
+        )
+        fake_sd.default.device = (0, 0)
+
+        try:
+            _log_audio_diagnostics(fake_sd, device_index=0)
+        except Exception as exc:
+            self.fail(f"_log_audio_diagnostics raised unexpectedly: {exc}")
+
+
 if __name__ == "__main__":
     unittest.main()
