@@ -1,4 +1,5 @@
 #! /usr/bin/python3
+import logging
 import time
 import csv
 import configparser
@@ -2273,6 +2274,11 @@ class RadioGUI:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s [%(name)s] %(message)s",
+    )
+
     # Load persisted settings from vader.cfg (created automatically on first save).
     _cfg = AppConfig()
 
