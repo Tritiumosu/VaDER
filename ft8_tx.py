@@ -114,6 +114,12 @@ TX_OUTPUT_SAMPLE_RATE: int = 48_000
 #: radio transceivers on Windows when using int16 with sd.play().
 TX_OUTPUT_DTYPE: str = "float32"
 
+#: OutputStream callback block size in frames.  100 ms at 48 kHz — matches
+#: the default ``block_size`` used by ``SoundCardAudioOutput`` in voice mode
+#: (see ``audio_passthrough.py``).  Keeping the value here in sync ensures
+#: consistent latency and buffer behaviour between voice and data TX paths.
+TX_OUTPUT_BLOCKSIZE: int = 4_800
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 0  Module-level audio helpers
@@ -434,9 +440,9 @@ def _stream_play(
 
     with sd.OutputStream(
         samplerate=fs,
-        blocksize=4_800,        # 100 ms at 48 kHz — same as SoundCardAudioOutput
+        blocksize=TX_OUTPUT_BLOCKSIZE,
         channels=1,
-        dtype="float32",
+        dtype=TX_OUTPUT_DTYPE,
         callback=_cb,
         finished_callback=done.set,
         **kw,

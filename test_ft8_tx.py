@@ -40,6 +40,7 @@ from ft8_tx import (
     USB_AUDIO_SWITCH_DELAY_S,
     TX_OUTPUT_SAMPLE_RATE,
     TX_OUTPUT_DTYPE,
+    TX_OUTPUT_BLOCKSIZE,
     _to_int16,
     _stream_play,
 )
@@ -595,7 +596,8 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
         fake_sd = self._make_fake_sd(device_samplerate=48_000)
         stream_calls, fake_stream = self._make_stream_recorder()
 
-        with mock.patch("ft8_tx._stream_play", side_effect=fake_stream), \
+        with mock.patch("ft8_tx.platform.system", return_value="Linux"), \
+             mock.patch("ft8_tx._stream_play", side_effect=fake_stream), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=None)
 
@@ -725,7 +727,8 @@ class TestTxAudioFixedFormat(unittest.TestCase):
         fake_sd.PortAudioError = Exception
         fake_sd.default.device = (0, 0)
 
-        with mock.patch("ft8_tx._stream_play"), \
+        with mock.patch("ft8_tx.platform.system", return_value="Linux"), \
+             mock.patch("ft8_tx._stream_play"), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=1)
 
@@ -1684,9 +1687,11 @@ class TestStreamPlay(unittest.TestCase):
 
         self.assertEqual(len(stream_opens), 1)
         kw = stream_opens[0]
-        self.assertEqual(kw.get("dtype"), "float32",
-                         "OutputStream must use float32 (same as voice mode)")
+        self.assertEqual(kw.get("dtype"), TX_OUTPUT_DTYPE,
+                         "OutputStream must use TX_OUTPUT_DTYPE (same as voice mode)")
         self.assertEqual(kw.get("samplerate"), TX_OUTPUT_SAMPLE_RATE)
+        self.assertEqual(kw.get("blocksize"), TX_OUTPUT_BLOCKSIZE,
+                         "OutputStream must use TX_OUTPUT_BLOCKSIZE")
         self.assertEqual(kw.get("channels"), 1)
 
     def test_passes_device_kwarg_when_device_valid(self):
