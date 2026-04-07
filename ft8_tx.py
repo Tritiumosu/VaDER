@@ -392,6 +392,98 @@ def _to_int16(audio: "np.ndarray") -> "np.ndarray":
     return (clipped * 32767.0).astype(np.int16)
 
 
+def _log_audio_diagnostics(sd, device_index: Optional[int]) -> None:
+    """
+    Log detailed audio hardware/driver information to help diagnose TX failures.
+
+    Emits an INFO-level summary of every available PortAudio host API and all
+    output-capable devices so that driver/firmware issues can be identified from
+    the log alone, without needing live hardware access.  Called at the start of
+    each ``_play_audio`` invocation.
+    """
+    try:
+        lines: list[str] = ["_play_audio: audio diagnostics ──────────────────────"]
+
+        # --- Host APIs --------------------------------------------------------
+        try:
+            apis = sd.query_hostapis()
+            if not isinstance(apis, list):
+                apis = [apis]
+            lines.append(f"  Host APIs ({len(apis)}):")
+            for api_idx, api in enumerate(apis):
+                default_out = api.get("default_output_device", -1)
+                host_api_index = api.get("index", api_idx)
+                devices = api.get("devices", [])
+                if "device_count" in api:
+                    device_count = api.get("device_count", "?")
+                elif isinstance(devices, (list, tuple)):
+                    device_count = len(devices)
+                else:
+                    device_count = "?"
+                lines.append(
+                    f"    [{host_api_index}] {api.get('name', '?')} "
+                    f"(default_out={default_out}, "
+                    f"devices={device_count})"
+                )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  Host APIs: unavailable ({exc})")
+
+        # --- Output devices ---------------------------------------------------
+        try:
+            all_devs = sd.query_devices()
+            if not isinstance(all_devs, list):
+                all_devs = [all_devs]
+            out_devs = [d for d in all_devs if d.get("max_output_channels", 0) > 0]
+            lines.append(f"  Output devices ({len(out_devs)}):")
+            for d in out_devs:
+                lines.append(
+                    f"    [{d.get('index', '?')}] {d.get('name', '?')} "
+                    f"(hostapi={d.get('hostapi', '?')}, "
+                    f"ch={d.get('max_output_channels', '?')}, "
+                    f"sr={d.get('default_samplerate', '?')} Hz)"
+                )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  Output devices: unavailable ({exc})")
+
+        # --- Selected device --------------------------------------------------
+        if device_index is not None and device_index >= 0:
+            try:
+                info = sd.query_devices(device_index)
+                host_api_name = "?"
+                try:
+                    api_info = sd.query_hostapis(info.get("hostapi"))
+                    host_api_name = api_info.get("name", "?")
+                except Exception:  # noqa: BLE001
+                    pass
+                lines.append(
+                    f"  Selected device [{device_index}]: {info.get('name', '?')} "
+                    f"(api={host_api_name}, "
+                    f"ch_out={info.get('max_output_channels', '?')}, "
+                    f"sr={info.get('default_samplerate', '?')} Hz)"
+                )
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"  Selected device [{device_index}]: query failed ({exc})")
+        else:
+            lines.append(f"  Selected device: {device_index!r} (system default)")
+
+        # --- System default output --------------------------------------------
+        try:
+            default_out_idx = sd.default.device[1]
+            if default_out_idx is not None and default_out_idx >= 0:
+                dinfo = sd.query_devices(default_out_idx)
+                lines.append(
+                    f"  System default output [{default_out_idx}]: "
+                    f"{dinfo.get('name', '?')}"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        lines.append("  ──────────────────────────────────────────────────────")
+        logger.info("\n".join(lines))
+    except Exception:  # noqa: BLE001 — diagnostics must never crash the TX path
+        pass
+
+
 def _stream_play(
     sd,
     audio_f32: "np.ndarray",
@@ -834,6 +926,10 @@ class Ft8TxCoordinator:
             )
             return
 
+        # Log hardware/driver diagnostics before any stream is opened so that
+        # audio failures can be diagnosed from the log alone.
+        _log_audio_diagnostics(sd, device)
+
         # ── On Windows, proactively swap WDM-KS device for WASAPI ───────────
         # WDM-KS requires kernel-level exclusive access and frequently fails
         # with KSPROPERTY_AUDIO_SAMPLING_FREQ (prop_id=10) / ERROR_NOT_FOUND
@@ -905,10 +1001,12 @@ class Ft8TxCoordinator:
             # 1. If a different WASAPI device is available (reactive swap not
             #    yet tried), attempt it in sounddevice's default WASAPI mode
             #    (exclusive), then retry in shared mode if that also fails.
-            # 2. If the proactive WDM-KS swap already selected this WASAPI
-            #    device (_proactive_swap_occurred, wasapi_dev == effective_device),
-            #    the first WASAPI attempt already failed; go straight to shared
-            #    mode to bypass the KSPROPERTY_AUDIO_SAMPLING_FREQ IOCTL.
+            # 2. If the effective device is already WASAPI (proactive swap or
+            #    user-selected) and the first play attempt failed, go straight
+            #    to shared mode to bypass the KSPROPERTY_AUDIO_SAMPLING_FREQ
+            #    IOCTL.  This covers both the proactive-swap case and the case
+            #    where the user directly configured a WASAPI device that fails
+            #    in exclusive mode.
             # 3. Try MME as a last-resort alternative audio path.
             # 4. Delay-retry the same device once for transient errors.
             if platform.system() == "Windows":
@@ -957,25 +1055,19 @@ class Ft8TxCoordinator:
                                 # Fall through to MME / delay-retry below.
                         # Fall through to MME / delay-retry — all WASAPI
                         # attempts for this device failed.
-                elif _proactive_swap_occurred and wasapi_dev is not None and hasattr(sd, "WasapiSettings"):
-                    # NOTE: `_proactive_swap_occurred` guards this branch so
-                    # it only fires when a WDM-KS device was detected and
-                    # swapped to WASAPI proactively.  Without this guard the
-                    # branch would also fire when the user directly selected a
-                    # WASAPI device (wasapi_dev == effective_device but no swap
-                    # occurred), resulting in an unexpected extra play attempt
-                    # and a misleading log message.
-                    #
-                    # The proactive WDM-KS swap selected this WASAPI device and
-                    # the first play attempt (sounddevice's default WASAPI mode,
-                    # which is exclusive) just failed.  The default WASAPI mode
-                    # can still trigger the same KSPROPERTY_AUDIO_SAMPLING_FREQ
-                    # IOCTL (prop_id=10) as WDM-KS on some USB audio codecs.
-                    # WASAPI shared mode routes audio through the Windows Audio
-                    # Session API mixer and avoids that IOCTL entirely.  Try
-                    # shared mode before falling back to MME or the delay-retry.
+                elif wasapi_dev is not None and hasattr(sd, "WasapiSettings"):
+                    # The effective device is already WASAPI (either because the
+                    # proactive WDM-KS swap selected it, or because the user
+                    # configured a WASAPI device directly) but the first play
+                    # attempt (sounddevice's default WASAPI exclusive mode) just
+                    # failed.  WASAPI exclusive mode can still trigger the same
+                    # KSPROPERTY_AUDIO_SAMPLING_FREQ IOCTL (prop_id=10) as
+                    # WDM-KS on some USB audio codecs.  WASAPI shared mode
+                    # routes audio through the Windows Audio Session API mixer
+                    # and avoids that IOCTL entirely.  Try shared mode before
+                    # falling back to MME or the delay-retry.
                     logger.info(
-                        "_play_audio: proactive WASAPI device %d also failed "
+                        "_play_audio: WASAPI device %d failed in exclusive mode "
                         "— retrying in shared mode",
                         wasapi_dev,
                     )

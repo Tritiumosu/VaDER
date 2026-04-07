@@ -587,7 +587,8 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
     def test_play_audio_uses_default_output_when_device_none(self):
         """
         When device is None, _play_audio should still call _stream_play at
-        TX_OUTPUT_SAMPLE_RATE with float32 audio without querying the device.
+        TX_OUTPUT_SAMPLE_RATE with float32 audio without querying the device
+        for its native sample rate.
         """
         import numpy as np
 
@@ -601,8 +602,9 @@ class TestFt8TxCoordinatorAudioPlay(unittest.TestCase):
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=None)
 
-        # Device query is no longer needed — sd.query_devices should NOT be called
-        fake_sd.query_devices.assert_not_called()
+        # _stream_play must be called with the fixed TX_OUTPUT_SAMPLE_RATE,
+        # regardless of what query_devices returns — the rate is not dynamically
+        # obtained from the device (only diagnostic logging calls query_devices).
         self.assertEqual(stream_calls[0]["fs"], TX_OUTPUT_SAMPLE_RATE)
         self.assertEqual(stream_calls[0]["audio"].dtype, np.float32)
 
@@ -715,8 +717,10 @@ class TestTxAudioFixedFormat(unittest.TestCase):
 
     def test_device_native_rate_not_queried(self):
         """
-        _play_audio must NOT call sd.query_devices to determine the output
-        rate — the rate is fixed at TX_OUTPUT_SAMPLE_RATE.
+        _play_audio must NOT use sd.query_devices to determine the output
+        rate — the rate is fixed at TX_OUTPUT_SAMPLE_RATE.  Diagnostic logging
+        may call query_devices for driver info, but the sample rate passed to
+        _stream_play must always be TX_OUTPUT_SAMPLE_RATE regardless.
         """
         import numpy as np
 
@@ -727,12 +731,19 @@ class TestTxAudioFixedFormat(unittest.TestCase):
         fake_sd.PortAudioError = Exception
         fake_sd.default.device = (0, 0)
 
+        stream_calls = []
+
+        def fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            stream_calls.append({"fs": fs, "audio": aud})
+
         with mock.patch("ft8_tx.platform.system", return_value="Linux"), \
-             mock.patch("ft8_tx._stream_play"), \
+             mock.patch("ft8_tx._stream_play", side_effect=fake_stream), \
              mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
             coord._play_audio(audio, device=1)
 
-        fake_sd.query_devices.assert_not_called()
+        self.assertEqual(len(stream_calls), 1)
+        self.assertEqual(stream_calls[0]["fs"], TX_OUTPUT_SAMPLE_RATE,
+                         "_stream_play must always receive TX_OUTPUT_SAMPLE_RATE")
 
     def test_play_audio_raises_if_resample_fails(self):
         """
@@ -1632,8 +1643,161 @@ class TestPlayAudioProactiveWdmKsSharedModeFallback(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 15c  _stream_play() unit tests
+# § 15d  WASAPI shared-mode fallback for directly-selected WASAPI device
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlayAudioDirectWasapiSharedModeFallback(unittest.TestCase):
+    """
+    Verify that when the user directly configures a WASAPI device (no WDM-KS
+    proactive swap) and the first play attempt fails with a PortAudioError,
+    _play_audio retries in WASAPI shared mode before falling back to
+    MME or the delay-retry.
+
+    This reproduces the specific bug where a user-selected WASAPI device fails
+    with 'WdmSyncIoctl: DeviceIoControl GLE = 0x00000490 (prop_id = 10)'
+    (PaErrorCode -9999) — the same KSPROPERTY_AUDIO_SAMPLING_FREQ error that
+    occurs on WDM-KS devices.  Without the fix, the code skipped shared-mode
+    and went straight to the useless 200 ms delay-retry on the same device,
+    which also failed, producing a RuntimeError.
+    """
+
+    def _make_coord(self):
+        return Ft8TxCoordinator(radio=None)
+
+    def _make_wasapi_fake_sd(self):
+        """Return a fake sounddevice that looks like a WASAPI device."""
+        fake_sd = mock.MagicMock()
+        fake_sd.PortAudioError = RuntimeError
+        # query_devices returns WASAPI device info
+        fake_sd.query_devices.return_value = {
+            "default_samplerate": 48_000,
+            "name": "USB Audio CODEC",
+            "hostapi": 1,
+        }
+        fake_sd.query_hostapis.return_value = {"name": "Windows WASAPI"}
+        fake_sd.default.device = (0, 5)
+        return fake_sd
+
+    def test_direct_wasapi_exclusive_fails_shared_mode_tried(self):
+        """
+        When the user configures a WASAPI device directly (no WDM-KS proactive
+        swap), and the first play attempt fails, _play_audio must retry in
+        WASAPI shared mode before the delay-retry.
+
+        This is the core bug: the old code required _proactive_swap_occurred to
+        be True before trying shared mode; a directly-selected WASAPI device
+        that fails in exclusive mode would skip shared mode and go straight to
+        the useless delay-retry.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_wasapi_fake_sd()
+
+        call_count = [0]
+        stream_calls = []
+
+        def _fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            call_count[0] += 1
+            stream_calls.append({"device": device, "extra_settings": extra_settings})
+            if call_count[0] == 1:
+                raise RuntimeError(
+                    "WdmSyncIoctl: DeviceIoControl GLE = 0x00000490 "
+                    "(prop_set = {8C134960-51AD-11CF-878A-94F801C10000}, prop_id = 10)"
+                )
+            # Second attempt (WASAPI shared mode) succeeds
+
+        sleep_calls = []
+
+        # _find_wasapi_output_device returns the SAME device (already WASAPI),
+        # so _proactive_swap_occurred is False and wasapi_dev == effective_device
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._is_wdm_ks_device", return_value=False), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=5)   # Must not raise
+
+        self.assertEqual(call_count[0], 2,
+                         "first WASAPI attempt (fails) + WASAPI shared mode (succeeds) = 2 calls")
+        # Shared mode must be tried immediately — no 200 ms delay
+        self.assertFalse(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                         "No delay sleep should occur when WASAPI shared mode succeeds")
+        # The second call must use WasapiSettings (exclusive=False)
+        self.assertIsNotNone(stream_calls[1]["extra_settings"],
+                             "Shared-mode retry must pass WasapiSettings via extra_settings")
+        self.assertEqual(stream_calls[1]["device"], 5,
+                         "Shared-mode retry must use the same WASAPI device index")
+
+    def test_direct_wasapi_shared_mode_fails_falls_to_delay_retry(self):
+        """
+        When the directly-selected WASAPI device fails in both exclusive AND
+        shared mode, the code falls through to the 200 ms delay-retry.
+        If delay-retry succeeds, _play_audio returns without raising.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_wasapi_fake_sd()
+
+        call_count = [0]
+
+        def _fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                raise RuntimeError("WDM-KS / WASAPI error")
+            # Third attempt (delay-retry) succeeds
+
+        sleep_calls = []
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._is_wdm_ks_device", return_value=False), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep",
+                        side_effect=lambda t: sleep_calls.append(t)), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream), \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            coord._play_audio(audio, device=5)   # Must not raise
+
+        self.assertEqual(call_count[0], 3,
+                         "first WASAPI attempt + shared mode + delay-retry = 3 calls")
+        self.assertTrue(any(t >= USB_AUDIO_SWITCH_DELAY_S for t in sleep_calls),
+                        "A ≥200 ms sleep must precede the delay-retry")
+
+    def test_direct_wasapi_all_fail_raises_runtime_error(self):
+        """
+        When all attempts for a directly-selected WASAPI device fail
+        (exclusive, shared mode, delay-retry), RuntimeError is raised.
+        """
+        import numpy as np
+
+        coord = self._make_coord()
+        audio = np.zeros(100, dtype=np.float32)
+        fake_sd = self._make_wasapi_fake_sd()
+
+        def _fake_stream(sd_mod, aud, fs, device, *, extra_settings=None):
+            raise RuntimeError("WDM-KS / WASAPI error")
+
+        with mock.patch("ft8_tx.platform.system", return_value="Windows"), \
+             mock.patch("ft8_tx._is_wdm_ks_device", return_value=False), \
+             mock.patch("ft8_tx._find_wasapi_output_device", return_value=5), \
+             mock.patch("ft8_tx._find_mme_output_device", return_value=None), \
+             mock.patch("ft8_tx.time.sleep"), \
+             mock.patch("ft8_tx._stream_play", side_effect=_fake_stream) as mock_stream, \
+             mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            with self.assertRaises(RuntimeError):
+                coord._play_audio(audio, device=5)
+
+        # exclusive + shared mode + delay-retry = 3 attempts
+        self.assertEqual(mock_stream.call_count, 3,
+                         "exclusive + shared mode + delay-retry = 3 attempts before giving up")
+
+
 
 class TestStreamPlay(unittest.TestCase):
     """
