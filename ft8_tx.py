@@ -410,12 +410,20 @@ def _log_audio_diagnostics(sd, device_index: Optional[int]) -> None:
             if not isinstance(apis, list):
                 apis = [apis]
             lines.append(f"  Host APIs ({len(apis)}):")
-            for api in apis:
+            for api_idx, api in enumerate(apis):
                 default_out = api.get("default_output_device", -1)
+                host_api_index = api.get("index", api_idx)
+                devices = api.get("devices", [])
+                if "device_count" in api:
+                    device_count = api.get("device_count", "?")
+                elif isinstance(devices, (list, tuple)):
+                    device_count = len(devices)
+                else:
+                    device_count = "?"
                 lines.append(
-                    f"    [{api.get('index', '?')}] {api.get('name', '?')} "
+                    f"    [{host_api_index}] {api.get('name', '?')} "
                     f"(default_out={default_out}, "
-                    f"devices={api.get('device_count', '?')})"
+                    f"devices={device_count})"
                 )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"  Host APIs: unavailable ({exc})")
