@@ -107,10 +107,18 @@ USB_AUDIO_SWITCH_DELAY_S: float = 0.20
 #: error that occurs when 12 000 Hz (FT8_FS) is requested directly.
 TX_OUTPUT_SAMPLE_RATE: int = 48_000
 
-#: Bit depth (dtype) sent to the soundcard.  16-bit PCM is the lowest common
-#: denominator for USB audio class devices and avoids driver-level format
-#: conversion that can introduce latency or fail outright on some hardware.
-TX_OUTPUT_DTYPE: str = "int16"
+#: Sample format sent to the soundcard.  float32 matches the format used by
+#: SoundCardAudioOutput / AudioTxCapture in voice mode and avoids the WDM-KS
+#: kernel-level KSPROPERTY_AUDIO_SAMPLING_FREQ IOCTL (prop_id=10) that causes
+#: paUnanticipatedHostError (PaErrorCode -9999) on USB audio codecs in ham
+#: radio transceivers on Windows when using int16 with sd.play().
+TX_OUTPUT_DTYPE: str = "float32"
+
+#: OutputStream callback block size in frames.  100 ms at 48 kHz — matches
+#: the default ``block_size`` used by ``SoundCardAudioOutput`` in voice mode
+#: (see ``audio_passthrough.py``).  Keeping the value here in sync ensures
+#: consistent latency and buffer behaviour between voice and data TX paths.
+TX_OUTPUT_BLOCKSIZE: int = 4_800
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -382,6 +390,64 @@ def _to_int16(audio: "np.ndarray") -> "np.ndarray":
     """
     clipped = np.clip(audio, -1.0, 1.0)
     return (clipped * 32767.0).astype(np.int16)
+
+
+def _stream_play(
+    sd,
+    audio_f32: "np.ndarray",
+    fs: int,
+    device: Optional[int],
+    *,
+    extra_settings=None,
+) -> None:
+    """
+    Play ``audio_f32`` (float32 mono array at *fs* Hz) through *device*,
+    blocking until playback completes.
+
+    Uses ``sd.OutputStream`` with an audio callback — the same technique as
+    ``SoundCardAudioOutput`` / ``AudioTxCapture`` in voice mode (see
+    ``audio_passthrough.py``).  Keeping the audio in float32 and using a
+    callback-driven stream avoids the WDM-KS kernel-level
+    ``KSPROPERTY_AUDIO_SAMPLING_FREQ`` IOCTL (prop_id=10) that causes
+    ``paUnanticipatedHostError`` (PaErrorCode -9999) on USB audio codecs
+    used in ham radio transceivers on Windows.
+
+    Raises ``sd.PortAudioError`` (propagated from ``sd.OutputStream``) if the
+    stream cannot be started or encounters a fatal error.
+    """
+    samples = np.asarray(audio_f32, dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples.reshape(-1, 1)   # (n_frames, 1) for mono OutputStream
+
+    pos = 0
+    done = threading.Event()
+
+    def _cb(outdata, frames, time_info, status):
+        nonlocal pos
+        remaining = len(samples) - pos
+        if remaining <= 0:
+            outdata[:] = 0.0
+            raise sd.CallbackStop()
+        n = min(remaining, frames)
+        outdata[:n] = samples[pos : pos + n]
+        if n < frames:
+            outdata[n:] = 0.0
+        pos += n
+
+    kw: dict = {} if (device is None or device < 0) else {"device": device}
+    if extra_settings is not None:
+        kw["extra_settings"] = extra_settings
+
+    with sd.OutputStream(
+        samplerate=fs,
+        blocksize=TX_OUTPUT_BLOCKSIZE,
+        channels=1,
+        dtype=TX_OUTPUT_DTYPE,
+        callback=_cb,
+        finished_callback=done.set,
+        **kw,
+    ):
+        done.wait()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -751,12 +817,14 @@ class Ft8TxCoordinator:
         If sounddevice is unavailable, logs a warning and returns immediately
         (this allows unit tests to run without a soundcard).
 
-        The audio is always resampled to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and
-        converted to TX_OUTPUT_DTYPE (int16, 16-bit PCM) before opening the
-        stream.  This fixed format is universally supported by USB audio codecs
-        used in ham radio transceivers and avoids ``paInvalidSampleRate``
-        (PaErrorCode -9997) errors that occur when the FT8 native rate
-        (12 000 Hz) or float32 data are passed directly.
+        The audio is always resampled to TX_OUTPUT_SAMPLE_RATE (48 000 Hz)
+        and played as float32 using ``sd.OutputStream`` with a callback — the
+        same technique as ``SoundCardAudioOutput`` / ``AudioTxCapture`` in
+        voice mode (see ``audio_passthrough.py``).  Using a callback-driven
+        stream avoids the WDM-KS kernel-level
+        ``KSPROPERTY_AUDIO_SAMPLING_FREQ`` IOCTL (prop_id=10) that causes
+        ``paUnanticipatedHostError`` (PaErrorCode -9999) when opening the
+        stream on USB audio codecs used in ham radio transceivers on Windows.
         """
         try:
             import sounddevice as sd  # local import — optional dependency
@@ -809,17 +877,10 @@ class Ft8TxCoordinator:
                     _proactive_swap_occurred = True
                     effective_device = alt_candidate
 
-        dev_kwarg: dict = (
-            {} if (effective_device is None or effective_device < 0)
-            else {"device": effective_device}
-        )
-
-        # ── Prepare fixed-format audio buffer ─────────────────────────────
-        # Always resample to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and convert to
-        # TX_OUTPUT_DTYPE (int16).  This fixed format is universally supported
-        # by USB audio codecs and avoids driver-level format-negotiation errors
-        # (paInvalidSampleRate / paUnanticipatedHostError) that occur when the
-        # FT8 native rate (12 000 Hz) or float32 data are passed directly.
+        # ── Prepare float32 audio buffer at TX_OUTPUT_SAMPLE_RATE ───────────
+        # Always resample to TX_OUTPUT_SAMPLE_RATE (48 000 Hz) and keep as
+        # float32.  Using float32 with sd.OutputStream (same as voice-mode TX
+        # via SoundCardAudioOutput) avoids WDM-KS format-negotiation errors.
         play_audio_f32, play_fs = _resample_audio(audio, FT8_FS, TX_OUTPUT_SAMPLE_RATE)
         if play_fs != TX_OUTPUT_SAMPLE_RATE:
             logger.error(
@@ -831,23 +892,19 @@ class Ft8TxCoordinator:
                 f"_play_audio requires {TX_OUTPUT_SAMPLE_RATE} Hz output, "
                 f"but resampler returned {play_fs} Hz"
             )
-        play_audio = _to_int16(play_audio_f32)
         logger.debug(
             "_play_audio: prepared %d samples at %d Hz, dtype=%s for device %s",
-            len(play_audio), play_fs, TX_OUTPUT_DTYPE, effective_device,
+            len(play_audio_f32), play_fs, TX_OUTPUT_DTYPE, effective_device,
         )
 
         try:
-            sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
-            sd.wait()
+            _stream_play(sd, play_audio_f32, play_fs, effective_device)
         except sd.PortAudioError as exc:
             logger.error("sounddevice PortAudio error during TX: %s", exc)
             # Reactive fallback chain (Windows only):
             # 1. If a different WASAPI device is available (reactive swap not
             #    yet tried), attempt it in sounddevice's default WASAPI mode
             #    (exclusive), then retry in shared mode if that also fails.
-            #    sounddevice does not pass WasapiSettings here, so the first
-            #    attempt uses PortAudio's WASAPI default (exclusive mode).
             # 2. If the proactive WDM-KS swap already selected this WASAPI
             #    device (_proactive_swap_occurred, wasapi_dev == effective_device),
             #    the first WASAPI attempt already failed; go straight to shared
@@ -862,15 +919,8 @@ class Ft8TxCoordinator:
                         "with WASAPI device %d",
                         effective_device, wasapi_dev,
                     )
-                    # play_audio is already at TX_OUTPUT_SAMPLE_RATE / int16;
-                    # no re-resampling needed for the fallback device.
                     try:
-                        sd.play(
-                            play_audio,
-                            samplerate=play_fs,
-                            device=wasapi_dev,
-                        )
-                        sd.wait()
+                        _stream_play(sd, play_audio_f32, play_fs, wasapi_dev)
                         return
                     except sd.PortAudioError as exc2:
                         logger.error(
@@ -893,13 +943,10 @@ class Ft8TxCoordinator:
                             )
                             try:
                                 ws = sd.WasapiSettings(exclusive=False)
-                                sd.play(
-                                    play_audio,
-                                    samplerate=play_fs,
-                                    device=wasapi_dev,
+                                _stream_play(
+                                    sd, play_audio_f32, play_fs, wasapi_dev,
                                     extra_settings=ws,
                                 )
-                                sd.wait()
                                 return
                             except sd.PortAudioError as exc_shared:
                                 logger.error(
@@ -934,13 +981,10 @@ class Ft8TxCoordinator:
                     )
                     try:
                         ws = sd.WasapiSettings(exclusive=False)
-                        sd.play(
-                            play_audio,
-                            samplerate=play_fs,
-                            device=wasapi_dev,
+                        _stream_play(
+                            sd, play_audio_f32, play_fs, wasapi_dev,
                             extra_settings=ws,
                         )
-                        sd.wait()
                         return
                     except sd.PortAudioError as exc_shared:
                         logger.error(
@@ -965,14 +1009,8 @@ class Ft8TxCoordinator:
                         "with MME device %d",
                         effective_device, mme_dev,
                     )
-                    # play_audio is already at TX_OUTPUT_SAMPLE_RATE / int16.
                     try:
-                        sd.play(
-                            play_audio,
-                            samplerate=play_fs,
-                            device=mme_dev,
-                        )
-                        sd.wait()
+                        _stream_play(sd, play_audio_f32, play_fs, mme_dev)
                         return
                     except sd.PortAudioError as exc_mme:
                         logger.error(
@@ -993,8 +1031,7 @@ class Ft8TxCoordinator:
                 )
                 time.sleep(USB_AUDIO_SWITCH_DELAY_S)
                 try:
-                    sd.play(play_audio, samplerate=play_fs, **dev_kwarg)
-                    sd.wait()
+                    _stream_play(sd, play_audio_f32, play_fs, effective_device)
                     return
                 except sd.PortAudioError as exc_retry:
                     raise RuntimeError(f"Audio output failed: {exc_retry}") from exc_retry
