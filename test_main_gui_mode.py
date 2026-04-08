@@ -821,6 +821,63 @@ def test_switch_to_voice_skips_stop_session_when_inactive():
     gui._on_stop_cq_session.assert_not_called()
 
 
+def test_maybe_assist_prefill_rrr_completion_hint():
+    """_maybe_assist_prefill status hint says 'RRR' when DX sends RRR (not 'RR73')."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    mgr.advance("W4ABC K9XYZ -05")  # lock in K9XYZ, move to EXCHANGE_SENT
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    # DX sends RRR (not RR73)
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ RRR", 0.0)
+
+    gui._tx_msg_var.set.assert_called_once()
+    status_arg = gui._tx_status_var.set.call_args[0][0]
+    # Must say "RRR", not "RR73"
+    assert "RRR" in status_arg
+    assert "RR73" not in status_arg
+
+
+def test_maybe_assist_prefill_rr73_completion_hint():
+    """_maybe_assist_prefill status hint says 'RR73' when DX sends RR73."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    mgr.advance("W4ABC K9XYZ -05")
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ RR73", 0.0)
+
+    gui._tx_msg_var.set.assert_called_once()
+    status_arg = gui._tx_status_var.set.call_args[0][0]
+    assert "RR73" in status_arg
+
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -881,6 +938,8 @@ if __name__ == "__main__":
     run("48. _apply_tx_state_update — dedup preserved on ERROR", test_apply_tx_state_update_does_not_clear_dedup_on_error)
     run("49. _switch_to_voice — stops active CQ session",   test_switch_to_voice_stops_active_cq_session)
     run("50. _switch_to_voice — no-op when session off",    test_switch_to_voice_skips_stop_session_when_inactive)
+    run("51. _maybe_assist_prefill — RRR hint text",        test_maybe_assist_prefill_rrr_completion_hint)
+    run("52. _maybe_assist_prefill — RR73 hint text",       test_maybe_assist_prefill_rr73_completion_hint)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total  = len(results)

@@ -55,7 +55,7 @@ class QsoState(Enum):
 # § 1b  QSO record (for future contact logging — Milestone 5)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
+@dataclass(frozen=True)
 class QsoRecord:
     """
     Immutable snapshot of a completed FT8 QSO for contact logging.
@@ -65,6 +65,9 @@ class QsoRecord:
     Milestone 5; stored here so the state machine and logging layer
     share a common data contract.
 
+    The dataclass is ``frozen=True`` so instances are truly immutable
+    once created — safe to cache, hash, or pass across thread boundaries.
+
     Attributes
     ----------
     our_call    : str              — Operator callsign (e.g. 'W4ABC')
@@ -72,7 +75,9 @@ class QsoRecord:
     freq_mhz    : float            — Operating frequency in MHz (0.0 if unknown)
     band        : str              — Band label (e.g. '20m') or '' if not resolved
     mode        : str              — Always 'FT8' for this module
-    time_on     : datetime         — UTC start time (when the first exchange was sent)
+    time_on     : datetime         — UTC start time (captured when the QSO session
+                                    began, i.e. when start_cq() / start_from_received()
+                                    was called)
     rst_sent    : str              — RST/signal report sent (e.g. '+00', '-07')
     rst_rcvd    : str              — RST/signal report received (e.g. '-05')
     initiated   : str              — 'CQ' if we called CQ, 'REPLY' if we answered one
@@ -357,6 +362,11 @@ class Ft8QsoManager:
         self._dx_call:   Optional[str] = None
         # SNR reported to us by the DX station (used if we want to echo it)
         self._rx_snr:    Optional[int] = None
+        # UTC timestamp captured when the QSO session starts (start_cq /
+        # start_from_received).  Used as QSO time_on in build_record() so the
+        # logged start time matches when the exchange actually began rather
+        # than when the record was assembled.
+        self._time_on_utc: Optional[datetime] = None
         # NTP-backed slot timer; each manager gets its own instance unless the
         # caller injects one (e.g. for testing or for sharing a pre-synced timer
         # across multiple managers in the same session).
@@ -386,8 +396,9 @@ class Ft8QsoManager:
             )
         msg = compose_cq(self.operator.callsign, self.operator.grid)
         self._set_tx(msg)
-        self.state    = QsoState.CQ_SENT
-        self._dx_call = None
+        self.state         = QsoState.CQ_SENT
+        self._dx_call      = None
+        self._time_on_utc  = datetime.now(timezone.utc)
         return msg
 
     def start_from_received(
@@ -417,8 +428,9 @@ class Ft8QsoManager:
 
         if rx.is_cq:
             # Reply to any CQ
-            self._dx_call = rx.call2
-            self._rx_snr  = rx.snr_db
+            self._dx_call     = rx.call2
+            self._rx_snr      = rx.snr_db
+            self._time_on_utc = datetime.now(timezone.utc)
             msg = compose_reply(rx.call2, self.operator.callsign, snr_db)
             self._set_tx(msg)
             self.state = QsoState.REPLY_SENT
@@ -519,17 +531,19 @@ class Ft8QsoManager:
 
     def abort(self) -> None:
         """Abort the current QSO and return to IDLE."""
-        self.state      = QsoState.ABORTED
-        self._queued_tx = None
-        self._dx_call   = None
-        self._rx_snr    = None
+        self.state         = QsoState.ABORTED
+        self._queued_tx    = None
+        self._dx_call      = None
+        self._rx_snr       = None
+        self._time_on_utc  = None
 
     def reset(self) -> None:
         """Reset the manager to IDLE state, ready for a new QSO."""
-        self.state      = QsoState.IDLE
-        self._queued_tx = None
-        self._dx_call   = None
-        self._rx_snr    = None
+        self.state         = QsoState.IDLE
+        self._queued_tx    = None
+        self._dx_call      = None
+        self._rx_snr       = None
+        self._time_on_utc  = None
 
     @property
     def is_active(self) -> bool:
@@ -573,12 +587,15 @@ class Ft8QsoManager:
             raise RuntimeError("No DX callsign recorded; cannot build a contact record.")
         rst_rcvd = f"{self._rx_snr:+03d}" if self._rx_snr is not None else "+00"
         rst_sent = f"{snr_sent:+03d}"
+        # Use the timestamp captured when the session started (start_cq /
+        # start_from_received), falling back to now() only as a safety net.
+        time_on = self._time_on_utc if self._time_on_utc is not None else datetime.now(timezone.utc)
         return QsoRecord(
             our_call  = self.operator.callsign,
             dx_call   = self._dx_call,
             freq_mhz  = freq_mhz,
             band      = band,
-            time_on   = datetime.now(timezone.utc),
+            time_on   = time_on,
             rst_sent  = rst_sent,
             rst_rcvd  = rst_rcvd,
             initiated = initiated,

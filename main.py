@@ -1218,7 +1218,13 @@ class RadioGUI:
         if qso_state == QsoState.EXCHANGE_SENT:
             hint = f"Reply from {dx} — review exchange, then Arm TX"
         elif qso_state == QsoState.COMPLETE:
-            hint = f"RR73 from {dx} — 73 pre-filled, Arm TX to close QSO"
+            if rx.is_rrr:
+                completion_text = "RRR"
+            elif rx.is_rr73:
+                completion_text = "RR73"
+            else:
+                completion_text = "Completion reply"
+            hint = f"{completion_text} from {dx} — 73 pre-filled, Arm TX to close QSO"
         else:
             hint = f"Next reply from {dx} — review then Arm TX"
 

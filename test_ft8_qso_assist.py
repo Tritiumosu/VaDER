@@ -428,6 +428,40 @@ class TestFt8QsoManagerBuildRecord(unittest.TestCase):
         self.assertIsNotNone(rec.time_on.tzinfo)
         self.assertEqual(rec.time_on.tzinfo, timezone.utc)
 
+    def test_build_record_time_on_captured_at_session_start(self):
+        """time_on must reflect when start_cq() was called, not when build_record() was called."""
+        import time as _time
+        mgr = _make_manager()
+        t_before = datetime.now(timezone.utc)
+        mgr.start_cq()
+        t_after_start = datetime.now(timezone.utc)
+
+        mgr.advance("W4ABC K9XYZ -05", snr_db=0)
+        mgr.advance("W4ABC K9XYZ RR73")
+
+        # Small sleep so build_record() wall time is measurably later
+        _time.sleep(0.05)
+        rec = mgr.build_record()
+
+        # time_on must be between t_before and t_after_start (the session window),
+        # not close to the build_record() call time (which is ~50 ms later).
+        self.assertGreaterEqual(rec.time_on, t_before)
+        self.assertLessEqual(rec.time_on, t_after_start)
+
+    def test_build_record_time_on_reset_after_reset(self):
+        """After reset(), a new session captures a fresh time_on."""
+        import time as _time
+        mgr = _make_manager()
+        mgr.start_cq()
+        first_time_on = mgr._time_on_utc
+
+        mgr.reset()
+        _time.sleep(0.05)
+        mgr.start_cq()
+        second_time_on = mgr._time_on_utc
+
+        self.assertGreater(second_time_on, first_time_on)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 5  QsoRecord helpers
@@ -468,6 +502,13 @@ class TestQsoRecord(unittest.TestCase):
         rec = self._make_record(rst_sent="-03", rst_rcvd="+01")
         self.assertEqual(rec.rst_sent, "-03")
         self.assertEqual(rec.rst_rcvd, "+01")
+
+    def test_record_is_immutable(self):
+        """QsoRecord must be frozen — mutation must raise FrozenInstanceError."""
+        from dataclasses import FrozenInstanceError
+        rec = self._make_record()
+        with self.assertRaises(FrozenInstanceError):
+            rec.dx_call = "W1AW"  # type: ignore[misc]
 
 
 if __name__ == "__main__":
