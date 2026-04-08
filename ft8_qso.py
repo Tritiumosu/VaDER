@@ -25,6 +25,7 @@ helpers to query the current slot but does not enforce any timing.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import Optional
@@ -48,6 +49,51 @@ class QsoState(Enum):
     RRR_SENT      = auto()  # We sent RR73; waiting for the final 73
     COMPLETE      = auto()  # QSO completed — 73 exchanged
     ABORTED       = auto()  # QSO abandoned (timeout, manual cancel, etc.)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 1b  QSO record (for future contact logging — Milestone 5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class QsoRecord:
+    """
+    Immutable snapshot of a completed FT8 QSO for contact logging.
+
+    Populated by ``Ft8QsoManager.build_record()`` after the exchange
+    reaches ``QsoState.COMPLETE``.  Intended for ADIF logging in
+    Milestone 5; stored here so the state machine and logging layer
+    share a common data contract.
+
+    Attributes
+    ----------
+    our_call    : str              — Operator callsign (e.g. 'W4ABC')
+    dx_call     : str              — DX station callsign (e.g. 'K9XYZ')
+    freq_mhz    : float            — Operating frequency in MHz (0.0 if unknown)
+    band        : str              — Band label (e.g. '20m') or '' if not resolved
+    mode        : str              — Always 'FT8' for this module
+    time_on     : datetime         — UTC start time (when the first exchange was sent)
+    rst_sent    : str              — RST/signal report sent (e.g. '+00', '-07')
+    rst_rcvd    : str              — RST/signal report received (e.g. '-05')
+    initiated   : str              — 'CQ' if we called CQ, 'REPLY' if we answered one
+    """
+    our_call:  str
+    dx_call:   str
+    freq_mhz:  float = 0.0
+    band:      str   = ""
+    mode:      str   = "FT8"
+    time_on:   datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    rst_sent:  str   = "+00"
+    rst_rcvd:  str   = "+00"
+    initiated: str   = "CQ"  # 'CQ' or 'REPLY'
+
+    def adif_date(self) -> str:
+        """Return the QSO date formatted for ADIF: YYYYMMDD."""
+        return self.time_on.strftime("%Y%m%d")
+
+    def adif_time(self) -> str:
+        """Return the QSO time formatted for ADIF: HHMMSS."""
+        return self.time_on.strftime("%H%M%S")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -428,10 +474,11 @@ class Ft8QsoManager:
                 self.state = QsoState.RRR_SENT
 
         elif self.state == QsoState.EXCHANGE_SENT:
-            # We sent an exchange; waiting for RRR or RR73
+            # We sent an exchange; waiting for RRR or RR73 from the locked DX
             if (
                 self._dx_call
                 and rx.is_addressed_to(self.operator.callsign)
+                and rx.is_from(self._dx_call)
                 and (rx.is_rrr or rx.is_rr73)
             ):
                 msg = compose_73(self._dx_call, self.operator.callsign)
@@ -443,6 +490,7 @@ class Ft8QsoManager:
             if (
                 self._dx_call
                 and rx.is_addressed_to(self.operator.callsign)
+                and rx.is_from(self._dx_call)
                 and rx.is_73
             ):
                 self._queued_tx = None
@@ -494,6 +542,47 @@ class Ft8QsoManager:
     def dx_call(self) -> Optional[str]:
         """Callsign of the DX station we are working, or None."""
         return self._dx_call
+
+    def build_record(
+        self,
+        *,
+        freq_mhz: float = 0.0,
+        band: str = "",
+        snr_sent: int = 0,
+        initiated: str = "CQ",
+    ) -> QsoRecord:
+        """
+        Build a :class:`QsoRecord` snapshot from the current QSO state.
+
+        Should only be called after the QSO reaches ``QsoState.COMPLETE``.
+        Raises ``RuntimeError`` if the QSO is not complete or has no DX call.
+
+        Parameters
+        ----------
+        freq_mhz : float  — Operating frequency in MHz (pass from radio poll).
+        band     : str    — Band label (e.g. '20m'); caller resolves from freq.
+        snr_sent : int    — Signal report we sent to the DX station (dB).
+        initiated: str    — 'CQ' if we called CQ, 'REPLY' if we answered one.
+        """
+        if self.state not in (QsoState.COMPLETE,):
+            raise RuntimeError(
+                f"QSO is not complete (state={self.state.name}); "
+                "cannot build a contact record."
+            )
+        if not self._dx_call:
+            raise RuntimeError("No DX callsign recorded; cannot build a contact record.")
+        rst_rcvd = f"{self._rx_snr:+03d}" if self._rx_snr is not None else "+00"
+        rst_sent = f"{snr_sent:+03d}"
+        return QsoRecord(
+            our_call  = self.operator.callsign,
+            dx_call   = self._dx_call,
+            freq_mhz  = freq_mhz,
+            band      = band,
+            time_on   = datetime.now(timezone.utc),
+            rst_sent  = rst_sent,
+            rst_rcvd  = rst_rcvd,
+            initiated = initiated,
+        )
 
     # ── Timeslot helpers ──────────────────────────────────────────────────
 
