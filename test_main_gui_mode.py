@@ -565,6 +565,320 @@ def test_on_cancel_tx_not_accepted():
 
 
 # ---------------------------------------------------------------------------
+# CQ QSO assist tests (Milestone 4)
+# ---------------------------------------------------------------------------
+
+def test_on_start_cq_session_valid_operator():
+    """_on_start_cq_session creates a QSO manager and pre-fills the CQ msg."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_start_cq_session(gui)
+    # TX message must be set to the CQ
+    gui._tx_msg_var.set.assert_called_once()
+    msg_arg = gui._tx_msg_var.set.call_args[0][0]
+    assert "CQ" in msg_arg
+    assert "W4ABC" in msg_arg
+    # Assist must be activated
+    assert gui._qso_assist_active is True
+    assert gui._qso_mgr is not None
+
+
+def test_on_start_cq_session_invalid_operator_shows_error():
+    """_on_start_cq_session shows an error and does not activate for invalid operator."""
+    gui = mock.MagicMock()
+    gui._tx_callsign_var.get.return_value = "!!INVALID!!"
+    gui._tx_grid_var.get.return_value = "EN52"
+    main.RadioGUI._on_start_cq_session(gui)
+    # Must NOT set the TX message
+    gui._tx_msg_var.set.assert_not_called()
+    # Must NOT activate assist
+    assert gui._qso_assist_active is not True
+
+
+def test_on_stop_cq_session_resets_state():
+    """_on_stop_cq_session clears manager and deactivates assist."""
+    gui = mock.MagicMock()
+    # Simulate an active session
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    gui._qso_mgr = mgr
+    gui._qso_assist_active = True
+    gui._qso_assist_prefilled = "CQ W4ABC EN52"
+    main.RadioGUI._on_stop_cq_session(gui)
+    assert gui._qso_assist_active is False
+    assert gui._qso_assist_prefilled == ""
+    assert gui._qso_mgr is None
+    gui._tx_status_var.set.assert_called()
+
+
+def test_maybe_assist_prefill_prefills_on_cq_reply():
+    """_maybe_assist_prefill fills TX field when a valid CQ reply is decoded."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+
+    gui._tx_msg_var.set.assert_called_once()
+    prefilled = gui._tx_msg_var.set.call_args[0][0]
+    assert "K9XYZ" in prefilled
+    assert "W4ABC" in prefilled
+    gui._tx_status_var.set.assert_called()
+
+
+def test_maybe_assist_prefill_ignores_unaddressed_message():
+    """_maybe_assist_prefill does not prefill for messages not addressed to us."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    # This message is addressed to K9ABC, not W4ABC
+    main.RadioGUI._maybe_assist_prefill(gui, "K9ABC VK2TIM -03", -3.0)
+
+    gui._tx_msg_var.set.assert_not_called()
+
+
+def test_maybe_assist_prefill_dedup_guard():
+    """_maybe_assist_prefill does not re-set a suggestion already prefilled."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    # First call should prefill
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    assert gui._tx_msg_var.set.call_count == 1
+    first_prefill = gui._tx_msg_var.set.call_args[0][0]
+
+    # Manually simulate that the guard was set by the first call
+    gui._qso_assist_prefilled = first_prefill
+
+    # Second decode of the SAME reply type — state machine returns None
+    # because state has already advanced to EXCHANGE_SENT.  No re-prefill.
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    assert gui._tx_msg_var.set.call_count == 1  # still only called once
+
+
+def test_maybe_assist_prefill_gated_during_tx_active():
+    """_maybe_assist_prefill is silenced while TX is in progress."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    # Simulate TX in progress
+    gui._tx_coord.state = TxState.TX_ACTIVE
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    gui._tx_msg_var.set.assert_not_called()
+
+
+def test_maybe_assist_prefill_gated_during_armed():
+    """_maybe_assist_prefill is silenced while a TX job is armed (scheduled)."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.ARMED
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    gui._tx_msg_var.set.assert_not_called()
+
+
+def test_maybe_assist_prefill_inactive_when_session_off():
+    """_maybe_assist_prefill does nothing when assist is not active."""
+    gui = mock.MagicMock()
+    gui._qso_assist_active = False
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    gui._tx_msg_var.set.assert_not_called()
+
+
+def test_maybe_assist_prefill_no_auto_arm():
+    """_maybe_assist_prefill must NEVER call _on_arm_tx (safety guard)."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    # _on_arm_tx must never be called — operator approval is mandatory
+    gui._on_arm_tx.assert_not_called()
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_apply_tx_state_update_clears_dedup_on_complete():
+    """_apply_tx_state_update clears _qso_assist_prefilled when TX completes."""
+    from ft8_tx import TxState
+    gui = mock.MagicMock()
+    gui._qso_assist_prefilled = "K9XYZ W4ABC R+00"
+    main.RadioGUI._apply_tx_state_update(gui, TxState.COMPLETE, "TX complete")
+    assert gui._qso_assist_prefilled == ""
+
+
+def test_apply_tx_state_update_does_not_clear_dedup_on_error():
+    """_apply_tx_state_update does NOT clear the dedup guard on ERROR."""
+    from ft8_tx import TxState
+    gui = mock.MagicMock()
+    gui._qso_assist_prefilled = "K9XYZ W4ABC R+00"
+    main.RadioGUI._apply_tx_state_update(gui, TxState.ERROR, "TX error")
+    # Guard is preserved — the message was not sent so the suggestion stands
+    assert gui._qso_assist_prefilled == "K9XYZ W4ABC R+00"
+
+
+def test_switch_to_voice_stops_active_cq_session():
+    """_switch_to_voice must stop an active CQ session when switching modes."""
+    gui = mock.MagicMock()
+    gui._op_mode = "data"
+    gui._qso_assist_active = True
+    main.RadioGUI._switch_to_voice(gui)
+    gui._on_stop_cq_session.assert_called_once()
+
+
+def test_switch_to_voice_skips_stop_session_when_inactive():
+    """_switch_to_voice must not call _on_stop_cq_session when no session active."""
+    gui = mock.MagicMock()
+    gui._op_mode = "data"
+    gui._qso_assist_active = False
+    main.RadioGUI._switch_to_voice(gui)
+    gui._on_stop_cq_session.assert_not_called()
+
+
+def test_maybe_assist_prefill_rrr_completion_hint():
+    """_maybe_assist_prefill status hint says 'RRR' when DX sends RRR (not 'RR73')."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    mgr.advance("W4ABC K9XYZ -05")  # lock in K9XYZ, move to EXCHANGE_SENT
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    # DX sends RRR (not RR73)
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ RRR", 0.0)
+
+    gui._tx_msg_var.set.assert_called_once()
+    status_arg = gui._tx_status_var.set.call_args[0][0]
+    # Must say "RRR", not "RR73"
+    assert "RRR" in status_arg
+    assert "RR73" not in status_arg
+
+
+def test_maybe_assist_prefill_rr73_completion_hint():
+    """_maybe_assist_prefill status hint says 'RR73' when DX sends RR73."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    mgr.advance("W4ABC K9XYZ -05")
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ RR73", 0.0)
+
+    gui._tx_msg_var.set.assert_called_once()
+    status_arg = gui._tx_status_var.set.call_args[0][0]
+    assert "RR73" in status_arg
+
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
@@ -610,6 +924,22 @@ if __name__ == "__main__":
     run("34. _on_arm_tx — invalid operator",        test_on_arm_tx_invalid_operator)
     run("35. _on_cancel_tx — accepted",             test_on_cancel_tx_accepted)
     run("36. _on_cancel_tx — not accepted",         test_on_cancel_tx_not_accepted)
+    run("37. _on_start_cq_session — valid operator",       test_on_start_cq_session_valid_operator)
+    run("38. _on_start_cq_session — invalid blocks error", test_on_start_cq_session_invalid_operator_shows_error)
+    run("39. _on_stop_cq_session — resets state",          test_on_stop_cq_session_resets_state)
+    run("40. _maybe_assist_prefill — CQ reply prefills",   test_maybe_assist_prefill_prefills_on_cq_reply)
+    run("41. _maybe_assist_prefill — unaddressed ignored", test_maybe_assist_prefill_ignores_unaddressed_message)
+    run("42. _maybe_assist_prefill — dedup guard",         test_maybe_assist_prefill_dedup_guard)
+    run("43. _maybe_assist_prefill — gated TX_ACTIVE",     test_maybe_assist_prefill_gated_during_tx_active)
+    run("44. _maybe_assist_prefill — gated ARMED",         test_maybe_assist_prefill_gated_during_armed)
+    run("45. _maybe_assist_prefill — inactive session noop", test_maybe_assist_prefill_inactive_when_session_off)
+    run("46. _maybe_assist_prefill — no auto-arm (safety)", test_maybe_assist_prefill_no_auto_arm)
+    run("47. _apply_tx_state_update — clears dedup on COMPLETE", test_apply_tx_state_update_clears_dedup_on_complete)
+    run("48. _apply_tx_state_update — dedup preserved on ERROR", test_apply_tx_state_update_does_not_clear_dedup_on_error)
+    run("49. _switch_to_voice — stops active CQ session",   test_switch_to_voice_stops_active_cq_session)
+    run("50. _switch_to_voice — no-op when session off",    test_switch_to_voice_skips_stop_session_when_inactive)
+    run("51. _maybe_assist_prefill — RRR hint text",        test_maybe_assist_prefill_rrr_completion_hint)
+    run("52. _maybe_assist_prefill — RR73 hint text",       test_maybe_assist_prefill_rr73_completion_hint)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total  = len(results)

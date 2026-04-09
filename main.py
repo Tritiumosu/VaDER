@@ -25,6 +25,7 @@ from ft8_decode import FT8ConsoleDecoder, format_ft8_message
 from audio_passthrough import AudioPassthrough, AudioTxCapture
 from ft8_tx import Ft8TxCoordinator, TxJob, TxState, validate_operator
 from ft8_ntp import Ft8SlotTimer, default_slot_timer
+from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState, ReceivedMessage
 
 # --- Constants & Band Plans ---
 BANDS = {
@@ -784,6 +785,18 @@ class RadioGUI:
         # Countdown refresh timer handle (stored so it can be cancelled)
         self._tx_countdown_after: str | None = None
 
+        # CQ QSO assist — operator-confirmed reply pre-fill (Milestone 4)
+        # Never auto-transmits; only pre-fills the TX message field and shows
+        # a hint so the operator can review and press Arm TX manually.
+        self._qso_mgr: "Ft8QsoManager | None" = None
+        self._qso_assist_active: bool = False
+        # Dedup guard: last message we pre-filled via the assist path.
+        # Prevents the same suggestion being written to the TX field more
+        # than once for the same QSO step.  Cleared when TX reaches COMPLETE
+        # (meaning the message was sent); preserved on ERROR/CANCELED so the
+        # operator's last suggestion remains visible.
+        self._qso_assist_prefilled: str = ""
+
         self.root.title("FT-991A Command Center")
         self.root.geometry("500x900")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -974,7 +987,9 @@ class RadioGUI:
         """
         line = format_ft8_message(utc, snr_db, freq_hz, message)
         print(line, flush=True)
-        self._ui_queue.put(("ft8_decoded", line + "\n"))
+        # Include the raw message and SNR so the UI thread can route it to
+        # the CQ QSO assist watcher without re-parsing the formatted line.
+        self._ui_queue.put(("ft8_decoded", line + "\n", message, snr_db))
 
     def _clear_ft8_log(self) -> None:
         """Clear the FT8 decoded messages panel (called from GUI thread)."""
@@ -1096,6 +1111,125 @@ class RadioGUI:
 
         self._tx_status_var.set(f"Reply pre-filled from: {received_msg.strip()}")
 
+    # -- CQ QSO assist methods (Milestone 4) ---------------------------------
+
+    def _on_start_cq_session(self) -> None:
+        """
+        Start a CQ QSO assist session.
+
+        Creates a new :class:`~ft8_qso.Ft8QsoManager`, composes the CQ
+        message, pre-fills the TX message field, and activates the
+        decode-driven reply-assist watcher.
+
+        The operator must still press **Arm TX** to transmit.  The assist
+        only pre-fills the TX field and updates the status label — it never
+        calls :meth:`_on_arm_tx` automatically.
+        """
+        call = self._tx_callsign_var.get().strip().upper()
+        grid = self._tx_grid_var.get().strip().upper()
+        ok, reason = validate_operator(call, grid)
+        if not ok:
+            messagebox.showerror(
+                "Operator Settings",
+                f"Cannot start CQ session: {reason}",
+                parent=self.root,
+            )
+            return
+
+        op = OperatorConfig(callsign=call, grid=grid)
+        self._qso_mgr = Ft8QsoManager(operator=op, slot_timer=self._slot_timer)
+        cq_msg = self._qso_mgr.start_cq()
+
+        # Pre-fill TX message and activate the assist watcher
+        self._tx_msg_var.set(cq_msg)
+        self._qso_assist_active    = True
+        self._qso_assist_prefilled = ""
+
+        # Update button states
+        self._cq_session_btn.config(state=tk.DISABLED)
+        self._stop_session_btn.config(state=tk.NORMAL)
+        self._tx_status_var.set(
+            f"CQ Session: {cq_msg} — Arm TX, then watch for replies"
+        )
+
+    def _on_stop_cq_session(self) -> None:
+        """
+        Stop the active CQ session and reset all QSO assist state.
+
+        Safe to call at any time; clears assist flags, aborts the QSO
+        manager (if present), and restores the session button states.
+        """
+        if self._qso_mgr is not None:
+            self._qso_mgr.abort()
+        self._qso_mgr              = None
+        self._qso_assist_active    = False
+        self._qso_assist_prefilled = ""
+        self._cq_session_btn.config(state=tk.NORMAL)
+        self._stop_session_btn.config(state=tk.DISABLED)
+        self._tx_status_var.set("QSO Session stopped")
+
+    def _maybe_assist_prefill(self, message: str, snr_db: float) -> None:
+        """
+        Inspect *message* against the active CQ QSO state machine and
+        pre-fill the TX message field with the appropriate next response.
+
+        Called on the Tkinter thread (via the UI queue), so it may safely
+        update :class:`tkinter.StringVar` instances and button states.
+        **It never calls** :meth:`_on_arm_tx` — the operator must press
+        Arm TX to transmit.
+
+        Guards
+        ------
+        - Only runs while ``_qso_assist_active`` is True.
+        - Skips if the TX coordinator is ARMED, TX_PREP, or TX_ACTIVE
+          (a transmission is scheduled or in flight; don't overwrite it).
+        - Dedup: skips if this exact message text was already pre-filled
+          for the current QSO cycle (prevents redundant UI flicker when
+          the same FT8 message is decoded in multiple consecutive slots).
+        """
+        if not self._qso_assist_active or self._qso_mgr is None:
+            return
+
+        # Gate: don't interfere with an active or armed TX job
+        tx_state = self._tx_coord.state
+        if tx_state in (TxState.ARMED, TxState.TX_PREP, TxState.TX_ACTIVE):
+            return
+
+        try:
+            next_msg = self._qso_mgr.advance(message, snr_db=round(snr_db))
+        except Exception:
+            return  # Defensive: never crash the UI queue drain
+
+        if next_msg is None:
+            return  # Message did not advance QSO state (not addressed to us, etc.)
+
+        # Dedup: avoid writing the same suggestion repeatedly
+        if next_msg == self._qso_assist_prefilled:
+            return
+
+        # Pre-fill the TX message field
+        self._tx_msg_var.set(next_msg)
+        self._qso_assist_prefilled = next_msg
+
+        # Compose a human-readable status hint
+        rx  = ReceivedMessage(message)
+        dx  = rx.call2 if rx.call2 else "?"
+        qso_state = self._qso_mgr.state
+        if qso_state == QsoState.EXCHANGE_SENT:
+            hint = f"Reply from {dx} — review exchange, then Arm TX"
+        elif qso_state == QsoState.COMPLETE:
+            if rx.is_rrr:
+                completion_text = "RRR"
+            elif rx.is_rr73:
+                completion_text = "RR73"
+            else:
+                completion_text = "Completion reply"
+            hint = f"{completion_text} from {dx} — 73 pre-filled, Arm TX to close QSO"
+        else:
+            hint = f"Next reply from {dx} — review then Arm TX"
+
+        self._tx_status_var.set(f"CQ Assist: {hint}")
+
     def _on_arm_tx(self) -> None:
         """Arm the TX coordinator for the next FT8 slot."""
         msg = self._tx_msg_var.get().strip()
@@ -1169,6 +1303,10 @@ class RadioGUI:
         if state in (TxState.IDLE, TxState.COMPLETE, TxState.ERROR, TxState.CANCELED):
             self._arm_btn.config(state=tk.NORMAL)
             self._cancel_btn.config(state=tk.DISABLED)
+            # Clear the dedup guard so the next decode can trigger a fresh
+            # assist prefill for the subsequent QSO step.
+            if state == TxState.COMPLETE:
+                self._qso_assist_prefilled = ""
             # Auto-reset coordinator to IDLE so next arm() works immediately
             self._tx_coord.reset()
         elif state == TxState.ARMED:
@@ -1199,6 +1337,9 @@ class RadioGUI:
 
     def _switch_to_voice(self) -> None:
         """Switch to voice operating mode."""
+        # Stop any active CQ QSO session before switching modes
+        if self._qso_assist_active:
+            self._on_stop_cq_session()
         # Save decoded FT8 messages before hiding the panel
         self._save_ft8_log_to_file()
         # Stop data-mode audio stream and FT8 decoder
@@ -1613,7 +1754,27 @@ class RadioGUI:
             command=self._on_compose_cq,
         ).pack(side=tk.LEFT, padx=(0, 2))
 
-        # Row 3: Arm / Cancel buttons + status
+        # Row 3: CQ Session assist buttons
+        session_row = tk.Frame(self._tx_frame)
+        session_row.pack(fill=tk.X, padx=5, pady=(4, 0))
+        self._cq_session_btn = tk.Button(
+            session_row,
+            text="\u25b6 Start CQ Session",
+            bg="#4a90d9", fg="white",
+            font=("Arial", 8, "bold"),
+            command=self._on_start_cq_session,
+        )
+        self._cq_session_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._stop_session_btn = tk.Button(
+            session_row,
+            text="\u25a0 Stop QSO",
+            bg="orange", state=tk.DISABLED,
+            font=("Arial", 8),
+            command=self._on_stop_cq_session,
+        )
+        self._stop_session_btn.pack(side=tk.LEFT, padx=(0, 0))
+
+        # Row 4: Arm / Cancel buttons + status
         ctrl_row = tk.Frame(self._tx_frame)
         ctrl_row.pack(fill=tk.X, padx=5, pady=(4, 2))
         self._arm_btn = tk.Button(
@@ -1849,11 +2010,16 @@ class RadioGUI:
                     self.log_box.see(tk.END)
 
                 elif kind == "ft8_decoded":
-                    _, line = item
+                    line = item[1]
                     self.ft8_log.config(state=tk.NORMAL)
                     self.ft8_log.insert(tk.END, line)
                     self.ft8_log.see(tk.END)
                     self.ft8_log.config(state=tk.DISABLED)
+                    # CQ QSO assist: route raw message + SNR to the prefill
+                    # watcher when a session is active.  Fields are present
+                    # when emitted by _on_ft8_decode (len == 4).
+                    if len(item) >= 4 and self._qso_assist_active:
+                        self._maybe_assist_prefill(item[2], item[3])
 
                 elif kind == "tx_state":
                     _, state, message = item

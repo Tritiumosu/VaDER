@@ -57,8 +57,9 @@ The project is currently **hardware-specific** (Yaesu FT-991A), but the CAT laye
 | GUI TX panel (arm/cancel/status/countdown) | ✅ Working (`main.py`) |
 | Select-and-reply from decoded messages | ✅ Working (`main.py`) |
 | CAT PTT key/unkey around FT8 TX window | ✅ Working (`ft8_tx.py`) |
+| CQ-initiated QSO assist (auto-prefill, no auto-TX) | ✅ Working (`main.py`, `ft8_qso.py`) |
 | Unattended full QSO automation | 🚫 Not permitted by project safety policy |
-| Contact / QSO logging to file | 🔲 Partial (UI exists, no file save) |
+| Contact / QSO logging to file | 🔲 Partial (`QsoRecord` struct ready, no file write yet) |
 | Support for radios other than FT-991A | 🔲 Planned |
 
 ---
@@ -282,8 +283,9 @@ pytest test_ft8_decode_output.py -v # Message formatting against live WAV files
 pytest test_msg_unpack.py -v        # Callsign / grid / free-text unpacking
 pytest test_audio_passthrough.py -v # Audio routing with mocked sounddevice
 pytest test_audio_bridge.py -v      # Full-duplex audio bridge with mocked sounddevice
-pytest test_main_gui_mode.py -v     # GUI operating modes and config persistence
+pytest test_main_gui_mode.py -v     # GUI operating modes, config persistence, CQ assist
 pytest test_ft8_encode.py -v        # FT8 encoder, QSO state machine, round-trip
+pytest test_ft8_qso_assist.py -v    # CQ-initiated QSO assist: parser, state machine, QsoRecord
 pytest test_ft8_ntp.py -v           # NTP sync, slot math, AppConfig NTP settings
 pytest test_ft8_tx.py -v            # TX orchestration: state machine, PTT, slot timing
 pytest test_ft8_reference.py -v     # Reference verification against ft8_lib constants
@@ -305,7 +307,7 @@ Live hardware scripts/checks are post-test validation, not a CI gate.
 ## Known Limitations
 
 - **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains manual-assisted and operator-controlled.
-- **QSO/contact logging is incomplete** — The log UI panel exists but does not yet save contacts to an ADIF or other file format.
+- **QSO/contact logging is incomplete** — `QsoRecord` (in `ft8_qso.py`) captures completed QSO data, but writing to ADIF or another log format is deferred to Milestone 5.
 - **Yaesu FT-991A only** — The CAT library is specific to this radio model. Other radios are a future goal.
 - **Windows-first audio** — GUI enumeration and TX fallback paths are tuned for Windows host APIs (WASAPI first, MME fallback); Linux/macOS audio discovery is less polished.
 - **No rig database / memory management** — Memories and other menu-level settings are accessible via CAT but are not presented in the GUI yet.
@@ -358,7 +360,8 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] **Select-and-reply assist** — double-click any decoded FT8 line to pre-populate the TX message with the recommended reply; manual confirmation (Arm TX) still required before any transmission
 - [x] **CAT PTT integration** — `Ft8TxCoordinator` keys and unkeys CAT PTT around the FT8 audio window with configurable pre-key and post-key guard intervals
 - [x] TX guardrails: blocks arm if CAT disconnected, invalid callsign/grid, empty message, negative audio device, or another TX already active/armed
-- [ ] Operator-confirmed QSO assist improvements (no unattended TX)
+- [x] **CQ-initiated QSO assist** — operator clicks **▶ Start CQ Session** to begin a tracked exchange; after sending CQ the system watches decoded traffic, recognises replies addressed to the operator, and pre-fills the next standard exchange message; the operator reviews the suggestion then presses **Arm TX** to transmit; the assist watcher continues through the full exchange (CQ → exchange → 73); **never transmits autonomously**
+- [x] `QsoRecord` dataclass added to `ft8_qso.py` with ADIF helpers (`adif_date()`, `adif_time()`) — foundation for Milestone 5 contact logging
 
 #### Milestone 4 Usage Notes
 
@@ -370,6 +373,23 @@ Progress is tracked here as features move from planned to implemented. Items are
 4. Click **Arm TX (next slot)** — the status label will count down to the next 15-second boundary.
 5. The coordinator automatically keys PTT, plays the FT8 tones, then unkeys PTT.
 6. Click **Cancel TX** at any time before the slot fires to abort without transmitting.
+
+**CQ Session assist (operator-confirmed)**
+
+1. Enter your callsign and grid, click **Save**.
+2. Click **▶ Start CQ Session** — the TX message is filled with `CQ MYCALL MYGRID` and the assist watcher is activated.
+3. Click **Arm TX (next slot)** to send the CQ.
+4. After the CQ transmits, decoded replies addressed to your callsign are automatically detected and the appropriate exchange response is pre-filled in the TX field.
+5. Review the suggested message (edit if needed), then click **Arm TX** again to respond.
+6. The watcher continues through the exchange:  CQ → exchange reply → 73 confirmation.
+7. Click **■ Stop QSO** at any time to end the session and clear the assist state.
+
+**Guard behaviour (CQ assist)**
+- The assist watcher **never calls Arm TX** — operator confirmation is always required.
+- Prefill is suppressed while a TX job is ARMED, in TX_PREP, or TX_ACTIVE.
+- A duplicate decode of the same message for the current QSO step is silently ignored (dedup guard).
+- Switching to VOICE mode automatically stops any active CQ session.
+- Messages from stations other than the first valid responder are ignored after lock-in.
 
 **Safety behaviour**
 - PTT is always unkeyed in a `finally` block — a Python exception, audio failure, or serial error will not leave the rig stuck in TX.
@@ -390,14 +410,13 @@ Saved automatically when you click **Save** in the TX panel.
 | `ft8_tx.py` | TX orchestration: state machine, slot timing, PTT, audio dispatch |
 | `ft8_encode.py` | FT8 tone generation and audio synthesis |
 | `ft8_ntp.py` | NTP-corrected slot timer |
-| `ft8_qso.py` | Message composition helpers and QSO state machine |
-| `main.py` | GUI TX panel, select-and-reply assist, UI queue dispatch |
+| `ft8_qso.py` | Message composition helpers, QSO state machine, `QsoRecord` |
+| `main.py` | GUI TX panel, select-and-reply assist, CQ session assist, UI queue dispatch |
 
 ### 🗺️ Milestone 5 — QSO Logging
-- [ ] Save completed QSOs to ADIF file format
+- [ ] Save completed QSOs to ADIF file format (using `QsoRecord` from `ft8_qso.py`)
 - [ ] In-session log view (callsign, band, mode, time, RST)
 - [ ] Optional integration with Hamlog / LOTW / QRZ for lookups
-- [ ] Improve operator-assisted QSO workflow while keeping manual TX approval
 
 ### 🗺️ Milestone 6 — Multi-Radio Support
 - [ ] Abstract CAT interface (base class) for multiple radio models
