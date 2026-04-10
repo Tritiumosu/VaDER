@@ -27,7 +27,8 @@ try:
         _ldpc_check, _BP_Mn, _BP_Nm,
     )
 except ImportError as e:
-    print(f"IMPORT ERROR: {e}"); sys.exit(1)
+    print(f"IMPORT ERROR: {e}")
+    raise
 
 PASS = "✓ PASS"; FAIL = "✗ FAIL"
 results: list[tuple[str, bool, str]] = []
