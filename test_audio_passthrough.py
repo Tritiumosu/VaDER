@@ -52,6 +52,7 @@ from audio_passthrough import (  # noqa: E402
     AudioPassthrough,
     AudioTxCapture,
 )
+from digi_input import SoundCardAudioSource  # noqa: E402
 
 
 # ===========================================================================
@@ -372,6 +373,56 @@ class TestAudioTxCapture(unittest.TestCase):
             finally:
                 if orig is not None:
                     sys.modules["sounddevice"] = orig
+
+
+
+# ===========================================================================
+# SoundCardAudioSource tests (digi_input.py)
+# ===========================================================================
+# digi_input imports sounddevice at call-time (inside start()), so the stub
+# already injected above is sufficient.
+
+
+class TestSoundCardAudioSourceStop(unittest.TestCase):
+    """Tests for SoundCardAudioSource.stop() resource-management behaviour."""
+
+    def _make_source(self):
+        """Create a SoundCardAudioSource with a mocked internal stream."""
+        src = SoundCardAudioSource(fs=48_000, block_size=4_800, device=0)
+        mock_stream = MagicMock()
+        src._stream = mock_stream
+        src._running = True
+        return src, mock_stream
+
+    def test_stop_clears_stream_on_success(self):
+        """After a clean stop(), _stream must be None."""
+        src, _ = self._make_source()
+        src.stop()
+        self.assertIsNone(src._stream)
+        self.assertFalse(src._running)
+
+    def test_stop_clears_stream_when_close_raises(self):
+        """_stream must be set to None even if close() raises (resource-leak regression)."""
+        src, mock_stream = self._make_source()
+        mock_stream.close.side_effect = RuntimeError("simulated close failure")
+        with self.assertRaises(RuntimeError):
+            src.stop()
+        # Despite the exception, the dangling reference must have been cleared.
+        self.assertIsNone(src._stream)
+
+    def test_stop_clears_stream_when_stop_raises(self):
+        """_stream must be set to None even if stream.stop() raises."""
+        src, mock_stream = self._make_source()
+        mock_stream.stop.side_effect = RuntimeError("simulated stop failure")
+        with self.assertRaises(RuntimeError):
+            src.stop()
+        self.assertIsNone(src._stream)
+
+    def test_stop_is_idempotent(self):
+        """Calling stop() when already stopped must not raise."""
+        src = SoundCardAudioSource(fs=48_000, block_size=4_800, device=0)
+        src.stop()  # _stream is None — should be a no-op
+        src.stop()  # second call should also be safe
 
 
 if __name__ == "__main__":

@@ -908,7 +908,7 @@ class Ft8TxCoordinator:
     # ── PTT helpers ────────────────────────────────────────────────────────
 
     def _ptt_on(self) -> None:
-        """Key PTT via CAT.  Logs error but does not raise."""
+        """Key PTT via CAT.  Logs error and re-raises on failure."""
         if self._radio is None:
             logger.debug("_ptt_on: no radio object (testing mode)")
             return

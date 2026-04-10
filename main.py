@@ -27,6 +27,8 @@ from ft8_tx import Ft8TxCoordinator, TxJob, TxState, validate_operator
 from ft8_ntp import Ft8SlotTimer, default_slot_timer
 from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState, ReceivedMessage
 
+_log = logging.getLogger(__name__)
+
 # --- Constants & Band Plans ---
 BANDS = {
     '160m': {'start': 1.800,  'end': 2.000,   'step': 0.001, 'mode': 'LSB'},
@@ -836,8 +838,8 @@ class RadioGUI:
                             samples=chunk.samples,
                             t0_monotonic=chunk.t0,
                         )
-                    except Exception:
-                        pass
+                    except Exception:  # noqa: BLE001
+                        _log.exception("FT8 decoder feed error")
 
                 # Basic RMS level indicator
                 x   = chunk.samples
@@ -1346,8 +1348,8 @@ class RadioGUI:
         self._stop_audio_stream()
         try:
             self._ft8.stop()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            _log.exception("FT8 decoder stop error during mode switch to voice")
         self._op_mode = "voice"
         self._apply_op_mode("voice")
 
@@ -1360,8 +1362,8 @@ class RadioGUI:
         # Start FT8 decoder (it will receive audio once the stream is started)
         try:
             self._ft8.start()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            _log.exception("FT8 decoder start error during mode switch to data")
         self._apply_op_mode("data")
 
     def _apply_op_mode(self, mode: str) -> None:

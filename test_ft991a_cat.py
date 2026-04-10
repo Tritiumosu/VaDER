@@ -9,6 +9,7 @@ Run with:  python -m pytest test_ft991a_cat.py -v
 """
 from __future__ import annotations
 
+import io
 import sys
 import types
 import unittest
@@ -60,6 +61,17 @@ class TestExistingCommands(unittest.TestCase):
         ctrl = _make_ctrl()
         ctrl.set_frequency(14.225)
         self.assertEqual(_last_write(ctrl), "FA014225000")
+
+    def test_set_frequency_no_stdout(self):
+        """set_frequency must not print debug output (regression for removed debug print)."""
+        ctrl = _make_ctrl()
+        buf = io.StringIO()
+        _orig, sys.stdout = sys.stdout, buf
+        try:
+            ctrl.set_frequency(14.074)
+        finally:
+            sys.stdout = _orig
+        self.assertEqual(buf.getvalue(), "", "set_frequency must not print to stdout")
 
     def test_get_frequency(self):
         ctrl = _make_ctrl()

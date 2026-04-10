@@ -153,8 +153,10 @@ class SoundCardAudioSource:
             try:
                 self._stream.stop()
             finally:
-                self._stream.close()
-            self._stream = None
+                try:
+                    self._stream.close()
+                finally:
+                    self._stream = None
 
     def chunks(self, *, timeout_s: float = 1.0) -> Generator[AudioChunk, None, None]:
         """

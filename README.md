@@ -414,7 +414,8 @@ Saved automatically when you click **Save** in the TX panel.
 | `main.py` | GUI TX panel, select-and-reply assist, CQ session assist, UI queue dispatch |
 
 ### 🗺️ Milestone 5 — QSO Logging
-- [ ] Save completed QSOs to ADIF file format (using `QsoRecord` from `ft8_qso.py`)
+- [x] `QsoRecord` dataclass with ADIF helpers (`adif_date()`, `adif_time()`) — data structure ready
+- [ ] Write completed QSOs to ADIF file (`.adi`) on `build_record()` completion
 - [ ] In-session log view (callsign, band, mode, time, RST)
 - [ ] Optional integration with Hamlog / LOTW / QRZ for lookups
 

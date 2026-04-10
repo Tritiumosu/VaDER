@@ -90,7 +90,6 @@ class Yaesu991AControl:
             .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         )
         self._execute(f"FA{hz:09d}")
-        print("mhz=", mhz, "hz_float=", float(mhz) * 1_000_000) # Temporary code to confirm frequency output via CAT
 
     def get_frequency(self):
         resp = self._execute("FA", read=True)
