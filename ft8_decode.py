@@ -38,6 +38,7 @@ import math
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -289,12 +290,46 @@ _AP_PARITY_ERROR_THRESHOLD: int = 15
 # centred between two 6.25 Hz grid points.  Trying these offsets finds the
 # optimal base frequency and significantly improves Costas scores and LLR quality
 # for off-grid signals.
-_FINE_FREQ_OFFSETS_HZ: tuple[float, ...] = (-3.0, -2.0, -1.0, 1.0, 2.0, 3.0)
+# Milestone 6: Wider search (±4 Hz) with ±0.5 Hz sub-steps catches transmitters
+# with ±3.5–4 Hz calibration offset (common with older rigs and cheap SDRs).
+_FINE_FREQ_OFFSETS_HZ: tuple[float, ...] = (
+    -4.0, -3.5, -3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0, 3.5, 4.0
+)
+
+# ---------------------------------------------------------------------------
+# Milestone 6 tunable decoder parameters
+# ---------------------------------------------------------------------------
+# Minimum Costas-array match count to accept a sync candidate.
+# Lowered from 7 to 5 so LDPC+CRC acts as the final arbiter (matching WSJT-X
+# behaviour) and weak signals are not discarded at the sync stage.
+_MIN_COSTAS_MATCHES: int = 5
+
+# Maximum number of sync candidates to process per slot after deduplication.
+# The waterfall search returns up to 40 coarse hits; capping at 10 left valid
+# weak signals on the table.  25 gives headroom for dense band openings.
+_MAX_SYNC_CANDIDATES: int = 25
+
+# Fine time-search step size as a fraction of one symbol duration.
+# 1/8  = 20 ms (former default) → 1/16 = 10 ms halves worst-case ISI error
+# and doubles the number of tested time offsets per candidate (from 9 to 17).
+_FINE_DT_FRACTION: float = 1.0 / 16.0
+
+# Adaptive LDPC: if the baseline 50-iteration decode leaves this many or fewer
+# unsatisfied parity checks, retry with a higher iteration budget before giving
+# up.  Signals in this "near-miss" zone often converge with more iterations.
+_ADAPTIVE_LDPC_ERROR_THRESHOLD: int = 5
+_ADAPTIVE_LDPC_MAX_ITERATIONS: int = 100
+
+# Deep search (iterative interference cancellation): maximum decode passes
+# performed on successive residual frames.  Set to 0 to disable deep search.
+_DEEP_SEARCH_MAX_PASSES: int = 3
 
 # Common AP tuples (n28a encoding helpers)
 _AP_BITS_I3_1 = ((74, 0), (75, 0), (76, 1))   # i3 = 001
 _AP_BITS_I3_2 = ((74, 0), (75, 1), (76, 0))   # i3 = 010
 _AP_BITS_I3_0 = ((74, 0), (75, 0), (76, 0))   # i3 = 000
+_AP_BITS_I3_3 = ((74, 0), (75, 1), (76, 1))   # i3 = 011  (non-standard/hashed calls)
+_AP_BITS_I3_4 = ((74, 1), (75, 0), (76, 0))   # i3 = 100  (WWROF contest)
 # n28a=2 (CQ): 28-bit MSB-first encoding of 2 = ...00000010
 _AP_BITS_N28A_CQ = tuple((i, 0) for i in range(26)) + ((26, 1), (27, 0))   # type: ignore[assignment]
 # n28a=0 (DE): all 28 bits zero
@@ -306,6 +341,9 @@ _AP_PASSES: tuple[tuple[str, tuple[tuple[int, int], ...]], ...] = (
     # Generic message-type passes (3 known bits each – safe, low false-positive risk)
     ("i3=1",     _AP_BITS_I3_1),
     ("i3=2",     _AP_BITS_I3_2),
+    # Non-standard and contest sub-types (3-bit priors – cheap and useful)
+    ("i3=3",     _AP_BITS_I3_3),
+    ("i3=4",     _AP_BITS_I3_4),
     # CQ + standard type-1 (32 known bits: n28a=CQ, ipa=0, i3=1 – common on FT8 bands)
     ("CQ+i3=1",  _AP_BITS_N28A_CQ + ((28, 0),) + _AP_BITS_I3_1),   # type: ignore[operator]
     # DE + standard type-1 (32 known bits: n28a=DE, ipa=0, i3=1)
@@ -430,11 +468,37 @@ class FT8SymbolEnergyExtractor:
     For each symbol position, a sym_n-point coherent DFT is evaluated at the
     8 tone frequencies f0 + k·6.25 Hz (k=0..7).  This is equivalent to the
     matched-filter approach used in WSJT-X / ft8_lib.
+
+    Milestone 6: DFT basis matrix is cached per f0_hz.  When exploring many
+    time offsets for the same candidate frequency the basis is identical and
+    need only be computed once.
     """
+
+    # Maximum number of distinct f0 values to keep in the basis cache.
+    # At 6.25 Hz spacing over a 200–3200 Hz band, there are ≤ 480 possible
+    # coarse bins; 64 covers the hot-band portion and most fine-freq variants.
+    _CACHE_MAXSIZE: int = 64
 
     def __init__(self, fs: int = FT8_FS) -> None:
         self.fs = int(fs)
         self.sym_n = int(round(FT8_SYMBOL_DURATION_S * self.fs))  # 1920 @ 12 kHz
+        # {f0_hz: basis (8, sym_n) complex128}
+        self._basis_cache: dict[float, np.ndarray] = {}
+
+    def _get_basis(self, f0_hz: float) -> np.ndarray:
+        """Return (cached) DFT basis matrix for the given base frequency."""
+        basis = self._basis_cache.get(f0_hz)
+        if basis is None:
+            phase_inc = 2.0 * math.pi * np.array(
+                [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
+            ) / float(self.fs)
+            t_sym = np.arange(self.sym_n, dtype=np.float64)
+            basis = np.exp(-1j * np.outer(phase_inc, t_sym))  # (8, sym_n)
+            if len(self._basis_cache) >= self._CACHE_MAXSIZE:
+                # Evict an arbitrary entry to stay within the budget.
+                self._basis_cache.pop(next(iter(self._basis_cache)))
+            self._basis_cache[f0_hz] = basis
+        return basis
 
     def extract_all_79(
         self,
@@ -460,12 +524,8 @@ class FT8SymbolEnergyExtractor:
         sym_n = self.sym_n
         t0_n = int(round(t0_s * self.fs))
 
-        # Basis matrix: exp(−j·2π·f_k/fs · t) for tone k, sample t  → (8, sym_n)
-        phase_inc = 2.0 * math.pi * np.array(
-            [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
-        ) / float(self.fs)
-        t_sym = np.arange(sym_n, dtype=np.float64)
-        basis = np.exp(-1j * np.outer(phase_inc, t_sym))   # (8, sym_n)
+        # Basis matrix: cached per f0_hz (reused across fine time-search calls).
+        basis = self._get_basis(f0_hz)   # (8, sym_n)
 
         n_start = t0_n
         n_end   = t0_n + FT8_NSYMS * sym_n
@@ -947,21 +1007,21 @@ def _costas_score(E79: np.ndarray) -> tuple[int, int, bool]:
 
     Returns (matches, total=21, inverted).
     'inverted' indicates the signal is reflected (7-n tone).
+
+    Milestone 6: vectorised — uses a single np.argmax over all Costas rows
+    plus array comparison instead of the former 21-iteration Python loop.
     """
     E79 = np.asarray(E79, dtype=np.float64)
-    best = -1
-    best_inv = False
-    for inv in (False, True):
-        m = 0
-        for i, pos in enumerate(FT8_COSTAS_POSITIONS):
-            expected = FT8_COSTAS_TONES[i % 7]
-            if inv:
-                expected = 7 - expected
-            if int(np.argmax(E79[pos])) == expected:
-                m += 1
-        if m > best:
-            best, best_inv = m, inv
-    return best, 21, best_inv
+    cos_pos = np.array(FT8_COSTAS_POSITIONS, dtype=np.intp)          # (21,)
+    cos_tones = np.array(
+        [FT8_COSTAS_TONES[i % 7] for i in range(21)], dtype=np.int32  # (21,)
+    )
+    argmax_at_pos = np.argmax(E79[cos_pos], axis=1).astype(np.int32)  # (21,)
+    m_normal = int(np.sum(argmax_at_pos == cos_tones))
+    m_inv    = int(np.sum(argmax_at_pos == (7 - cos_tones)))
+    if m_normal >= m_inv:
+        return m_normal, 21, False
+    return m_inv, 21, True
 
 
 # Legacy API shims used by some existing test files
@@ -991,9 +1051,41 @@ def ft8_costas_rank_stats(Ec: np.ndarray) -> dict[str, float]:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# § 10  Offline Batch Decoder  (decode_wav)
-# ═══════════════════════════════════════════════════════════════════════════════
+def _costas_energy_llr_scale(E79: np.ndarray) -> float:
+    """
+    Estimate a soft LLR scaling factor from the Costas symbol energy ratios.
+
+    Milestone 6 — Soft Costas-energy LLR scaling:
+    For each of the 21 Costas symbols the ratio (best_tone_energy /
+    second_best_energy) approximates the instantaneous per-symbol SNR.  The
+    geometric mean of these ratios serves as a slot-level quality metric.  A
+    smooth mapping converts it to a multiplicative factor applied to the
+    channel LLRs before LDPC belief propagation, improving convergence under
+    multipath fading without changing the variance-24 normalisation target.
+
+    The mapping is intentionally conservative:
+      ratio ≤ 1 (noise-dominated)  → scale ≈ 0.7 (mild damping)
+      ratio ≈ 4 (typical signal)   → scale ≈ 1.0 (neutral)
+      ratio ≥ 16 (strong signal)   → scale ≈ 1.3 (mild boost)
+
+    Returns a float in [0.6, 1.4].
+    """
+    cos_pos = np.array(FT8_COSTAS_POSITIONS, dtype=np.intp)   # (21,)
+    E_cos = np.asarray(E79, dtype=np.float64)[cos_pos]        # (21, 8)
+    # Sort descending along tone axis
+    E_sorted = np.sort(E_cos, axis=1)[:, ::-1]                # (21, 8) desc
+    second_best = E_sorted[:, 1]
+    best = E_sorted[:, 0]
+    eps = 1e-12
+    ratios = best / np.maximum(second_best, eps)               # (21,)
+    # Geometric mean in log domain (clamp ratios to ≥1 to stay non-negative)
+    log_ratios = np.log(np.maximum(ratios, 1.0))
+    geo_mean = float(np.exp(np.mean(log_ratios)))
+    # Map: log4(geo_mean) centred at 1, with tanh compression
+    # scale = 1 + 0.3 * tanh((log(geo_mean) - log(4)) / log(4))
+    x = (math.log(max(geo_mean, 1.0)) - math.log(4.0)) / math.log(4.0)
+    scale = 1.0 + 0.3 * math.tanh(x)
+    return max(0.6, min(1.4, scale))
 
 @dataclass(frozen=True)
 class FT8DecodeResult:
@@ -1173,7 +1265,7 @@ def decode_wav(
 
                 E79 = extractor.extract_all_79(frame, t0_s=t0_s, f0_hz=f0_hz)
                 costas_m, _, _ = _costas_score(E79)
-                if costas_m < 7:
+                if costas_m < _MIN_COSTAS_MATCHES:
                     continue
 
                 # Fine frequency refinement: try sub-bin Hz offsets to handle signals
@@ -1195,17 +1287,33 @@ def decode_wav(
                 if var > 1e-10:
                     ch_llrs = ch_llrs * math.sqrt(24.0 / var)
 
+                # Milestone 6: Soft Costas-energy LLR scaling.
+                ch_llrs = ch_llrs * _costas_energy_llr_scale(E79)
+
                 ok, payload, iters, _base_errs = ft8_ldpc_decode(ch_llrs, max_iterations=max_iterations)
+                # Milestone 6: Adaptive LDPC for near-miss signals.
+                if not ok and _base_errs <= _ADAPTIVE_LDPC_ERROR_THRESHOLD:
+                    ok, payload, iters, _base_errs = ft8_ldpc_decode(
+                        ch_llrs, max_iterations=_ADAPTIVE_LDPC_MAX_ITERATIONS
+                    )
                 # If baseline fails with few parity errors (near-miss real signal),
                 # try AP passes for common message types.
                 if not ok and _base_errs <= _AP_PARITY_ERROR_THRESHOLD:
                     for _ap_name, _ap_bits in _AP_PASSES:
-                        ok, payload, iters, _ = ft8_ldpc_decode(
+                        ok, payload, iters, _base_errs = ft8_ldpc_decode(
                             ch_llrs, max_iterations=max_iterations,
                             ap_assignments=_ap_bits,
                         )
                         if ok:
                             break
+                        if _base_errs <= _ADAPTIVE_LDPC_ERROR_THRESHOLD:
+                            ok, payload, iters, _base_errs = ft8_ldpc_decode(
+                                ch_llrs,
+                                max_iterations=_ADAPTIVE_LDPC_MAX_ITERATIONS,
+                                ap_assignments=_ap_bits,
+                            )
+                            if ok:
+                                break
                 if not ok:
                     continue
 
@@ -1585,6 +1693,143 @@ def _ft8_waterfall_sync(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# § 14b  Interference Cancellation Helpers (Milestone 6 — deep search)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_callsign_ap_passes(
+    callsign: str,
+) -> list[tuple[str, tuple[tuple[int, int], ...]]]:
+    """
+    Build AP pass tuples that inject a known callsign into LDPC decoding.
+
+    Milestone 6 — Callsign-aware AP passes:
+    When the operator has an active QSO partner whose callsign is known, we
+    can inject that callsign's 28-bit n28 encoding as a priori bits into extra
+    LDPC passes.  This targets the common near-miss scenario where BP almost
+    converges but cannot cross the threshold because the callsign bits are
+    marginal.
+
+    Parameters
+    ----------
+    callsign : str  — the DX station callsign (will be packed to n28)
+
+    Returns
+    -------
+    List of (name, bits) tuples suitable for appending to _AP_PASSES.
+    Two passes are generated:
+      * callsign as n28a (bits  0-27) + i3=1 — DX is the calling station
+      * callsign as n28b (bits 29-56) + i3=1 — DX is the called station
+    An empty list is returned if the callsign cannot be packed.
+    """
+    # Import here to avoid a circular dependency at module level; ft8_encode
+    # has no dependency on ft8_decode.
+    try:
+        from ft8_encode import ft8_pack_callsign
+        n28 = ft8_pack_callsign(callsign)
+    except Exception:
+        return []
+
+    # 28-bit MSB-first decomposition: bit 0 = MSB (bit 27 of n28)
+    n28_bits: tuple[tuple[int, int], ...] = tuple(
+        (i, int((n28 >> (27 - i)) & 1)) for i in range(28)
+    )
+
+    name = callsign.upper()
+    # n28a position: bits 0-27, ipa=0 (bit 28)
+    bits_n28a: tuple[tuple[int, int], ...] = (
+        n28_bits + ((28, 0),) + _AP_BITS_I3_1   # type: ignore[operator]
+    )
+    # n28b position: bits 29-56, ipb=0 (bit 57)
+    n28b_bits: tuple[tuple[int, int], ...] = tuple(
+        (29 + i, int((n28 >> (27 - i)) & 1)) for i in range(28)
+    )
+    bits_n28b: tuple[tuple[int, int], ...] = (
+        n28b_bits + ((57, 0),) + _AP_BITS_I3_1  # type: ignore[operator]
+    )
+    return [
+        (f"{name}(n28a)+i3=1", bits_n28a),
+        (f"{name}(n28b)+i3=1", bits_n28b),
+    ]
+
+
+def _subtract_decoded_signal(
+    frame: np.ndarray,
+    *,
+    t0_s: float,
+    f0_hz: float,
+    symbols: np.ndarray,
+    fs: int,
+) -> np.ndarray:
+    """
+    Reconstruct and subtract a decoded FT8 signal from an audio frame.
+
+    Milestone 6 — Iterative interference cancellation (deep search):
+    Given the 79-symbol tone sequence for a successfully decoded signal and
+    its time/frequency location in the frame, this function:
+      1. Synthesises the signal at unit amplitude (phase-continuous 8-FSK).
+      2. Estimates the actual amplitude by comparing the measured Costas-
+         symbol energy to the synthesised Costas-symbol energy.
+      3. Subtracts the scaled synthesised waveform from the frame.
+
+    The subtraction is performed in-place on a copy of the frame.  The
+    caller should use the returned residual frame for a subsequent decode pass.
+
+    Parameters
+    ----------
+    frame   : 1-D float audio (at ``fs`` Hz)
+    t0_s    : signal start time relative to frame start (seconds)
+    f0_hz   : base tone frequency (Hz)
+    symbols : (79,) uint8 — decoded tone indices (0–7)
+    fs      : audio sample rate (Hz)
+
+    Returns
+    -------
+    np.ndarray  residual frame (same shape as ``frame``, float64)
+    """
+    from ft8_encode import ft8_symbols_to_audio, FT8_FS as _ENC_FS
+
+    sym_n = int(round(FT8_SYMBOL_DURATION_S * fs))
+    t0_n = int(round(t0_s * fs))
+    total_n = FT8_NSYMS * sym_n
+
+    # Synthesise the FT8 tone sequence at unit amplitude (ramp suppressed so
+    # we can estimate amplitude uniformly across the whole signal).
+    synth_f32 = ft8_symbols_to_audio(
+        symbols, f0_hz=f0_hz, fs=fs, amplitude=1.0, ramp_samples=0
+    )
+    synth = synth_f32.astype(np.float64)
+
+    # Estimate signal amplitude from Costas positions (known, reliable energy).
+    meas_e = 0.0
+    synth_e = 0.0
+    for pos in FT8_COSTAS_POSITIONS:
+        start_frame = t0_n + pos * sym_n
+        end_frame = start_frame + sym_n
+        start_synth = pos * sym_n
+        end_synth = start_synth + sym_n
+        if start_frame < 0 or end_frame > len(frame):
+            continue
+        meas_e  += float(np.sum(np.asarray(frame[start_frame:end_frame], dtype=np.float64) ** 2))
+        synth_e += float(np.sum(synth[start_synth:end_synth] ** 2))
+
+    if synth_e < 1e-12:
+        return np.asarray(frame, dtype=np.float64).copy()
+
+    amplitude = math.sqrt(meas_e / synth_e)
+
+    # Build the residual by subtracting the scaled synthesised waveform.
+    residual = np.asarray(frame, dtype=np.float64).copy()
+    frame_start = max(0, t0_n)
+    frame_end   = min(len(residual), t0_n + total_n)
+    synth_start = frame_start - t0_n
+    synth_end   = synth_start + (frame_end - frame_start)
+    if frame_end > frame_start:
+        residual[frame_start:frame_end] -= amplitude * synth[synth_start:synth_end]
+
+    return residual
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # § 14  FT8ConsoleDecoder  (end-to-end streaming decoder)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1605,6 +1850,15 @@ class FT8ConsoleDecoder:
         while running:
             decoder.feed(fs=chunk.fs, samples=chunk.samples, t0_monotonic=chunk.t0)
         decoder.stop()
+
+    Milestone 6 additions
+    ---------------------
+    * ``set_dx_callsign(call)`` — injects the active QSO partner's callsign
+      into extra LDPC AP passes, improving decode of near-miss messages from
+      that station.
+    * Deep search (iterative interference cancellation) is enabled by default
+      (up to ``_DEEP_SEARCH_MAX_PASSES`` residual passes).  Set
+      ``deep_search_passes = 0`` to disable it.
     """
 
     def __init__(
@@ -1638,7 +1892,37 @@ class FT8ConsoleDecoder:
         )
 
         self._debug: bool = True
-        self._min_costas_matches: int = 7
+        # Milestone 6: use lowered default threshold (5 instead of 7).
+        self._min_costas_matches: int = _MIN_COSTAS_MATCHES
+        # Milestone 6: number of iterative interference-cancellation passes.
+        self.deep_search_passes: int = _DEEP_SEARCH_MAX_PASSES
+        # Milestone 6: callsign-aware AP pass tuples (thread-safe read, Tk writes).
+        self._dx_ap_passes: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+
+    def set_dx_callsign(self, callsign: Optional[str]) -> None:
+        """
+        Register the active QSO partner's callsign for callsign-aware AP passes.
+
+        Milestone 6 — Callsign-aware AP passes:
+        Calling this with a valid callsign string causes the decoder to inject
+        that callsign's n28 bits into additional LDPC belief-propagation passes
+        when a baseline decode narrowly fails (best_errors ≤ AP threshold).
+        This targets the common near-miss scenario where BP cannot converge
+        solely because the partner's callsign bits are marginal.
+
+        Call with ``None`` (or an empty string) to clear the partner context
+        (e.g. when the QSO ends or a CQ session is aborted).
+
+        Parameters
+        ----------
+        callsign : str or None
+            DX station callsign (e.g. 'K9XYZ').  Invalid callsigns are silently
+            ignored (no AP passes generated).
+        """
+        if not callsign:
+            self._dx_ap_passes = []
+            return
+        self._dx_ap_passes = _make_callsign_ap_passes(callsign.strip().upper())
 
     def start(self) -> None:
         self._stop.clear()
@@ -1666,23 +1950,205 @@ class FT8ConsoleDecoder:
     def _fmt_utc(epoch_s: float) -> str:
         return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%H:%M:%S")
 
-    def _decode_frame(self, frame: np.ndarray, utc: str) -> None:
-        """Run full decode pipeline on one 15 s frame.
+    # ------------------------------------------------------------------
+    # Internal decode helpers
+    # ------------------------------------------------------------------
 
-        Sync search follows the ft8_lib ``find_sync`` approach:
-          1. Fast waterfall sync  — incoherent spectrogram, covers full
-             FT8 timing window in O(n_wins × n_f0) time (< 5 ms).
-          2. Fine time search     — ±80 ms at 20 ms steps around each
-             coarse candidate to resolve sub-symbol timing (ft8_lib style).
-          3. Fine frequency       — ±3 Hz sub-bin refinement.
-          4. LLR extraction + LDPC + AP passes (unchanged).
+    def _decode_one_candidate(
+        self,
+        frame: np.ndarray,
+        t0_coarse: float,
+        f0_hz_coarse: float,
+        seen_msg: set,
+    ) -> "list[tuple[str, float, float, float, np.ndarray, np.ndarray]]":
+        """
+        Fine-search, LLR extraction, LDPC decode for one sync candidate.
+
+        Returns a list of (message, f0_hz, t0_s, snr_db, payload_91, symbols_79)
+        tuples for each successful decode (normally 0 or 1).
+
+        Milestone 6: extracted from _decode_frame to allow parallel execution
+        via ThreadPoolExecutor — the frame array is read-only and all state
+        is local to this call.
         """
         _T0_MIN = -0.50
-        _T0_MAX = 15.0 - FT8_TX_DURATION_S   # ≈ +2.36 s
+        _T0_MAX = 15.0 - FT8_TX_DURATION_S
 
-        # ── Step 1: Fast waterfall sync search (ft8_lib find_sync style) ─────
-        # Covers the full valid FT8 window [_T0_MIN, _T0_MAX] via a precomputed
-        # incoherent power spectrogram; typically completes in < 5 ms.
+        # ── Fine time search ──────────────────────────────────────────────────
+        # Milestone 6: step is FT8_SYMBOL_DURATION_S * _FINE_DT_FRACTION
+        # = 10 ms (was 20 ms), giving 17 tested offsets instead of 9.
+        dt_fine = FT8_SYMBOL_DURATION_S * _FINE_DT_FRACTION
+        half_sym = FT8_SYMBOL_DURATION_S * 0.5
+        best_m = -1
+        best_t0 = t0_coarse
+        best_E79: Optional[np.ndarray] = None
+        for dt in np.arange(-half_sym, half_sym + dt_fine / 2.0, dt_fine):
+            t0_try = float(t0_coarse) + float(dt)
+            if t0_try < _T0_MIN or t0_try > _T0_MAX:
+                continue
+            E_try = self._extractor.extract_all_79(
+                frame, t0_s=t0_try, f0_hz=f0_hz_coarse
+            )
+            m, _, _ = _costas_score(E_try)
+            if m > best_m:
+                best_m = m
+                best_t0 = t0_try
+                best_E79 = E_try
+
+        if best_E79 is None:
+            return []
+        t0_s = best_t0
+        costas_m = best_m
+        E79 = best_E79
+
+        # ── Fine frequency refinement ─────────────────────────────────────────
+        # Milestone 6: ±4 Hz with 0.5 Hz sub-steps (was ±3 Hz, 1 Hz steps).
+        _best_m = costas_m
+        _best_f0 = f0_hz_coarse
+        _best_E79 = E79
+        for _fdf in _FINE_FREQ_OFFSETS_HZ:
+            _E79_try = self._extractor.extract_all_79(
+                frame, t0_s=t0_s, f0_hz=f0_hz_coarse + _fdf
+            )
+            _m_try, _, _ = _costas_score(_E79_try)
+            if _m_try > _best_m:
+                _best_m = _m_try
+                _best_f0 = f0_hz_coarse + _fdf
+                _best_E79 = _E79_try
+        if _best_m > costas_m and self._debug:
+            print(
+                f"    [fine-freq] {f0_hz_coarse:.1f} → {_best_f0:.1f} Hz"
+                f"  costas {costas_m} → {_best_m}/21",
+                flush=True,
+            )
+        costas_m = _best_m
+        f0_hz = _best_f0
+        E79 = _best_E79
+
+        if self._debug:
+            print(
+                f"  [cand] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
+                f"  costas={costas_m}/21",
+                flush=True,
+            )
+        if costas_m < self._min_costas_matches:
+            if self._debug:
+                print(
+                    f"    -> costas {costas_m} < {self._min_costas_matches}"
+                    f" threshold -- skip",
+                    flush=True,
+                )
+            return []
+
+        # ── LLR extraction, normalisation ─────────────────────────────────────
+        E_payload, hard_syms = ft8_extract_payload_symbols(E79)
+        _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
+
+        var = float(np.var(ch_llrs))
+        if var > 1e-10:
+            ch_llrs = ch_llrs * math.sqrt(24.0 / var)
+
+        # Milestone 6: Soft Costas-energy LLR scaling — multiply LLRs by a
+        # quality factor derived from the energy contrast at the Costas
+        # positions, improving BP convergence under multipath fading.
+        llr_scale = _costas_energy_llr_scale(E79)
+        if llr_scale != 1.0:
+            ch_llrs = ch_llrs * llr_scale
+
+        # ── LDPC + AP passes ──────────────────────────────────────────────────
+        ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)
+        ap_pass_name = "none"
+
+        if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
+            # Milestone 6: Adaptive LDPC — retry near-miss signals with more
+            # iterations before attempting AP passes.
+            if best_errors <= _ADAPTIVE_LDPC_ERROR_THRESHOLD:
+                ok, payload, iters, best_errors = ft8_ldpc_decode(
+                    ch_llrs, max_iterations=_ADAPTIVE_LDPC_MAX_ITERATIONS
+                )
+                if ok:
+                    ap_pass_name = "adaptive-iters"
+
+        if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
+            # Snapshot current DX AP passes (list may be updated from Tk thread).
+            dx_passes = list(self._dx_ap_passes)
+            all_ap = list(_AP_PASSES) + dx_passes
+            for _ap_name, _ap_bits in all_ap:
+                ok, payload, iters, best_errors = ft8_ldpc_decode(
+                    ch_llrs, ap_assignments=_ap_bits
+                )
+                if ok:
+                    ap_pass_name = _ap_name
+                    break
+                # Milestone 6: adaptive iterations for near-miss AP decodes.
+                if best_errors <= _ADAPTIVE_LDPC_ERROR_THRESHOLD:
+                    ok, payload, iters, best_errors = ft8_ldpc_decode(
+                        ch_llrs,
+                        ap_assignments=_ap_bits,
+                        max_iterations=_ADAPTIVE_LDPC_MAX_ITERATIONS,
+                    )
+                    if ok:
+                        ap_pass_name = _ap_name
+                        break
+
+        if self._debug:
+            if ok:
+                ap_tag = f" ap={ap_pass_name}" if ap_pass_name != "none" else ""
+                print(f"    [ldpc] OK  ({iters} iters{ap_tag})", flush=True)
+            else:
+                if best_errors == 0:
+                    rx_crc_bits = payload[77:91]
+                    rx_crc = int(
+                        sum(int(b) << (13 - i)
+                            for i, b in enumerate(rx_crc_bits))
+                    )
+                    calc_crc = _ft8_crc14(payload[:77])
+                    print(
+                        f"    [ldpc] LDPC OK ({iters} iters) -- CRC mismatch"
+                        f"  rx=0x{rx_crc:04X}  calc=0x{calc_crc:04X}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"    [ldpc] FAIL  {best_errors} parity errors"
+                        f"  ({iters} iters)",
+                        flush=True,
+                    )
+        if not ok:
+            return []
+
+        message = ft8_unpack_message(payload[:77])
+        if self._debug:
+            print(f"    [msg]  '{message}'", flush=True)
+        if message in seen_msg:
+            return []
+
+        # Re-encode to 79-tone symbols for interference cancellation.
+        try:
+            from ft8_encode import ft8_encode_to_symbols as _enc_syms
+            symbols = _enc_syms(message)
+        except Exception:
+            symbols = np.zeros(FT8_NSYMS, dtype=np.uint8)
+
+        snr_db = 10.0 * math.log10(max(costas_m / 21.0, 1e-6))
+        return [(message, f0_hz, t0_s, snr_db, payload[:91].copy(), symbols)]
+
+    def _decode_pass(
+        self,
+        frame: np.ndarray,
+        utc: str,
+        seen_msg: set,
+    ) -> "list[tuple[str, float, float, float, np.ndarray, np.ndarray]]":
+        """
+        Run one full waterfall-sync → fine-search → LDPC decode pass.
+
+        Milestone 6: Parallel candidate decode via ThreadPoolExecutor.
+        Returns a list of (message, f0_hz, t0_s, snr_db, payload_91, symbols_79)
+        for all new decodes found in this pass.
+        """
+        _T0_MIN = -0.50
+        _T0_MAX = 15.0 - FT8_TX_DURATION_S
+
         coarse = _ft8_waterfall_sync(
             frame,
             fs=self.fs_proc,
@@ -1699,7 +2165,8 @@ class FT8ConsoleDecoder:
                   flush=True)
 
         # De-duplicate by frequency: keep only the best-scoring t0 per f0 bin,
-        # then take the top 10 for the (more expensive) fine decode loop.
+        # then take the top _MAX_SYNC_CANDIDATES for the fine decode loop.
+        # Milestone 6: cap raised from 10 → 25.
         seen_f0_bin: set[int] = set()
         sync_cands: list[tuple[float, float, float]] = []
         df = FT8_TONE_SPACING_HZ
@@ -1710,7 +2177,7 @@ class FT8ConsoleDecoder:
             seen_f0_bin.add(f0_bin)
             score_db = 10.0 * math.log10(max(cos_m / len(FT8_COSTAS_POSITIONS), 1e-6))
             sync_cands.append((t0_coarse, f0_hz, score_db))
-            if len(sync_cands) >= 10:
+            if len(sync_cands) >= _MAX_SYNC_CANDIDATES:
                 break
 
         if self._debug:
@@ -1725,135 +2192,110 @@ class FT8ConsoleDecoder:
                     flush=True,
                 )
 
+        results: list[tuple[str, float, float, float, np.ndarray, np.ndarray]] = []
+
+        # Milestone 6: Parallel candidate decode.
+        # Each candidate reads only the immutable frame array; BLAS calls in
+        # the matmul / LDPC steps release the GIL, enabling real speedup on
+        # multi-core hardware.
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                    self._decode_one_candidate, frame, t0c, f0c, seen_msg
+                )
+                for t0c, f0c, _ in sync_cands
+            ]
+            for future in as_completed(futures):
+                try:
+                    for item in future.result():
+                        msg = item[0]
+                        if msg not in seen_msg:
+                            seen_msg.add(msg)
+                            results.append(item)
+                except Exception as exc:
+                    if self._debug:
+                        print(f"[FT8] candidate decode error: {exc!r}", flush=True)
+
+        return results
+
+    def _decode_frame(self, frame: np.ndarray, utc: str) -> None:
+        """Run full decode pipeline on one 15 s frame.
+
+        Sync search follows the ft8_lib ``find_sync`` approach:
+          1. Fast waterfall sync  — incoherent spectrogram, covers full
+             FT8 timing window in O(n_wins × n_f0) time (< 5 ms).
+          2. Fine time search     — ±80 ms at 10 ms steps (Milestone 6:
+             was 20 ms) around each coarse candidate.
+          3. Fine frequency       — ±4 Hz with ±0.5 Hz sub-steps
+             (Milestone 6: was ±3 Hz, 1 Hz steps).
+          4. LLR extraction + soft Costas scaling + LDPC + AP passes.
+          5. Deep search (Milestone 6) — iterative interference cancellation.
+        """
         seen_msg: set[str] = set()
-        for t0_coarse, f0_hz, _score in sync_cands:
-            # ── Step 2: Fine time search (ft8_lib sub-symbol refinement) ─────
-            # The waterfall has 160 ms (1 symbol) resolution.  Search ±80 ms
-            # (half a symbol) at 20 ms steps to find the exact signal start.
-            dt_fine = FT8_SYMBOL_DURATION_S / 8.0        # 20 ms
-            half_sym = FT8_SYMBOL_DURATION_S * 0.5       # 80 ms
-            best_m = -1
-            best_t0 = t0_coarse
-            best_E79: Optional[np.ndarray] = None
-            for dt in np.arange(-half_sym, half_sym + dt_fine / 2.0, dt_fine):
-                t0_try = float(t0_coarse) + float(dt)
-                if t0_try < _T0_MIN or t0_try > _T0_MAX:
-                    continue
-                E_try = self._extractor.extract_all_79(
-                    frame, t0_s=t0_try, f0_hz=f0_hz
-                )
-                m, _, _ = _costas_score(E_try)
-                if m > best_m:
-                    best_m = m
-                    best_t0 = t0_try
-                    best_E79 = E_try
 
-            if best_E79 is None:
-                continue
-            t0_s = best_t0
-            costas_m = best_m
-            E79 = best_E79
-
-            # ── Step 3: Fine frequency refinement ─────────────────────────────
-            _best_m = costas_m
-            _best_f0 = f0_hz
-            _best_E79 = E79
-            for _fdf in _FINE_FREQ_OFFSETS_HZ:
-                _E79_try = self._extractor.extract_all_79(
-                    frame, t0_s=t0_s, f0_hz=f0_hz + _fdf
-                )
-                _m_try, _, _ = _costas_score(_E79_try)
-                if _m_try > _best_m:
-                    _best_m = _m_try
-                    _best_f0 = f0_hz + _fdf
-                    _best_E79 = _E79_try
-            if _best_m > costas_m and self._debug:
+        # Initial decode pass.
+        first_pass = self._decode_pass(frame, utc, seen_msg)
+        for msg, f0_hz, t0_s, snr_db, payload, _syms in first_pass:
+            if self._debug:
                 print(
-                    f"    [fine-freq] {f0_hz:.1f} → {_best_f0:.1f} Hz"
-                    f"  costas {costas_m} → {_best_m}/21",
+                    f"[FT8] {utc} DECODE f0={f0_hz:.1f}Hz t0={t0_s:+.02f}s "
+                    f"snr={snr_db:+.1f}dB '{msg}'",
                     flush=True,
                 )
-            costas_m = _best_m
-            f0_hz = _best_f0
-            E79 = _best_E79
+            if self._on_decode is not None:
+                self._on_decode(utc, f0_hz, snr_db, msg)
+
+        # Milestone 6: Deep search — iterative interference cancellation.
+        # After decoding successfully, subtract each signal's reconstructed
+        # waveform from the audio frame and decode the residual to find weaker
+        # signals that were masked by co-channel interference.
+        decoded_signals = list(first_pass)  # (msg, f0_hz, t0_s, snr_db, pay, sym)
+
+        for ds_iter in range(self.deep_search_passes):
+            if not decoded_signals:
+                break
+            # Build residual by subtracting all signals decoded so far.
+            residual = np.asarray(frame, dtype=np.float64)
+            for _, f0_hz, t0_s, _, _pay, syms in decoded_signals:
+                try:
+                    residual = _subtract_decoded_signal(
+                        residual,
+                        t0_s=t0_s,
+                        f0_hz=f0_hz,
+                        symbols=syms,
+                        fs=self.fs_proc,
+                    )
+                except Exception as exc:
+                    if self._debug:
+                        print(
+                            f"[FT8] deep-search subtract error: {exc!r}",
+                            flush=True,
+                        )
 
             if self._debug:
                 print(
-                    f"  [cand] t0={t0_s:+.3f}s  f0={f0_hz:7.1f} Hz"
-                    f"  costas={costas_m}/21",
+                    f"[FT8] {utc} deep-search pass {ds_iter + 1}/"
+                    f"{self.deep_search_passes} — decoding residual",
                     flush=True,
                 )
-            if costas_m < self._min_costas_matches:
+            new_decodes = self._decode_pass(residual.astype(np.float32), utc, seen_msg)
+            if not new_decodes:
                 if self._debug:
                     print(
-                        f"    -> costas {costas_m} < {self._min_costas_matches}"
-                        f" threshold -- skip",
+                        f"[FT8] {utc} deep-search pass {ds_iter + 1}: no new decodes",
                         flush=True,
                     )
-                continue
-
-            # ── Step 4: LLR extraction, normalisation, LDPC + AP ─────────────
-            E_payload, hard_syms = ft8_extract_payload_symbols(E79)
-            _, ch_llrs = ft8_gray_decode(hard_syms, E_payload)
-
-            var = float(np.var(ch_llrs))
-            if var > 1e-10:
-                ch_llrs = ch_llrs * math.sqrt(24.0 / var)
-
-            ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)
-            ap_pass_name = "none"
-            if not ok and best_errors <= _AP_PARITY_ERROR_THRESHOLD:
-                for _ap_name, _ap_bits in _AP_PASSES:
-                    ok, payload, iters, best_errors = ft8_ldpc_decode(
-                        ch_llrs, ap_assignments=_ap_bits
+                break
+            for msg, f0_hz, t0_s, snr_db, payload, syms in new_decodes:
+                if self._debug:
+                    print(
+                        f"[FT8] {utc} DEEP DECODE f0={f0_hz:.1f}Hz t0={t0_s:+.02f}s "
+                        f"snr={snr_db:+.1f}dB '{msg}'",
+                        flush=True,
                     )
-                    if ok:
-                        ap_pass_name = _ap_name
-                        break
-            if self._debug:
-                if ok:
-                    ap_tag = f" ap={ap_pass_name}" if ap_pass_name != "none" else ""
-                    print(f"    [ldpc] OK  ({iters} iters{ap_tag})", flush=True)
-                else:
-                    if best_errors == 0:
-                        rx_crc_bits = payload[77:91]
-                        rx_crc = int(
-                            sum(int(b) << (13 - i)
-                                for i, b in enumerate(rx_crc_bits))
-                        )
-                        calc_crc = _ft8_crc14(payload[:77])
-                        print(
-                            f"    [ldpc] LDPC OK ({iters} iters) -- CRC mismatch"
-                            f"  rx=0x{rx_crc:04X}  calc=0x{calc_crc:04X}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"    [ldpc] FAIL  {best_errors} parity errors"
-                            f"  ({iters} iters)",
-                            flush=True,
-                        )
-            if not ok:
-                continue
-
-            message = ft8_unpack_message(payload[:77])
-            if self._debug:
-                print(f"    [msg]  '{message}'", flush=True)
-            if message in seen_msg:
-                continue
-            seen_msg.add(message)
-
-            snr_db = 10.0 * math.log10(max(costas_m / 21.0, 1e-6))
-
-            if self._debug:
-                print(
-                    f"[FT8] {utc} DECODE f0={f0_hz:.1f}Hz t0={t0_s:+.2f}s "
-                    f"snr={snr_db:+.1f}dB iters={iters} '{message}'",
-                    flush=True,
-                )
-
-            if self._on_decode is not None:
-                self._on_decode(utc, f0_hz, snr_db, message)
+                if self._on_decode is not None:
+                    self._on_decode(utc, f0_hz, snr_db, msg)
+            decoded_signals = new_decodes  # only new signals for next subtraction
 
     def _worker(self) -> None:
         while not self._stop.is_set():
