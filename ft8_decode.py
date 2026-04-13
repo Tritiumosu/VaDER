@@ -193,6 +193,76 @@ for _m, _row in enumerate(_BP_Nm):
         _BP_Mn[_n].append(_m)
 del _m, _row, _n
 
+# ─── Vectorized BP decode pre-computed tables ─────────────────────────────────
+# Built once at module import to eliminate per-call Python-loop overhead inside
+# ft8_ldpc_decode.  The FT8 (174,91) code has column weight exactly 3 (each
+# variable node connects to exactly 3 check nodes) and check-node degree 6 or 7.
+
+
+def _build_bp_numpy_tables() -> tuple:
+    """
+    Pre-compute dense/flat index arrays for the fully-vectorised numpy LDPC BP
+    decoder.
+
+    Returns
+    -------
+    nm_dense   : (83, max_row) int32  — variable-node indices, -1 for padding
+    nm_valid   : (83, max_row) bool   — True only for real (non-padded) edges
+    max_row    : int                  — maximum check-node degree (7 for FT8)
+    edges_vn   : (E,) int32           — variable-node index for each edge
+    edges_midx : (E,) int32           — tov column (0/1/2) for that variable node
+    edges_ravel: (E,) int32           — flat index into (83, max_row) matrix
+    """
+    M = len(_BP_Nm)
+    max_row = max(len(r) for r in _BP_Nm)   # 7 for the FT8 (174,91) code
+
+    nm_dense = np.full((M, max_row), -1, dtype=np.int32)
+    nm_valid = np.zeros((M, max_row), dtype=bool)
+
+    ev: list[int] = []    # variable-node index per edge
+    em: list[int] = []    # tov slot (m_idx) for that variable node
+    er: list[int] = []    # flat index into (83, max_row) padded matrix
+
+    for m, row in enumerate(_BP_Nm):
+        for n_idx, n in enumerate(row):
+            nm_dense[m, n_idx] = n
+            nm_valid[m, n_idx] = True
+            m_idx = _BP_Mn[n].index(m)
+            ev.append(n)
+            em.append(m_idx)
+            er.append(m * max_row + n_idx)
+
+    return (
+        nm_dense,
+        nm_valid,
+        max_row,
+        np.array(ev, dtype=np.int32),
+        np.array(em, dtype=np.int32),
+        np.array(er, dtype=np.int32),
+    )
+
+
+(
+    _BP_NM_DENSE,
+    _BP_NM_VALID,
+    _BP_MAX_ROW_LEN,
+    _BP_EDGES_VN,
+    _BP_EDGES_MIDX,
+    _BP_EDGES_RAVEL,
+) = _build_bp_numpy_tables()
+
+# Parity-check matrix H (83 × 174, uint8) for vectorised syndrome evaluation.
+# H[m, n] = 1 iff variable n participates in parity check m.
+_H_LDPC = np.zeros((83, 174), dtype=np.uint8)
+for _r, _cols in enumerate(_LDPC_CHECKS):
+    for _c in _cols:
+        _H_LDPC[_r, _c] = 1
+del _r, _cols, _c
+
+# Pre-built numpy copies of the Gray code tables — avoids per-call np.array().
+_GRAY_FWD_NP = np.array(_FT8_GRAY_MAP,    dtype=np.int32)  # gray_value → tone index
+_GRAY_INV_NP = np.array(_FT8_GRAY_DECODE, dtype=np.int32)  # tone index → gray_value
+
 # ---------------------------------------------------------------------------
 # A priori (AP) decode constants.
 # WSJT-X ft8b.f90 performs multiple BP passes with known structural bits clamped
@@ -390,21 +460,33 @@ class FT8SymbolEnergyExtractor:
         sym_n = self.sym_n
         t0_n = int(round(t0_s * self.fs))
 
-        # Pre-compute basis vectors: exp(−j·2π·f_k/fs · t) for t=0..sym_n-1
+        # Basis matrix: exp(−j·2π·f_k/fs · t) for tone k, sample t  → (8, sym_n)
         phase_inc = 2.0 * math.pi * np.array(
             [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
-        ) / float(self.fs)               # (8,) rad/sample
+        ) / float(self.fs)
         t_sym = np.arange(sym_n, dtype=np.float64)
         basis = np.exp(-1j * np.outer(phase_inc, t_sym))   # (8, sym_n)
 
-        E79 = np.zeros((FT8_NSYMS, 8), dtype=np.float64)
-        for s in range(FT8_NSYMS):
-            start = t0_n + s * sym_n
-            end = start + sym_n
-            if start < 0 or end > len(x):
-                continue
-            dft = basis @ x[start:end]             # (8,) complex
-            E79[s] = (dft * np.conj(dft)).real     # |DFT|²
+        n_start = t0_n
+        n_end   = t0_n + FT8_NSYMS * sym_n
+
+        if n_start >= 0 and n_end <= len(x):
+            # Fast path: all 79 symbols lie within the frame.
+            # Reshape audio into (79, sym_n) and evaluate all DFTs in one matmul:
+            #   (79, sym_n) @ (sym_n, 8)  →  (79, 8) complex — a single BLAS call.
+            x_matrix = x[n_start:n_end].reshape(FT8_NSYMS, sym_n)
+            dfts = x_matrix @ basis.T        # (79, 8) complex
+            E79 = np.abs(dfts) ** 2          # |DFT|²  (79, 8) float64
+        else:
+            # Fallback: per-symbol bounds check for edge-of-buffer cases.
+            E79 = np.zeros((FT8_NSYMS, 8), dtype=np.float64)
+            for s in range(FT8_NSYMS):
+                start = t0_n + s * sym_n
+                end   = start + sym_n
+                if start < 0 or end > len(x):
+                    continue
+                dft = basis @ x[start:end]
+                E79[s] = (dft * np.conj(dft)).real
         return E79
 
 
@@ -482,37 +564,37 @@ def ft8_gray_decode(
     syms = np.asarray(syms, dtype=np.int32)
     E = np.asarray(E, dtype=np.float64)
 
-    # gray_fwd[gv] = tone  (kFT8_Gray_map)
-    gray_fwd = np.array(_FT8_GRAY_MAP, dtype=np.int32)
-    # gray_inv[tone] = gv  (_FT8_GRAY_DECODE)
-    gray_inv = np.array(_FT8_GRAY_DECODE, dtype=np.int32)
+    N = FT8_NDATASYM   # 58
+    E_safe = np.maximum(E, 1e-30)   # (58, 8)
 
-    N = FT8_NDATASYM
-    hard_bits = np.empty(N * 3, dtype=np.uint8)
+    # Reorder energies so axis-1 indexes gray_value instead of tone index.
+    # s2[s, gv] = E_safe[s, gray_fwd[gv]]  — equivalent to the original inner loop
+    # "for gv in range(8): s2[gv] = row[gray_fwd[gv]]", but for all 58 symbols
+    # at once via numpy fancy indexing (no Python loop).
+    s2 = E_safe[:, _GRAY_FWD_NP]   # (58, 8)
+
+    # ── LLRs (ft8_lib ft8_extract_symbol conventions) ────────────────────────
+    # Bit 2 (MSB):  max(gv=4..7) − max(gv=0..3)
+    llr_b2 = np.max(s2[:, 4:8], axis=1) - np.max(s2[:, 0:4], axis=1)
+    # Bit 1:        max(gv=2,3,6,7) − max(gv=0,1,4,5)
+    llr_b1 = (np.max(s2[:, [2, 3, 6, 7]], axis=1)
+              - np.max(s2[:, [0, 1, 4, 5]], axis=1))
+    # Bit 0 (LSB):  max(gv=1,3,5,7) − max(gv=0,2,4,6)
+    llr_b0 = (np.max(s2[:, [1, 3, 5, 7]], axis=1)
+              - np.max(s2[:, [0, 2, 4, 6]], axis=1))
+
+    # Interleave into (174,): [b2_0, b1_0, b0_0, b2_1, b1_1, b0_1, …]
     llrs = np.empty(N * 3, dtype=np.float64)
-    E_safe = np.maximum(E, 1e-30)
+    llrs[0::3] = llr_b2
+    llrs[1::3] = llr_b1
+    llrs[2::3] = llr_b0
 
-    for s in range(N):
-        row = E_safe[s]
-        # s2[gv] = energy at the tone that carries gray_value gv
-        s2 = np.empty(8, dtype=np.float64)
-        for gv in range(8):
-            s2[gv] = row[gray_fwd[gv]]
-
-        llrs[3 * s + 0] = (
-            max(s2[4], s2[5], s2[6], s2[7]) - max(s2[0], s2[1], s2[2], s2[3])
-        )
-        llrs[3 * s + 1] = (
-            max(s2[2], s2[3], s2[6], s2[7]) - max(s2[0], s2[1], s2[4], s2[5])
-        )
-        llrs[3 * s + 2] = (
-            max(s2[1], s2[3], s2[5], s2[7]) - max(s2[0], s2[2], s2[4], s2[6])
-        )
-
-        gv = int(gray_inv[int(syms[s])])
-        hard_bits[3 * s + 0] = (gv >> 2) & 1
-        hard_bits[3 * s + 1] = (gv >> 1) & 1
-        hard_bits[3 * s + 2] = gv & 1
+    # ── Hard bits via gray inverse ────────────────────────────────────────────
+    gv_all = _GRAY_INV_NP[syms]   # (58,) gray values, no Python loop
+    hard_bits = np.empty(N * 3, dtype=np.uint8)
+    hard_bits[0::3] = (gv_all >> 2) & 1
+    hard_bits[1::3] = (gv_all >> 1) & 1
+    hard_bits[2::3] = gv_all & 1
 
     return hard_bits, llrs
 
@@ -531,6 +613,17 @@ def _ldpc_check(plain: np.ndarray) -> int:
         if x:
             errors += 1
     return errors
+
+
+def _ldpc_check_vec(plain: np.ndarray) -> int:
+    """
+    Vectorised parity check via H-matrix multiplication.
+
+    Equivalent to _ldpc_check but uses a precomputed dense H matrix and a
+    single numpy matmul instead of Python loops — roughly 50× faster.
+    """
+    syndrome = (_H_LDPC.astype(np.int32) @ plain.astype(np.int32)) % 2
+    return int(syndrome.sum())
 
 
 def ft8_ldpc_decode(
@@ -588,51 +681,63 @@ def ft8_ldpc_decode(
     N = 174
     CLAMP = 0.9999
     EPS = 1e-10
+    M = len(_BP_Nm)            # 83
+    max_row = _BP_MAX_ROW_LEN  # 7
 
-    tov: list[list[float]] = [[0.0, 0.0, 0.0] for _ in range(N)]
-    toc: list[list[float]] = [[0.0] * len(row) for row in _BP_Nm]
+    # tov[n, k]     — C→V message from check _BP_Mn[n][k] to variable n  (174×3)
+    tov = np.zeros((N, 3), dtype=np.float64)
+    # toc_padded[m, n_idx] — V→C message from variable to check m (83×max_row).
+    # Padding positions are initialised to 1.0 (neutral for multiplication).
+    toc_padded = np.ones((M, max_row), dtype=np.float64)
 
     plain = np.zeros(N, dtype=np.uint8)
-    best_errors = 83
+    best_errors = M
     best_plain = plain.copy()
     iterations_used = max_iterations
 
     for iteration in range(max_iterations):
-        # ── V→C ──────────────────────────────────────────────────────────
-        for m, row in enumerate(_BP_Nm):
-            for n_idx, n in enumerate(row):
-                Lmn = float(codeword[n])
-                for j in range(3):
-                    if _BP_Mn[n][j] != m:
-                        Lmn += tov[n][j]
-                toc[m][n_idx] = math.tanh(-Lmn / 2.0)  # ft8_lib uses tanh(-Tnm/2)
+        # ── V→C (fully vectorised) ────────────────────────────────────────────
+        # Extrinsic belief from variable n towards check m:
+        #   Lmn = (codeword[n] + Σ_k tov[n,k]) − tov[n, m_idx]
+        total = codeword + tov.sum(axis=1)                                   # (N,)
+        extrinsic = total[_BP_EDGES_VN] - tov[_BP_EDGES_VN, _BP_EDGES_MIDX] # (E,)
+        toc_flat = np.tanh(-extrinsic * 0.5)                                 # (E,)
+        toc_padded[:] = 1.0                           # reset to neutral element
+        toc_padded.ravel()[_BP_EDGES_RAVEL] = toc_flat  # scatter into padded matrix
 
-        # ── C→V ──────────────────────────────────────────────────────────
-        for m, row in enumerate(_BP_Nm):
-            prod_all = 1.0
-            for k in range(len(row)):
-                prod_all *= toc[m][k]
+        # ── C→V (log-domain product exclusion, fully vectorised) ─────────────
+        # For each check row m and position n_idx, compute the product of all
+        # tanh values in that row *excluding* position n_idx.
+        #
+        # sign(prod_excl[m,i]) = sign(prod_all[m]) · sign(toc[m,i])
+        # |prod_excl[m,i]|     = exp( Σ_j log|toc[m,j]| − log|toc[m,i]| )
+        #
+        # Padding cells hold 1.0: log(1)=0 contributes nothing to the sum,
+        # and sign(+1)=+1 is neutral for the product — both safe to include.
+        sign_toc = np.where(toc_padded >= 0, 1.0, -1.0)   # (M, max_row)
+        sign_toc[~_BP_NM_VALID] = 1.0                      # ensure padding = +1
+        log_abs_toc = np.log(np.maximum(np.abs(toc_padded), EPS))  # (M, max_row)
+        log_abs_toc[~_BP_NM_VALID] = 0.0                   # padding contributes 0
 
-            for n_idx, n in enumerate(row):
-                m_idx = _BP_Mn[n].index(m)
-                t = toc[m][n_idx]
-                if abs(t) > EPS:
-                    prod_excl = prod_all / t
-                else:
-                    prod_excl = 1.0
-                    for k, nv in enumerate(row):
-                        if nv != n:
-                            prod_excl *= toc[m][k]
+        sum_log = log_abs_toc.sum(axis=1, keepdims=True)   # (M, 1)
+        log_abs_excl = sum_log - log_abs_toc               # (M, max_row)
+        abs_excl = np.exp(log_abs_excl)                    # (M, max_row)
 
-                prod_excl = max(-CLAMP, min(CLAMP, prod_excl))
-                tov[n][m_idx] = -2.0 * math.atanh(prod_excl)
+        prod_sign = sign_toc.prod(axis=1, keepdims=True)   # (M, 1)
+        sign_excl = prod_sign * sign_toc                   # (M, max_row)
 
-        # ── Hard decision ─────────────────────────────────────────────────
-        for n in range(N):
-            total = float(codeword[n]) + tov[n][0] + tov[n][1] + tov[n][2]
-            plain[n] = 1 if total > 0.0 else 0
+        cov_upd = np.clip(sign_excl * abs_excl, -CLAMP, CLAMP)   # (M, max_row)
+        cov_upd = -2.0 * np.arctanh(cov_upd)                     # (M, max_row)
+        cov_upd[~_BP_NM_VALID] = 0.0                             # zero padding
 
-        errors = _ldpc_check(plain)
+        # Scatter new C→V messages back into tov (174×3)
+        tov[_BP_EDGES_VN, _BP_EDGES_MIDX] = cov_upd.ravel()[_BP_EDGES_RAVEL]
+
+        # ── Hard decision + vectorised parity check ───────────────────────────
+        total = codeword + tov.sum(axis=1)
+        plain = (total > 0.0).astype(np.uint8)
+        errors = _ldpc_check_vec(plain)
+
         if errors < best_errors:
             best_errors = errors
             best_plain = plain.copy()

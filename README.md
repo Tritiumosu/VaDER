@@ -18,6 +18,11 @@
 - [Running Tests](#running-tests)
 - [Known Limitations](#known-limitations)
 - [Roadmap](#roadmap)
+  - [Milestone 5 — QSO Logging](#%EF%B8%8F-milestone-5--qso-logging)
+  - [Milestone 6 — FT8 Decoder Enhancements](#%EF%B8%8F-milestone-6--ft8-decoder-enhancements)
+  - [Milestone 7 — Multi-Radio Support](#%EF%B8%8F-milestone-7--multi-radio-support)
+  - [Milestone 8 — UI / UX Modernization](#%EF%B8%8F-milestone-8--ui--ux-modernization)
+  - [Milestone 9 — Advanced Digital Modes](#%EF%B8%8F-milestone-9--advanced-digital-modes)
 - [Contributing](#contributing)
 - [License / Notes](#license--notes)
 
@@ -308,6 +313,7 @@ Live hardware scripts/checks are post-test validation, not a CI gate.
 
 - **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains manual-assisted and operator-controlled.
 - **QSO/contact logging is incomplete** — `QsoRecord` (in `ft8_qso.py`) captures completed QSO data, but writing to ADIF or another log format is deferred to Milestone 5.
+- **Decode depth vs. WSJT-X** — VaDER's FT8 decoder implements the same core algorithm (Costas sync, Gray decode, LDPC BP, AP passes) but does not yet perform iterative interference cancellation ("deep search"), which is the primary reason WSJT-X decodes significantly more signals per slot on busy bands. This is the headline item of Milestone 6.
 - **Yaesu FT-991A only** — The CAT library is specific to this radio model. Other radios are a future goal.
 - **Windows-first audio** — GUI enumeration and TX fallback paths are tuned for Windows host APIs (WASAPI first, MME fallback); Linux/macOS audio discovery is less polished.
 - **No rig database / memory management** — Memories and other menu-level settings are accessible via CAT but are not presented in the GUI yet.
@@ -399,8 +405,8 @@ Progress is tracked here as features move from planned to implemented. Items are
 **Configuration (`vader.cfg`)**
 ```ini
 [operator]
-callsign = W4ABC
-grid     = EN52
+callsign = W1AW
+grid     = FN31
 ```
 Saved automatically when you click **Save** in the TX panel.
 
@@ -419,20 +425,44 @@ Saved automatically when you click **Save** in the TX panel.
 - [ ] In-session log view (callsign, band, mode, time, RST)
 - [ ] Optional integration with Hamlog / LOTW / QRZ for lookups
 
-### 🗺️ Milestone 6 — Multi-Radio Support
+### 🗺️ Milestone 6 — FT8 Decoder Enhancements
+
+> **Prerequisite:** Milestone 5 (ADIF logging) complete — at that point VaDER has a full end-to-end FT8 pipeline (RX decode → QSO assist → TX → contact log), making it the right time to focus on improving raw decode depth and weak-signal performance to match or approach WSJT-X levels.
+
+#### Flagship: Iterative Interference Cancellation
+- [ ] **Iterative signal cancellation ("deep search")** — after successfully decoding a signal, reconstruct its waveform (using `ft8_encode.py` tone/audio synthesis), estimate its amplitude and phase at the detected `(t0_s, f0_hz)`, subtract it from the raw audio frame, and re-run the full decode pass on the residual; repeat until no new decodes emerge.  This is the primary reason WSJT-X decodes 40+ signals per slot on a busy 40 m / 20 m band opening — pulling weaker stations out from under co-channel interference that would otherwise mask them.
+
+#### Candidate Search Improvements
+- [ ] **Lower Costas match threshold** (7 → 5–6) — with the vectorised LDPC decoder (~4 ms/call) the decoder now has headroom to attempt more candidates and let LDPC+CRC be the final arbiter, just as WSJT-X does
+- [ ] **Increase candidate count** (10 → 20–25) — the waterfall sync already finds up to 40 coarse hits; the post-dedup cap at 10 leaves valid weak signals on the table
+- [ ] **Finer time-search step** (20 ms → 10 ms) — halves worst-case ISI from mis-alignment; doubles the fine-search window from 9 to 17 offsets per candidate
+- [ ] **Wider fine-frequency search** (±3 Hz → ±4 Hz, add ±0.5 Hz sub-steps) — catches transmitters with ±3.5–4 Hz calibration offset (common with older rigs and cheap SDRs)
+
+#### LLR & LDPC Quality Improvements
+- [ ] **Callsign-aware AP passes** — inject the active QSO partner's callsign bits (n28a/n28b, bits 0–27 / 29–56) from `ft8_qso.py` state into additional LDPC AP passes, targeting the exact "heard their call but BP won't converge" near-miss
+- [ ] **Additional AP pass message types** — add i3=3 (non-standard/hashed calls) and i3=4 (WWROF contest) to `_AP_PASSES`; both are cheap 3-bit priors
+- [ ] **Adaptive LDPC iteration count** — allow up to 100 iterations when `best_errors ≤ 5` (genuine near-miss); the existing early-exit on `errors == 0` prevents waste on easy signals
+- [ ] **Soft Costas-energy LLR scaling** — use the per-symbol energy ratio (best tone ÷ second-best) from the Costas positions to estimate per-symbol SNR and scale payload LLRs proportionally before BP, improving convergence under multipath fading
+
+#### Performance / Infrastructure
+- [ ] **Parallel candidate decode** (`ThreadPoolExecutor`) — each sync candidate is independent and reads only the immutable `frame` array; BLAS calls release the GIL, enabling real parallel speedup on multi-core hardware
+- [ ] **Cache DFT basis matrix by `f0_hz`** in `FT8SymbolEnergyExtractor` — the basis changes only when frequency changes, not when time offset changes; the 9 fine-time-search calls per candidate all share the same `f0_hz` and currently recompute it needlessly
+- [ ] **Vectorise `_costas_score`** — replace the 21-position Python loop with a single `np.argmax` over the Costas row slice and an array comparison
+
+### 🗺️ Milestone 7 — Multi-Radio Support
 - [ ] Abstract CAT interface (base class) for multiple radio models
 - [ ] Icom IC-7300 support (CI-V protocol)
 - [ ] Kenwood TS-590S / TS-890S support (ASCII CAT, similar to Yaesu)
 - [ ] Hamlib back-end option as universal fallback
 
-### 🗺️ Milestone 7 — UI / UX Modernization
+### 🗺️ Milestone 8 — UI / UX Modernization
 - [ ] Migrate from raw tkinter to a modern UI framework (e.g. CustomTkinter or PyQt6)
 - [ ] Dark/light theme support
 - [ ] Resizable layout and proper high-DPI handling
 - [ ] Waterfall display (spectrum / panadapter view from audio)
 - [ ] Accessible keyboard shortcuts and screen-reader support
 
-### 🗺️ Milestone 8 — Advanced Digital Modes
+### 🗺️ Milestone 9 — Advanced Digital Modes
 - [ ] JS8Call / JS8 decode
 - [ ] WSPR decode (2-minute slots, 4-FSK)
 - [ ] PSK31 / PSK63 decode
