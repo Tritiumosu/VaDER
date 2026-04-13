@@ -1129,7 +1129,7 @@ def format_ft8_message(utc: str, snr_db: float, freq_hz: float, message: str) ->
     str  formatted line ready for terminal or log output
     """
     snr_int = int(round(snr_db))
-    freq_int = int(round(freq_hz))
+    freq_int = math.floor(freq_hz + 0.5)
     return f"{utc} {snr_int:+3d} {freq_int:4d} {message}"
 
 

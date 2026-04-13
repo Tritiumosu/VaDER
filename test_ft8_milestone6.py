@@ -1290,7 +1290,6 @@ class TestRegressionDecodeCorrectness:
         sym_n = int(round(FT8_SYMBOL_DURATION_S * FT8_FS))
         frame_n = FT8_NSYMS * sym_n + int(0.5 * FT8_FS)
         frame = (rng.standard_normal(frame_n) * noise_sigma).astype(np.float32)
-        from ft8_encode import ft8_encode_to_symbols
         tones = ft8_encode_to_symbols(msg)
         t0_n = int(0.5 * FT8_FS)
         t_sym = np.arange(sym_n, dtype=np.float64) / FT8_FS
