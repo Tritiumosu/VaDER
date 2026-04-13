@@ -7,7 +7,7 @@ Tests:
   2. format_ft8_message — CQ message (CQ CALL GRID)
   3. format_ft8_message — grid exchange (CALL1 CALL2 GRID)
   4. format_ft8_message — SNR rounding (positive, negative, fractional)
-  5. format_ft8_message — frequency formatting (8 chars, 3 decimal places)
+  5. format_ft8_message — frequency formatting (integer Hz, no decimal places)
   6. format_ft8_message — SNR width always 3 chars with sign
   7. decode_wav with live_ft8_traffic_2.wav — produces decodable messages
   8. decode_wav results — all messages have non-empty utc_time, message fields
@@ -60,7 +60,7 @@ def run(name: str, fn) -> None:
 def t_standard_message() -> str:
     """Standard message: CALL1 CALL2 REPORT."""
     line = format_ft8_message("12:34:56", -10.0, 1234.567, "W4ABC K9XYZ -10")
-    assert line == "12:34:56 -10 1234.567 W4ABC K9XYZ -10", f"Got: {line!r}"
+    assert line == "12:34:56 -10 1235 W4ABC K9XYZ -10", f"Got: {line!r}"
     return f"format OK: {line!r}"
 
 run("1. format_ft8_message — standard message (CALL1 CALL2 REPORT)", t_standard_message)
@@ -69,7 +69,7 @@ run("1. format_ft8_message — standard message (CALL1 CALL2 REPORT)", t_standar
 def t_cq_message() -> str:
     """CQ message: CQ CALL GRID."""
     line = format_ft8_message("23:00:15", -7.0, 975.0, "CQ W4ABC EM73")
-    assert line == "23:00:15  -7  975.000 CQ W4ABC EM73", f"Got: {line!r}"
+    assert line == "23:00:15  -7  975 CQ W4ABC EM73", f"Got: {line!r}"
     return f"format OK: {line!r}"
 
 run("2. format_ft8_message — CQ message (CQ CALL GRID)", t_cq_message)
@@ -78,7 +78,7 @@ run("2. format_ft8_message — CQ message (CQ CALL GRID)", t_cq_message)
 def t_grid_exchange() -> str:
     """Grid exchange: CALL1 CALL2 GRID."""
     line = format_ft8_message("00:00:00", 3.5, 2000.0, "KG5QIX W2EAD FN31")
-    assert line == "00:00:00  +4 2000.000 KG5QIX W2EAD FN31", f"Got: {line!r}"
+    assert line == "00:00:00  +4 2000 KG5QIX W2EAD FN31", f"Got: {line!r}"
     return f"format OK: {line!r}"
 
 run("3. format_ft8_message — grid exchange (CALL1 CALL2 GRID)", t_grid_exchange)
@@ -101,24 +101,24 @@ run("4. format_ft8_message — SNR rounding", t_snr_rounding)
 
 
 def t_frequency_format() -> str:
-    """Frequency field uses 8-char formatted field (3 decimal places).
-    When parsed via split(), leading padding spaces are stripped."""
+    """Frequency field uses integer Hz (no decimal places), matching WSJT-X style.
+    When parsed via split(), the field is the rounded integer frequency."""
     line = format_ft8_message("12:00:00", 0.0, 450.0, "MSG")
     parts = line.split()
-    # parts[2] is the frequency token (stripped of leading spaces by split)
+    # parts[2] is the frequency token
     freq_field = parts[2]
-    assert freq_field == "450.000", f"Frequency field wrong: {freq_field!r}"
-    assert "." in freq_field and freq_field.endswith("000"), \
-        f"Frequency not 3 decimal places: {freq_field!r}"
-    # Verify the raw line contains the 8-char formatted field
-    assert " 450.000 " in line, f"8-char freq field not in raw line: {line!r}"
-    # Larger frequency (fills all 8 chars, no padding)
+    assert freq_field == "450", f"Frequency field wrong: {freq_field!r}"
+    assert "." not in freq_field, f"Frequency should not contain decimal: {freq_field!r}"
+    # Verify the raw line contains the right-aligned 4-char integer field
+    assert " 450 " in line, f"4-char freq field not in raw line: {line!r}"
+    # Larger frequency (fills all 4 chars, no padding)
     line2 = format_ft8_message("12:00:00", 0.0, 2843.75, "MSG")
     parts2 = line2.split()
-    assert parts2[2] == "2843.750", f"Frequency field wrong: {parts2[2]!r}"
+    # 2843.75 rounds to 2844
+    assert parts2[2] == "2844", f"Frequency field wrong: {parts2[2]!r}"
     return f"Frequency format OK: {freq_field!r}"
 
-run("5. format_ft8_message — frequency format (8-char field, 3 decimal places)", t_frequency_format)
+run("5. format_ft8_message — frequency format (integer Hz, no decimal places)", t_frequency_format)
 
 
 def t_snr_field_width() -> str:
@@ -204,8 +204,8 @@ def t_decode_wav_format_output() -> str:
         snr_str = parts[1]
         assert snr_str[0] in ("+", "-"), f"SNR has no sign: {snr_str!r} in {line!r}"
         assert snr_str[1:].isdigit(), f"SNR non-digit after sign: {snr_str!r}"
-        # Freq field (parts[2]) must contain '.'
-        assert "." in parts[2], f"Freq missing decimal: {parts[2]!r}"
+        # Freq field (parts[2]) must be a positive integer
+        assert parts[2].isdigit(), f"Freq not integer: {parts[2]!r}"
     return f"format_ft8_message produces valid lines for all {len(_WAV2_RESULTS)} results"
 
 run("10. decode_wav — format_ft8_message produces valid lines for all results",
@@ -275,7 +275,7 @@ def t_decode_wav3_format_output() -> str:
         snr_str = parts[1]
         assert snr_str[0] in ("+", "-"), f"SNR has no sign: {snr_str!r} in {line!r}"
         assert snr_str[1:].isdigit(), f"SNR non-digit after sign: {snr_str!r}"
-        assert "." in parts[2], f"Freq missing decimal: {parts[2]!r}"
+        assert parts[2].isdigit(), f"Freq not integer: {parts[2]!r}"
     return f"format_ft8_message produces valid lines for all {len(_WAV3_RESULTS)} sample_3 results"
 
 run("14. decode_wav sample_3 — format_ft8_message produces valid lines for all results",
