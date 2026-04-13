@@ -1166,6 +1166,8 @@ class RadioGUI:
         self._qso_mgr              = None
         self._qso_assist_active    = False
         self._qso_assist_prefilled = ""
+        # Milestone 6: clear DX callsign AP passes — no more QSO context.
+        self._ft8.set_dx_callsign(None)
         self._cq_session_btn.config(state=tk.NORMAL)
         self._stop_session_btn.config(state=tk.DISABLED)
         self._tx_status_var.set("QSO Session stopped")
@@ -1204,6 +1206,13 @@ class RadioGUI:
 
         if next_msg is None:
             return  # Message did not advance QSO state (not addressed to us, etc.)
+
+        # Milestone 6: Callsign-aware AP passes — notify the decoder of the
+        # active DX partner so it can inject their callsign bits into LDPC AP
+        # passes.  The partner is first known once the QSO manager accepts the
+        # reply (i.e. dx_callsign is populated after advance() returns non-None).
+        if self._qso_mgr.dx_callsign:
+            self._ft8.set_dx_callsign(self._qso_mgr.dx_callsign)
 
         # Dedup: avoid writing the same suggestion repeatedly
         if next_msg == self._qso_assist_prefilled:

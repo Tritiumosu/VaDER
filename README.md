@@ -313,7 +313,7 @@ Live hardware scripts/checks are post-test validation, not a CI gate.
 
 - **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains manual-assisted and operator-controlled.
 - **QSO/contact logging is incomplete** — `QsoRecord` (in `ft8_qso.py`) captures completed QSO data, but writing to ADIF or another log format is deferred to Milestone 5.
-- **Decode depth vs. WSJT-X** — VaDER's FT8 decoder implements the same core algorithm (Costas sync, Gray decode, LDPC BP, AP passes) but does not yet perform iterative interference cancellation ("deep search"), which is the primary reason WSJT-X decodes significantly more signals per slot on busy bands. This is the headline item of Milestone 6.
+- **Decode depth vs. WSJT-X** — VaDER's FT8 decoder now implements iterative interference cancellation ("deep search"), callsign-aware AP passes, adaptive LDPC iterations, soft Costas-energy LLR scaling, parallel candidate decode, and all Milestone 6 enhancements.  Decode depth on a busy band should approach WSJT-X levels.
 - **Yaesu FT-991A only** — The CAT library is specific to this radio model. Other radios are a future goal.
 - **Windows-first audio** — GUI enumeration and TX fallback paths are tuned for Windows host APIs (WASAPI first, MME fallback); Linux/macOS audio discovery is less polished.
 - **No rig database / memory management** — Memories and other menu-level settings are accessible via CAT but are not presented in the GUI yet.
@@ -425,29 +425,30 @@ Saved automatically when you click **Save** in the TX panel.
 - [ ] In-session log view (callsign, band, mode, time, RST)
 - [ ] Optional integration with Hamlog / LOTW / QRZ for lookups
 
-### 🗺️ Milestone 6 — FT8 Decoder Enhancements
+### ✅ Milestone 6 — FT8 Decoder Enhancements (Complete)
 
-> **Prerequisite:** Milestone 5 (ADIF logging) complete — at that point VaDER has a full end-to-end FT8 pipeline (RX decode → QSO assist → TX → contact log), making it the right time to focus on improving raw decode depth and weak-signal performance to match or approach WSJT-X levels.
+> **Note:** Implemented ahead of Milestone 5 to address QSO completion difficulty
+> on busy bands.
 
 #### Flagship: Iterative Interference Cancellation
-- [ ] **Iterative signal cancellation ("deep search")** — after successfully decoding a signal, reconstruct its waveform (using `ft8_encode.py` tone/audio synthesis), estimate its amplitude and phase at the detected `(t0_s, f0_hz)`, subtract it from the raw audio frame, and re-run the full decode pass on the residual; repeat until no new decodes emerge.  This is the primary reason WSJT-X decodes 40+ signals per slot on a busy 40 m / 20 m band opening — pulling weaker stations out from under co-channel interference that would otherwise mask them.
+- [x] **Iterative signal cancellation ("deep search")** — after successfully decoding a signal, reconstruct its waveform (using `ft8_encode.py` tone/audio synthesis), estimate its amplitude at the detected `(t0_s, f0_hz)`, subtract it from the raw audio frame, and re-run the full decode pass on the residual; repeat up to `_DEEP_SEARCH_MAX_PASSES` times.  This is the primary reason WSJT-X decodes 40+ signals per slot on a busy 40 m / 20 m band opening.
 
 #### Candidate Search Improvements
-- [ ] **Lower Costas match threshold** (7 → 5–6) — with the vectorised LDPC decoder (~4 ms/call) the decoder now has headroom to attempt more candidates and let LDPC+CRC be the final arbiter, just as WSJT-X does
-- [ ] **Increase candidate count** (10 → 20–25) — the waterfall sync already finds up to 40 coarse hits; the post-dedup cap at 10 leaves valid weak signals on the table
-- [ ] **Finer time-search step** (20 ms → 10 ms) — halves worst-case ISI from mis-alignment; doubles the fine-search window from 9 to 17 offsets per candidate
-- [ ] **Wider fine-frequency search** (±3 Hz → ±4 Hz, add ±0.5 Hz sub-steps) — catches transmitters with ±3.5–4 Hz calibration offset (common with older rigs and cheap SDRs)
+- [x] **Lower Costas match threshold** (7 → 5) — LDPC+CRC acts as the final arbiter; `_MIN_COSTAS_MATCHES = 5`
+- [x] **Increase candidate count** (10 → 25) — `_MAX_SYNC_CANDIDATES = 25`; leaves fewer valid weak signals on the table
+- [x] **Finer time-search step** (20 ms → 10 ms) — `_FINE_DT_FRACTION = 1/16`; 17 offsets tested per candidate (was 9)
+- [x] **Wider fine-frequency search** (±3 Hz → ±4 Hz, ±0.5 Hz sub-steps) — `_FINE_FREQ_OFFSETS_HZ` updated
 
 #### LLR & LDPC Quality Improvements
-- [ ] **Callsign-aware AP passes** — inject the active QSO partner's callsign bits (n28a/n28b, bits 0–27 / 29–56) from `ft8_qso.py` state into additional LDPC AP passes, targeting the exact "heard their call but BP won't converge" near-miss
-- [ ] **Additional AP pass message types** — add i3=3 (non-standard/hashed calls) and i3=4 (WWROF contest) to `_AP_PASSES`; both are cheap 3-bit priors
-- [ ] **Adaptive LDPC iteration count** — allow up to 100 iterations when `best_errors ≤ 5` (genuine near-miss); the existing early-exit on `errors == 0` prevents waste on easy signals
-- [ ] **Soft Costas-energy LLR scaling** — use the per-symbol energy ratio (best tone ÷ second-best) from the Costas positions to estimate per-symbol SNR and scale payload LLRs proportionally before BP, improving convergence under multipath fading
+- [x] **Callsign-aware AP passes** — `FT8ConsoleDecoder.set_dx_callsign(call)` injects the partner's n28 bits into extra LDPC AP passes; wired through the public `Ft8QsoManager.dx_callsign` property
+- [x] **Additional AP pass message types** — i3=3 (non-standard/hashed calls) and i3=4 (WWROF contest) added to `_AP_PASSES`
+- [x] **Adaptive LDPC iteration count** — `_ADAPTIVE_LDPC_MAX_ITERATIONS = 100` retried when `best_errors ≤ _ADAPTIVE_LDPC_ERROR_THRESHOLD (5)`
+- [x] **Soft Costas-energy LLR scaling** — `_costas_energy_llr_scale()` maps Costas energy contrast to a multiplicative LLR scale factor before BP
 
 #### Performance / Infrastructure
-- [ ] **Parallel candidate decode** (`ThreadPoolExecutor`) — each sync candidate is independent and reads only the immutable `frame` array; BLAS calls release the GIL, enabling real parallel speedup on multi-core hardware
-- [ ] **Cache DFT basis matrix by `f0_hz`** in `FT8SymbolEnergyExtractor` — the basis changes only when frequency changes, not when time offset changes; the 9 fine-time-search calls per candidate all share the same `f0_hz` and currently recompute it needlessly
-- [ ] **Vectorise `_costas_score`** — replace the 21-position Python loop with a single `np.argmax` over the Costas row slice and an array comparison
+- [x] **Parallel candidate decode** (`ThreadPoolExecutor`) — `_decode_pass()` submits each sync candidate in parallel; BLAS + LDPC calls release the GIL
+- [x] **Cache DFT basis matrix by `f0_hz`** — `FT8SymbolEnergyExtractor._get_basis()` uses a true LRU cache backed by `collections.OrderedDict`; basis reused across all fine-time-search calls at the same frequency
+- [x] **Vectorise `_costas_score`** — single `np.argmax` + array comparison replaces the 21-iteration Python loop
 
 ### 🗺️ Milestone 7 — Multi-Radio Support
 - [ ] Abstract CAT interface (base class) for multiple radio models
