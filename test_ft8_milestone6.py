@@ -44,6 +44,7 @@ from ft8_decode import (
     FT8_COSTAS_TONES,
     FT8_FS,
     FT8_NSYMS,
+    FT8_PAYLOAD_POSITIONS,
     FT8_SYMBOL_DURATION_S,
     FT8_TONE_SPACING_HZ,
     FT8_TX_DURATION_S,
@@ -1265,7 +1266,7 @@ class TestRegressionDecodeCorrectness:
         )
 
     def test_roundtrip_snr_reported(self):
-        """The SNR dB value should be a finite float for a clean signal."""
+        """The SNR dB value should be a finite float and meaningful for a clean signal."""
         msg = "CQ W4ABC EN52"
         frame = _synthesise_ft8(msg, f0_hz=1500.0, amplitude=0.5)
         dec = FT8ConsoleDecoder()
@@ -1273,6 +1274,55 @@ class TestRegressionDecodeCorrectness:
         assert results, "Expected at least one decode"
         snr = results[0][3]
         assert math.isfinite(snr)
+
+    def test_snr_calibration_against_theory(self):
+        """
+        SNR from E79 symbol energies should match the WSJT-X 2500 Hz reference
+        bandwidth formula to within ±3 dB when extracted at exact signal timing.
+
+        This validates the bandwidth normalization factor 2500/(2*6.25)=200 is correct.
+        """
+        msg = "CQ W4ABC EN52"
+        amplitude = 1.0
+        noise_sigma = 1.0
+        rng = np.random.default_rng(42)
+
+        sym_n = int(round(FT8_SYMBOL_DURATION_S * FT8_FS))
+        frame_n = FT8_NSYMS * sym_n + int(0.5 * FT8_FS)
+        frame = (rng.standard_normal(frame_n) * noise_sigma).astype(np.float32)
+        tones = ft8_encode_to_symbols(msg)
+        t0_n = int(0.5 * FT8_FS)
+        t_sym = np.arange(sym_n, dtype=np.float64) / FT8_FS
+        for s, tone in enumerate(tones):
+            freq = 1500.0 + tone * FT8_TONE_SPACING_HZ
+            frame[t0_n + s * sym_n: t0_n + (s + 1) * sym_n] += (
+                amplitude * np.cos(2 * math.pi * freq * t_sym)
+            ).astype(np.float32)
+
+        # Extract E79 at the exact known signal timing (not via decoder search)
+        extractor = FT8SymbolEnergyExtractor(fs=FT8_FS)
+        E79 = extractor.extract_all_79(frame, t0_s=0.5, f0_hz=1500.0)
+
+        # Compute SNR using the same formula as _decode_one_candidate
+        _pl_pos = np.array(FT8_PAYLOAD_POSITIONS)
+        E_pl = E79[_pl_pos, :]
+        max_e = np.max(E_pl, axis=1)
+        sum_e = np.sum(E_pl, axis=1)
+        noise_per_bin = (sum_e - max_e) / 7.0
+        avg_noise = float(np.mean(noise_per_bin))
+        avg_sig = float(np.mean(max_e)) - avg_noise
+        noise_2500 = avg_noise * (2500.0 / (2.0 * FT8_TONE_SPACING_HZ))
+        measured_snr = 10.0 * math.log10(max(avg_sig, 1e-30) / max(noise_2500, 1e-30))
+
+        # Theoretical WSJT-X SNR for amp=1, noise_sigma=1 at 12kHz
+        theoretical_snr = 10.0 * math.log10(
+            (amplitude ** 2 * FT8_FS) / (2.0 * noise_sigma ** 2 * 2500.0)
+        )  # ≈ +3.8 dB
+
+        assert abs(measured_snr - theoretical_snr) < 3.0, (
+            f"SNR {measured_snr:.1f} dB differs from theoretical "
+            f"{theoretical_snr:.1f} dB by more than 3 dB"
+        )
 
     def test_costas_score_legacy_shims(self):
         """Legacy API shims ft8_costas_ok / ft8_costas_ok_costasE still work."""

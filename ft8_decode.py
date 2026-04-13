@@ -75,6 +75,9 @@ FT8_PAYLOAD_POSITIONS: tuple[int, ...] = tuple(
     s for s in range(FT8_NSYMS) if s not in set(FT8_COSTAS_POSITIONS)
 )
 
+# Pre-computed numpy array of payload positions for efficient SNR calculation.
+_PAYLOAD_POS_ARRAY: np.ndarray = np.array(FT8_PAYLOAD_POSITIONS, dtype=np.intp)
+
 # ---------------------------------------------------------------------------
 # Gray code  (ft8_lib constants.c  kFT8_Gray_map)
 # ---------------------------------------------------------------------------
@@ -1112,13 +1115,13 @@ def format_ft8_message(utc: str, snr_db: float, freq_hz: float, message: str) ->
     """
     Format an FT8 decoded message matching the reference decoder output format.
 
-    Output: ``HHMMSS +NN NNNN.NNN MESSAGE``
+    Output: ``HHMMSS +NN NNNN MESSAGE``
 
     Parameters
     ----------
     utc      : UTC timestamp string (e.g. ``HH:MM:SS`` or ``HHMMSS``)
     snr_db   : signal-to-noise ratio in dB (rounded to nearest integer)
-    freq_hz  : audio frequency in Hz
+    freq_hz  : audio frequency in Hz (displayed as integer Hz, matching WSJT-X)
     message  : decoded FT8 message text (e.g. ``CQ W4ABC EM73``)
 
     Returns
@@ -1126,7 +1129,8 @@ def format_ft8_message(utc: str, snr_db: float, freq_hz: float, message: str) ->
     str  formatted line ready for terminal or log output
     """
     snr_int = int(round(snr_db))
-    return f"{utc} {snr_int:+3d} {freq_hz:8.3f} {message}"
+    freq_int = math.floor(freq_hz + 0.5)
+    return f"{utc} {snr_int:+3d} {freq_int:4d} {message}"
 
 
 def decode_wav(
@@ -2153,7 +2157,24 @@ class FT8ConsoleDecoder:
         except Exception:
             symbols = np.zeros(FT8_NSYMS, dtype=np.uint8)
 
-        snr_db = 10.0 * math.log10(max(costas_m / 21.0, 1e-6))
+        # Compute SNR from payload symbol energy contrast in E79.
+        # For each of the 58 payload positions, the dominant (max-energy) bin
+        # carries signal + noise; the remaining 7 bins carry noise only.
+        # The per-bin noise estimate is the mean energy of the 7 non-dominant
+        # bins.  SNR is referenced to a 2500 Hz noise bandwidth (the WSJT-X
+        # standard).  The correct normalization factor is:
+        #   2500 Hz / (2 × 6.25 Hz) = 200
+        # The factor of 2 accounts for the real-valued signal having energy
+        # split between positive and negative DFT frequencies.
+        # _PAYLOAD_POS_ARRAY is a module-level constant (no per-call allocation).
+        _E_pl = E79[_PAYLOAD_POS_ARRAY, :]         # (58, 8) payload energies
+        _max_e = np.max(_E_pl, axis=1)             # dominant bin per symbol
+        _sum_e = np.sum(_E_pl, axis=1)             # total energy per symbol
+        _noise_per_bin = (_sum_e - _max_e) / 7.0  # mean of the other 7 bins
+        _avg_noise = float(np.mean(_noise_per_bin))
+        _avg_sig = float(np.mean(_max_e)) - _avg_noise  # signal-only power
+        _noise_2500 = max(_avg_noise * (2500.0 / (2.0 * FT8_TONE_SPACING_HZ)), 1e-30)
+        snr_db = 10.0 * math.log10(max(_avg_sig, 1e-30) / _noise_2500)
         return [(message, f0_hz, t0_s, snr_db, payload[:91].copy(), symbols)]
 
     def _decode_pass(
