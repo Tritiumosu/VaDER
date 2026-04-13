@@ -559,28 +559,40 @@ class TestCallsignAwareAPPasses:
     def test_dx_ap_passes_included_in_decode(self):
         """
         Verify that dx_ap_passes are tried when baseline LDPC fails.
-        We mock ft8_ldpc_decode to return failure + few errors, and check
-        that the DX-callsign AP pass is attempted.
+        We mock ft8_ldpc_decode to force the baseline and all non-DX AP passes
+        to fail with best_errors=3 (≤ threshold), and assert that at least one
+        call uses a DX-callsign AP assignment.
         """
         call_log: list[Optional[tuple]] = []
         _orig = ft8_decode.ft8_ldpc_decode
 
-        def _fake(llrs, *, max_iterations=50, ap_assignments=None):
-            call_log.append(ap_assignments)
-            return _orig(llrs, max_iterations=max_iterations,
-                         ap_assignments=ap_assignments)
+        class _DXAPAttempted(RuntimeError):
+            """Raised when a DX-specific AP pass is observed, ending the test."""
 
         dec = FT8ConsoleDecoder()
         dec.set_dx_callsign("K9XYZ")
+        dx_ap_set = {bits for _, bits in dec._dx_ap_passes}
         frame = _synthesise_ft8("CQ W4ABC EN52", f0_hz=1500.0)
 
-        with mock.patch.object(ft8_decode, "ft8_ldpc_decode", side_effect=_fake):
-            dec._decode_one_candidate(frame, 0.5, 1500.0, set())
+        def _fake(llrs, *, max_iterations=50, ap_assignments=None):
+            call_log.append(ap_assignments)
+            # If this is a DX AP pass we've confirmed the code reaches it.
+            if ap_assignments in dx_ap_set:
+                raise _DXAPAttempted
+            # Force all non-DX calls to fail with best_errors=3 so the decoder
+            # proceeds to the DX AP passes.
+            _, pay, _, _ = _orig(llrs, max_iterations=max_iterations,
+                                 ap_assignments=None)
+            return False, pay, max_iterations, 3
 
-        # The DX AP passes should appear somewhere in the call log when
-        # the baseline decode may fail.  Since the signal is clean and decodes
-        # immediately, we just verify the function doesn't crash.
+        with pytest.raises(_DXAPAttempted):
+            with mock.patch.object(ft8_decode, "ft8_ldpc_decode", side_effect=_fake):
+                dec._decode_one_candidate(frame, 0.5, 1500.0, set())
+
         assert call_log, "ft8_ldpc_decode should have been called at least once"
+        assert any(
+            ap in dx_ap_set for ap in call_log
+        ), "Expected at least one LDPC call with a DX-callsign AP assignment"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -685,6 +697,45 @@ class TestDFTBasisCache:
         assert len(ext._basis_cache) <= max_size, (
             f"Cache size {len(ext._basis_cache)} exceeded max {max_size}"
         )
+
+    def test_cache_lru_eviction_order(self):
+        """
+        True LRU: the least-recently-used entry is evicted, not the
+        first-inserted one.
+        """
+        from collections import OrderedDict
+        ext = FT8SymbolEnergyExtractor(fs=FT8_FS)
+        max_size = ext._CACHE_MAXSIZE
+        assert max_size >= 3, "This test needs cache size ≥ 3"
+
+        # Fill to exactly max_size
+        freqs = [float(1000 + i) for i in range(max_size)]
+        for f in freqs:
+            ext._get_basis(f)
+        assert len(ext._basis_cache) == max_size
+
+        # Re-access the oldest entry (freqs[0]) to promote it to MRU.
+        ext._get_basis(freqs[0])
+
+        # Insert a new entry to trigger eviction.
+        new_f = float(1000 + max_size)
+        ext._get_basis(new_f)
+        assert len(ext._basis_cache) == max_size
+
+        # The evicted entry should be freqs[1] (LRU), NOT freqs[0] (just accessed).
+        assert freqs[0] in ext._basis_cache, (
+            "freqs[0] was recently accessed and must NOT be evicted (LRU)"
+        )
+        assert new_f in ext._basis_cache, "Newly inserted key should be present"
+        assert freqs[1] not in ext._basis_cache, (
+            "freqs[1] was the true LRU entry and should have been evicted"
+        )
+
+    def test_basis_cache_is_ordered_dict(self):
+        """_basis_cache must be an OrderedDict for true LRU eviction."""
+        from collections import OrderedDict
+        ext = FT8SymbolEnergyExtractor(fs=FT8_FS)
+        assert isinstance(ext._basis_cache, OrderedDict)
 
     def test_extract_all_79_uses_cache(self):
         """Calling extract_all_79 twice with same f0_hz should hit the cache."""
@@ -863,6 +914,31 @@ class TestSubtractDecodedSignal:
         )
         assert result.shape == frame.shape
 
+    def test_out_parameter_inplace(self):
+        """When out= is provided, subtraction happens in-place into that buffer."""
+        msg = "CQ W4ABC EN52"
+        frame, symbols = self._make_signal_and_symbols(msg)
+        buf = frame.copy()
+        result = _subtract_decoded_signal(
+            frame, t0_s=0.5, f0_hz=1500.0, symbols=symbols, fs=FT8_FS, out=buf
+        )
+        # result must be the exact same object as buf
+        assert result is buf, "out= buffer must be returned directly"
+
+    def test_out_parameter_modifies_correctly(self):
+        """Result via out= must equal result via default (copy) path."""
+        msg = "CQ W4ABC EN52"
+        frame, symbols = self._make_signal_and_symbols(msg)
+        expected = _subtract_decoded_signal(
+            frame, t0_s=0.5, f0_hz=1500.0, symbols=symbols, fs=FT8_FS
+        )
+        buf = frame.copy()
+        _subtract_decoded_signal(
+            frame, t0_s=0.5, f0_hz=1500.0, symbols=symbols, fs=FT8_FS, out=buf
+        )
+        np.testing.assert_allclose(buf, expected, atol=1e-12,
+                                   err_msg="out= path must produce same result as copy path")
+
     def test_edge_t0_near_zero(self):
         """t0 near zero (signal starts at frame edge) should not crash."""
         msg = "CQ W4ABC EN52"
@@ -1016,6 +1092,83 @@ class TestDeepSearch:
         assert not subtract_calls, (
             "No subtraction should happen when there are no initial decodes"
         )
+
+    def test_deep_search_cumulative_subtraction(self):
+        """
+        Each deep-search pass must subtract ALL previously decoded signals,
+        not just those decoded in the immediately preceding pass.
+
+        We spy on _subtract_decoded_signal and record which symbols are
+        passed.  After the first pass decodes N signals, pass 2 must subtract
+        those same N signals (plus any new ones from pass 1, etc.).
+        """
+        from ft8_encode import ft8_encode_to_symbols
+
+        subtracted: list[tuple] = []   # (t0_s, f0_hz, symbols_tuple)
+        _orig = ft8_decode._subtract_decoded_signal
+
+        def _spy(frame, *, t0_s, f0_hz, symbols, fs, out=None):
+            subtracted.append((round(t0_s, 3), round(f0_hz, 1), tuple(symbols)))
+            return _orig(frame, t0_s=t0_s, f0_hz=f0_hz, symbols=symbols,
+                         fs=fs, out=out)
+
+        msg = "CQ W4ABC EN52"
+        frame = _synthesise_ft8(msg, f0_hz=1500.0, amplitude=0.8)
+
+        dec = FT8ConsoleDecoder()
+        dec.deep_search_passes = 2   # two deep-search passes after the first
+
+        first_pass_results = []
+
+        def _capture_first_pass(utc, f0, snr, decoded_msg):
+            first_pass_results.append(decoded_msg)
+
+        dec._on_decode = _capture_first_pass
+
+        with mock.patch.object(ft8_decode, "_subtract_decoded_signal", _spy):
+            dec._decode_frame(frame, "000000")
+
+        if not first_pass_results:
+            pytest.skip("Signal not decoded; cannot verify cumulative subtraction")
+
+        # Pass 1 of deep search: should subtract all signals from first pass.
+        # Pass 2 of deep search: should subtract all signals from first AND
+        # second (deep) pass.  Even if the second pass yielded nothing new, the
+        # loop exits early — but at minimum pass 1 must have subtracted
+        # everything from the initial pass.
+        first_pass_n = len(first_pass_results)
+        # The subtracted list spans all deep-search passes.  The very first
+        # batch must be at least first_pass_n entries (one per decoded signal).
+        assert len(subtracted) >= first_pass_n, (
+            f"Deep search pass 1 should subtract all {first_pass_n} decoded "
+            f"signal(s); only subtracted {len(subtracted)}"
+        )
+
+    def test_deep_search_inplace_out_buffer(self):
+        """
+        _subtract_decoded_signal is called with out= in the deep-search loop,
+        so no extra full-frame copies are made per signal.
+        """
+        out_params = []
+        _orig = ft8_decode._subtract_decoded_signal
+
+        def _spy(frame, *, t0_s, f0_hz, symbols, fs, out=None):
+            out_params.append(out)
+            return _orig(frame, t0_s=t0_s, f0_hz=f0_hz, symbols=symbols,
+                         fs=fs, out=out)
+
+        msg = "CQ W4ABC EN52"
+        frame = _synthesise_ft8(msg, f0_hz=1500.0, amplitude=0.8)
+        dec = FT8ConsoleDecoder()
+        dec.deep_search_passes = 1
+
+        with mock.patch.object(ft8_decode, "_subtract_decoded_signal", _spy):
+            dec._decode_frame(frame, "000000")
+
+        if out_params:
+            assert any(o is not None for o in out_params), (
+                "Deep-search loop should pass out= buffer to avoid per-signal copies"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

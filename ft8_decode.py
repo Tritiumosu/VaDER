@@ -38,6 +38,7 @@ import math
 import queue
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -482,11 +483,16 @@ class FT8SymbolEnergyExtractor:
     def __init__(self, fs: int = FT8_FS) -> None:
         self.fs = int(fs)
         self.sym_n = int(round(FT8_SYMBOL_DURATION_S * self.fs))  # 1920 @ 12 kHz
-        # {f0_hz: basis (8, sym_n) complex128}
-        self._basis_cache: dict[float, np.ndarray] = {}
+        # {f0_hz: basis (8, sym_n) complex128} — insertion-ordered for LRU eviction.
+        self._basis_cache: OrderedDict[float, np.ndarray] = OrderedDict()
 
     def _get_basis(self, f0_hz: float) -> np.ndarray:
-        """Return (cached) DFT basis matrix for the given base frequency."""
+        """Return (cached) DFT basis matrix for the given base frequency.
+
+        Uses a true LRU eviction policy backed by :class:`collections.OrderedDict`:
+        a cache hit moves the entry to *most-recently-used* position, and an
+        eviction removes the *least-recently-used* (first) entry.
+        """
         basis = self._basis_cache.get(f0_hz)
         if basis is None:
             phase_inc = 2.0 * math.pi * np.array(
@@ -495,9 +501,12 @@ class FT8SymbolEnergyExtractor:
             t_sym = np.arange(self.sym_n, dtype=np.float64)
             basis = np.exp(-1j * np.outer(phase_inc, t_sym))  # (8, sym_n)
             if len(self._basis_cache) >= self._CACHE_MAXSIZE:
-                # Evict an arbitrary entry to stay within the budget.
-                self._basis_cache.pop(next(iter(self._basis_cache)))
+                # Evict the least-recently-used entry.
+                self._basis_cache.popitem(last=False)
             self._basis_cache[f0_hz] = basis
+        else:
+            # Move to most-recently-used position.
+            self._basis_cache.move_to_end(f0_hz)
         return basis
 
     def extract_all_79(
@@ -1763,6 +1772,7 @@ def _subtract_decoded_signal(
     f0_hz: float,
     symbols: np.ndarray,
     fs: int,
+    out: "Optional[np.ndarray]" = None,
 ) -> np.ndarray:
     """
     Reconstruct and subtract a decoded FT8 signal from an audio frame.
@@ -1775,9 +1785,6 @@ def _subtract_decoded_signal(
          symbol energy to the synthesised Costas-symbol energy.
       3. Subtracts the scaled synthesised waveform from the frame.
 
-    The subtraction is performed in-place on a copy of the frame.  The
-    caller should use the returned residual frame for a subsequent decode pass.
-
     Parameters
     ----------
     frame   : 1-D float audio (at ``fs`` Hz)
@@ -1785,12 +1792,18 @@ def _subtract_decoded_signal(
     f0_hz   : base tone frequency (Hz)
     symbols : (79,) uint8 — decoded tone indices (0–7)
     fs      : audio sample rate (Hz)
+    out     : optional pre-allocated float64 output buffer of the same shape
+              as ``frame``.  When provided the subtraction is performed in-place
+              into *out* without an extra full-frame copy.  The caller is
+              responsible for initialising *out* with the current residual
+              before calling this function.  When *None* (default) a new
+              float64 copy is returned.
 
     Returns
     -------
     np.ndarray  residual frame (same shape as ``frame``, float64)
     """
-    from ft8_encode import ft8_symbols_to_audio, FT8_FS as _ENC_FS
+    from ft8_encode import ft8_symbols_to_audio
 
     sym_n = int(round(FT8_SYMBOL_DURATION_S * fs))
     t0_n = int(round(t0_s * fs))
@@ -1816,23 +1829,21 @@ def _subtract_decoded_signal(
         meas_e  += float(np.sum(np.asarray(frame[start_frame:end_frame], dtype=np.float64) ** 2))
         synth_e += float(np.sum(synth[start_synth:end_synth] ** 2))
 
+    # Prepare the output buffer.
+    if out is None:
+        residual = np.asarray(frame, dtype=np.float64).copy()
+    else:
+        residual = out
+
     if synth_e < 1e-12:
         # Synthesised Costas energy is effectively zero — this can happen if
         # all Costas positions fall outside the frame boundary (e.g. t0 is
-        # near the end of the buffer).  Skip subtraction silently and return
-        # the original frame unchanged.
-        import sys
-        print(
-            f"[FT8] _subtract_decoded_signal: near-zero synth energy "
-            f"(t0={t0_s:.3f}s f0={f0_hz:.1f}Hz) — subtraction skipped",
-            file=sys.stderr, flush=True,
-        )
-        return np.asarray(frame, dtype=np.float64).copy()
+        # near the end of the buffer).  Skip subtraction silently.
+        return residual
 
     amplitude = math.sqrt(meas_e / synth_e)
 
-    # Build the residual by subtracting the scaled synthesised waveform.
-    residual = np.asarray(frame, dtype=np.float64).copy()
+    # Subtract the scaled synthesised waveform in-place.
     frame_start = max(0, t0_n)
     frame_end   = min(len(residual), t0_n + total_n)
     synth_start = frame_start - t0_n
@@ -2210,10 +2221,18 @@ class FT8ConsoleDecoder:
         # Each candidate reads only the immutable frame array; BLAS calls in
         # the matmul / LDPC steps release the GIL, enabling real speedup on
         # multi-core hardware.
+        #
+        # Thread-safety: Python `set` is not safe for concurrent read/write.
+        # Pass a read-only frozenset snapshot of seen_msg to each worker so
+        # that already-decoded messages are skipped without any lock contention.
+        # Final deduplication against the live seen_msg happens in the
+        # collector loop below (on the caller's thread), which is the only
+        # place seen_msg is mutated.
+        seen_msg_snapshot = frozenset(seen_msg)
         with ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(
-                    self._decode_one_candidate, frame, t0c, f0c, seen_msg
+                    self._decode_one_candidate, frame, t0c, f0c, seen_msg_snapshot
                 )
                 for t0c, f0c, _ in sync_cands
             ]
@@ -2261,21 +2280,30 @@ class FT8ConsoleDecoder:
         # After decoding successfully, subtract each signal's reconstructed
         # waveform from the audio frame and decode the residual to find weaker
         # signals that were masked by co-channel interference.
-        decoded_signals = list(first_pass)  # (msg, f0_hz, t0_s, snr_db, pay, sym)
+        #
+        # Cumulative approach: all_decoded_signals grows across passes so that
+        # each successive residual has *every* previously decoded signal removed,
+        # not just those found in the immediately preceding pass.  A single
+        # pre-allocated residual buffer is reused to avoid O(N × frame_len)
+        # copy overhead.
+        all_decoded_signals = list(first_pass)  # cumulative across all passes
+        new_pass_signals = list(first_pass)     # only signals new to this pass
 
         for ds_iter in range(self.deep_search_passes):
-            if not decoded_signals:
+            if not new_pass_signals:
                 break
-            # Build residual by subtracting all signals decoded so far.
-            residual = np.asarray(frame, dtype=np.float64)
-            for _, f0_hz, t0_s, _, _pay, syms in decoded_signals:
+            # Build residual in-place: start from the original frame and
+            # subtract ALL signals decoded across all passes so far.
+            residual = np.asarray(frame, dtype=np.float64).copy()
+            for _, f0_hz, t0_s, _, _pay, syms in all_decoded_signals:
                 try:
-                    residual = _subtract_decoded_signal(
+                    _subtract_decoded_signal(
                         residual,
                         t0_s=t0_s,
                         f0_hz=f0_hz,
                         symbols=syms,
                         fs=self.fs_proc,
+                        out=residual,   # subtract in-place; no extra copy
                     )
                 except Exception as exc:
                     if self._debug:
@@ -2287,7 +2315,8 @@ class FT8ConsoleDecoder:
             if self._debug:
                 print(
                     f"[FT8] {utc} deep-search pass {ds_iter + 1}/"
-                    f"{self.deep_search_passes} — decoding residual",
+                    f"{self.deep_search_passes} — decoding residual "
+                    f"({len(all_decoded_signals)} signal(s) removed)",
                     flush=True,
                 )
             new_decodes = self._decode_pass(residual.astype(np.float32), utc, seen_msg)
@@ -2307,7 +2336,8 @@ class FT8ConsoleDecoder:
                     )
                 if self._on_decode is not None:
                     self._on_decode(utc, f0_hz, snr_db, msg)
-            decoded_signals = new_decodes  # only new signals for next subtraction
+            new_pass_signals = new_decodes
+            all_decoded_signals.extend(new_decodes)  # accumulate for next pass
 
     def _worker(self) -> None:
         while not self._stop.is_set():

@@ -440,14 +440,14 @@ Saved automatically when you click **Save** in the TX panel.
 - [x] **Wider fine-frequency search** (±3 Hz → ±4 Hz, ±0.5 Hz sub-steps) — `_FINE_FREQ_OFFSETS_HZ` updated
 
 #### LLR & LDPC Quality Improvements
-- [x] **Callsign-aware AP passes** — `FT8ConsoleDecoder.set_dx_callsign(call)` injects the partner's n28 bits into extra LDPC AP passes; wired to `Ft8QsoManager._dx_call` in `main.py`
+- [x] **Callsign-aware AP passes** — `FT8ConsoleDecoder.set_dx_callsign(call)` injects the partner's n28 bits into extra LDPC AP passes; wired through the public `Ft8QsoManager.dx_callsign` property
 - [x] **Additional AP pass message types** — i3=3 (non-standard/hashed calls) and i3=4 (WWROF contest) added to `_AP_PASSES`
 - [x] **Adaptive LDPC iteration count** — `_ADAPTIVE_LDPC_MAX_ITERATIONS = 100` retried when `best_errors ≤ _ADAPTIVE_LDPC_ERROR_THRESHOLD (5)`
 - [x] **Soft Costas-energy LLR scaling** — `_costas_energy_llr_scale()` maps Costas energy contrast to a multiplicative LLR scale factor before BP
 
 #### Performance / Infrastructure
 - [x] **Parallel candidate decode** (`ThreadPoolExecutor`) — `_decode_pass()` submits each sync candidate in parallel; BLAS + LDPC calls release the GIL
-- [x] **Cache DFT basis matrix by `f0_hz`** — `FT8SymbolEnergyExtractor._get_basis()` LRU cache; basis reused across all fine-time-search calls at the same frequency
+- [x] **Cache DFT basis matrix by `f0_hz`** — `FT8SymbolEnergyExtractor._get_basis()` uses a true LRU cache backed by `collections.OrderedDict`; basis reused across all fine-time-search calls at the same frequency
 - [x] **Vectorise `_costas_score`** — single `np.argmax` + array comparison replaces the 21-iteration Python loop
 
 ### 🗺️ Milestone 7 — Multi-Radio Support
