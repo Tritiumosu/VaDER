@@ -75,6 +75,9 @@ FT8_PAYLOAD_POSITIONS: tuple[int, ...] = tuple(
     s for s in range(FT8_NSYMS) if s not in set(FT8_COSTAS_POSITIONS)
 )
 
+# Pre-computed numpy array of payload positions for efficient SNR calculation.
+_PAYLOAD_POS_ARRAY: np.ndarray = np.array(FT8_PAYLOAD_POSITIONS, dtype=np.intp)
+
 # ---------------------------------------------------------------------------
 # Gray code  (ft8_lib constants.c  kFT8_Gray_map)
 # ---------------------------------------------------------------------------
@@ -2163,8 +2166,8 @@ class FT8ConsoleDecoder:
         #   2500 Hz / (2 × 6.25 Hz) = 200
         # The factor of 2 accounts for the real-valued signal having energy
         # split between positive and negative DFT frequencies.
-        _pl_pos = np.array(FT8_PAYLOAD_POSITIONS)
-        _E_pl = E79[_pl_pos, :]                    # (58, 8) payload energies
+        # _PAYLOAD_POS_ARRAY is a module-level constant (no per-call allocation).
+        _E_pl = E79[_PAYLOAD_POS_ARRAY, :]         # (58, 8) payload energies
         _max_e = np.max(_E_pl, axis=1)             # dominant bin per symbol
         _sum_e = np.sum(_E_pl, axis=1)             # total energy per symbol
         _noise_per_bin = (_sum_e - _max_e) / 7.0  # mean of the other 7 bins
