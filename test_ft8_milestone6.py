@@ -93,12 +93,16 @@ def _make_e79_with_costas(n_correct: int) -> np.ndarray:
     """
     Create a synthetic (79, 8) energy matrix where exactly n_correct
     Costas positions match the FT8_COSTAS_TONES and the rest don't.
+
+    FT8_COSTAS_TONES has 7 elements.  The 21 Costas positions are three
+    groups of 7, all sharing the same 7-tone pattern, so ``i % 7`` is
+    the correct index into FT8_COSTAS_TONES for Costas position ``i``.
     """
     E79 = np.ones((FT8_NSYMS, 8), dtype=np.float64)
     cos_positions = list(FT8_COSTAS_POSITIONS)
     # Set up the Costas rows: small uniform energy first
     for i, pos in enumerate(cos_positions):
-        expected = FT8_COSTAS_TONES[i % 7]
+        expected = FT8_COSTAS_TONES[i % 7]  # same 7-tone pattern repeats 3×
         if i < n_correct:
             # Make the correct tone dominant
             E79[pos, expected] = 10.0
@@ -402,10 +406,15 @@ class TestCostasEnergyLLRScaling:
         return np.ones((FT8_NSYMS, 8), dtype=np.float64)
 
     def _strong_e79(self, ratio: float = 16.0) -> np.ndarray:
-        """E79 where the correct Costas tone is 'ratio' times stronger."""
+        """E79 where the correct Costas tone is 'ratio' times stronger.
+
+        FT8_COSTAS_TONES has 7 elements; the 21 Costas positions are three
+        groups of 7 all using the same 7-tone pattern, so ``i % 7`` is the
+        correct subscript into FT8_COSTAS_TONES for position index ``i``.
+        """
         E79 = np.ones((FT8_NSYMS, 8), dtype=np.float64)
         for i, pos in enumerate(FT8_COSTAS_POSITIONS):
-            expected = FT8_COSTAS_TONES[i % 7]
+            expected = FT8_COSTAS_TONES[i % 7]  # same 7-tone pattern repeats 3×
             E79[pos, expected] = ratio
         return E79
 
@@ -604,10 +613,14 @@ class TestVectorisedCostasScore:
             )
 
     def test_inverted_detection(self):
-        """E79 with inverted Costas (7-n) should return inv=True."""
+        """E79 with inverted Costas (7-n) should return inv=True.
+
+        FT8_COSTAS_TONES has 7 elements; three groups of 7 Costas positions
+        all share the same pattern so ``i % 7`` is the correct index.
+        """
         E79 = np.ones((FT8_NSYMS, 8), dtype=np.float64)
         for i, pos in enumerate(FT8_COSTAS_POSITIONS):
-            expected = FT8_COSTAS_TONES[i % 7]
+            expected = FT8_COSTAS_TONES[i % 7]  # same 7-tone pattern repeats 3×
             inverted = 7 - expected
             E79[pos, inverted] = 10.0
         m, _, inv = _costas_score(E79)

@@ -376,6 +376,18 @@ class Ft8QsoManager:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
+    @property
+    def dx_callsign(self) -> Optional[str]:
+        """
+        Return the active DX partner's callsign, or ``None`` if not yet known.
+
+        Populated once the QSO manager receives the first reply that identifies
+        the remote station (via :meth:`start_from_received` or
+        :meth:`advance`).  Read-only — use the state machine methods to update
+        QSO state rather than mutating this directly.
+        """
+        return self._dx_call
+
     def start_cq(self) -> str:
         """
         Compose a CQ message and queue it for the next TX slot.

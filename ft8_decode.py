@@ -1014,6 +1014,10 @@ def _costas_score(E79: np.ndarray) -> tuple[int, int, bool]:
     E79 = np.asarray(E79, dtype=np.float64)
     cos_pos = np.array(FT8_COSTAS_POSITIONS, dtype=np.intp)          # (21,)
     cos_tones = np.array(
+        # FT8_COSTAS_TONES has 7 elements (one Costas symbol per 7-position
+        # group).  The 21 Costas positions are three identical copies of the
+        # same 7-tone pattern, so % 7 cycles correctly: positions 0-6, 7-13,
+        # 14-20 all map to FT8_COSTAS_TONES[0..6].
         [FT8_COSTAS_TONES[i % 7] for i in range(21)], dtype=np.int32  # (21,)
     )
     argmax_at_pos = np.argmax(E79[cos_pos], axis=1).astype(np.int32)  # (21,)
@@ -1813,6 +1817,16 @@ def _subtract_decoded_signal(
         synth_e += float(np.sum(synth[start_synth:end_synth] ** 2))
 
     if synth_e < 1e-12:
+        # Synthesised Costas energy is effectively zero — this can happen if
+        # all Costas positions fall outside the frame boundary (e.g. t0 is
+        # near the end of the buffer).  Skip subtraction silently and return
+        # the original frame unchanged.
+        import sys
+        print(
+            f"[FT8] _subtract_decoded_signal: near-zero synth energy "
+            f"(t0={t0_s:.3f}s f0={f0_hz:.1f}Hz) — subtraction skipped",
+            file=sys.stderr, flush=True,
+        )
         return np.asarray(frame, dtype=np.float64).copy()
 
     amplitude = math.sqrt(meas_e / synth_e)
@@ -2051,9 +2065,7 @@ class FT8ConsoleDecoder:
         # Milestone 6: Soft Costas-energy LLR scaling — multiply LLRs by a
         # quality factor derived from the energy contrast at the Costas
         # positions, improving BP convergence under multipath fading.
-        llr_scale = _costas_energy_llr_scale(E79)
-        if llr_scale != 1.0:
-            ch_llrs = ch_llrs * llr_scale
+        ch_llrs = ch_llrs * _costas_energy_llr_scale(E79)
 
         # ── LDPC + AP passes ──────────────────────────────────────────────────
         ok, payload, iters, best_errors = ft8_ldpc_decode(ch_llrs)

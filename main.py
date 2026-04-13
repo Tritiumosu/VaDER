@@ -1210,9 +1210,9 @@ class RadioGUI:
         # Milestone 6: Callsign-aware AP passes — notify the decoder of the
         # active DX partner so it can inject their callsign bits into LDPC AP
         # passes.  The partner is first known once the QSO manager accepts the
-        # reply (i.e. _dx_call is populated after advance() returns non-None).
-        if self._qso_mgr._dx_call:
-            self._ft8.set_dx_callsign(self._qso_mgr._dx_call)
+        # reply (i.e. dx_callsign is populated after advance() returns non-None).
+        if self._qso_mgr.dx_callsign:
+            self._ft8.set_dx_callsign(self._qso_mgr.dx_callsign)
 
         # Dedup: avoid writing the same suggestion repeatedly
         if next_msg == self._qso_assist_prefilled:
