@@ -549,7 +549,7 @@ def test_on_arm_tx_invalid_operator():
 
 
 def test_on_arm_tx_passes_f0_hz_to_txjob():
-    """_on_arm_tx reads the base tone field and passes f0_hz to TxJob.arm()."""
+    """_on_arm_tx reads the base tone field, sets f0_hz on the TxJob, and arms that job."""
     gui = mock.MagicMock()
     gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
     gui._tx_callsign_var.get.return_value = "W4ABC"
@@ -612,6 +612,58 @@ def test_appconfig_save_ft8_base_tone_hz():
         cfg.save_ft8_base_tone_hz(800.0)
         cfg2 = main.AppConfig(path=path)
         assert cfg2.ft8_base_tone_hz == 800.0
+
+
+def test_appconfig_ft8_base_tone_hz_out_of_range_falls_back():
+    """ft8_base_tone_hz falls back to 1500 when stored value is out of range."""
+    import tempfile, os, configparser
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "vader.cfg")
+        # Write an out-of-range value directly to bypass save validation
+        cfg_raw = configparser.ConfigParser()
+        cfg_raw["tx_audio"] = {"ft8_base_tone_hz": "9999"}
+        with open(path, "w") as fh:
+            cfg_raw.write(fh)
+        cfg = main.AppConfig(path=path)
+        assert cfg.ft8_base_tone_hz == 1500.0
+
+
+def test_appconfig_ft8_base_tone_hz_nan_falls_back():
+    """ft8_base_tone_hz falls back to 1500 when stored value is nan."""
+    import tempfile, os, configparser, math
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "vader.cfg")
+        cfg_raw = configparser.ConfigParser()
+        cfg_raw["tx_audio"] = {"ft8_base_tone_hz": "nan"}
+        with open(path, "w") as fh:
+            cfg_raw.write(fh)
+        cfg = main.AppConfig(path=path)
+        assert cfg.ft8_base_tone_hz == 1500.0
+
+
+def test_appconfig_save_ft8_base_tone_hz_rejects_out_of_range():
+    """save_ft8_base_tone_hz raises ValueError for values outside 50–3000 Hz."""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = main.AppConfig(path=os.path.join(tmpdir, "vader.cfg"))
+        try:
+            cfg.save_ft8_base_tone_hz(9999.0)
+            assert False, "Expected ValueError"
+        except ValueError:
+            pass
+
+
+def test_appconfig_save_ft8_base_tone_hz_rejects_nan():
+    """save_ft8_base_tone_hz raises ValueError for nan/inf."""
+    import tempfile, os, math
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = main.AppConfig(path=os.path.join(tmpdir, "vader.cfg"))
+        for bad in (math.nan, math.inf, -math.inf):
+            try:
+                cfg.save_ft8_base_tone_hz(bad)
+                assert False, f"Expected ValueError for {bad}"
+            except ValueError:
+                pass
 
 
 def test_on_cancel_tx_accepted():
@@ -994,6 +1046,10 @@ if __name__ == "__main__":
     run("34e. _on_arm_tx — tone above 3000 Hz",     test_on_arm_tx_invalid_tone_out_of_range_high)
     run("34f. AppConfig.ft8_base_tone_hz — default", test_appconfig_ft8_base_tone_hz_default)
     run("34g. AppConfig.save_ft8_base_tone_hz — persists", test_appconfig_save_ft8_base_tone_hz)
+    run("34h. AppConfig.ft8_base_tone_hz — out-of-range falls back", test_appconfig_ft8_base_tone_hz_out_of_range_falls_back)
+    run("34i. AppConfig.ft8_base_tone_hz — nan falls back", test_appconfig_ft8_base_tone_hz_nan_falls_back)
+    run("34j. AppConfig.save_ft8_base_tone_hz — rejects out-of-range", test_appconfig_save_ft8_base_tone_hz_rejects_out_of_range)
+    run("34k. AppConfig.save_ft8_base_tone_hz — rejects nan/inf", test_appconfig_save_ft8_base_tone_hz_rejects_nan)
     run("35. _on_cancel_tx — accepted",             test_on_cancel_tx_accepted)
     run("36. _on_cancel_tx — not accepted",         test_on_cancel_tx_not_accepted)
     run("37. _on_start_cq_session — valid operator",       test_on_start_cq_session_valid_operator)

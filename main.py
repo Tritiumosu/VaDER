@@ -205,13 +205,25 @@ class AppConfig:
     @property
     def ft8_base_tone_hz(self) -> float:
         """FT8 base tone frequency in Hz (50–3000). Defaults to 1500."""
+        import math
         try:
-            return float(self._cfg.get("tx_audio", "ft8_base_tone_hz", fallback="1500"))
+            val = float(self._cfg.get("tx_audio", "ft8_base_tone_hz", fallback="1500"))
         except ValueError:
             return 1500.0
+        if not math.isfinite(val) or not (50.0 <= val <= 3000.0):
+            return 1500.0
+        return val
 
     def save_ft8_base_tone_hz(self, hz: float) -> None:
-        """Persist the FT8 base tone frequency to vader.cfg."""
+        """Persist the FT8 base tone frequency to vader.cfg.
+
+        Raises ValueError if ``hz`` is not finite or outside 50–3000 Hz.
+        """
+        import math
+        if not math.isfinite(hz) or not (50.0 <= hz <= 3000.0):
+            raise ValueError(
+                f"ft8_base_tone_hz must be a finite value in the range 50–3000 Hz; got {hz!r}"
+            )
         if not self._cfg.has_section("tx_audio"):
             self._cfg.add_section("tx_audio")
         self._cfg.set("tx_audio", "ft8_base_tone_hz", str(float(hz)))
@@ -1291,7 +1303,7 @@ class RadioGUI:
         if not (50.0 <= f0_hz <= 3000.0):
             messagebox.showerror(
                 "TX Error",
-                f"Base tone frequency {f0_hz:.0f} Hz is out of range (50–3000 Hz).",
+                f"Base tone frequency {f0_hz:g} Hz is out of range (50–3000 Hz).",
                 parent=self.root,
             )
             return
