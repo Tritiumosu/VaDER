@@ -84,6 +84,7 @@ class AppConfig:
             "mic_device_label":        "",
             "radio_out_device_index":  "-1",  # soundcard output → radio audio input
             "radio_out_device_label":  "",
+            "ft8_base_tone_hz":        "1500",  # FT8 base tone frequency in Hz (50–3000)
         },
         "operator": {
             "callsign": "",   # operator callsign, e.g. W4ABC — used in FT8 messages
@@ -200,6 +201,21 @@ class AppConfig:
     @property
     def tx_radio_out_device_label(self) -> str:
         return self._cfg.get("tx_audio", "radio_out_device_label", fallback="").strip()
+
+    @property
+    def ft8_base_tone_hz(self) -> float:
+        """FT8 base tone frequency in Hz (50–3000). Defaults to 1500."""
+        try:
+            return float(self._cfg.get("tx_audio", "ft8_base_tone_hz", fallback="1500"))
+        except ValueError:
+            return 1500.0
+
+    def save_ft8_base_tone_hz(self, hz: float) -> None:
+        """Persist the FT8 base tone frequency to vader.cfg."""
+        if not self._cfg.has_section("tx_audio"):
+            self._cfg.add_section("tx_audio")
+        self._cfg.set("tx_audio", "ft8_base_tone_hz", str(float(hz)))
+        self._write()
 
     def save_tx_audio(
         self,
@@ -1263,10 +1279,29 @@ class RadioGUI:
         # Persist operator settings
         self._config.save_operator(call, grid)
 
+        # Validate and read base tone frequency
+        try:
+            f0_hz = float(self._tx_base_tone_var.get().strip())
+        except ValueError:
+            messagebox.showerror(
+                "TX Error", "Base tone frequency must be a number (50–3000 Hz).",
+                parent=self.root,
+            )
+            return
+        if not (50.0 <= f0_hz <= 3000.0):
+            messagebox.showerror(
+                "TX Error",
+                f"Base tone frequency {f0_hz:.0f} Hz is out of range (50–3000 Hz).",
+                parent=self.root,
+            )
+            return
+        self._config.save_ft8_base_tone_hz(f0_hz)
+
         # Build TxJob with the configured radio output device
         dev = self.tx_radio_out_device_index
         job = TxJob(
             msg,
+            f0_hz=f0_hz,
             audio_device=dev,
         )
 
@@ -1764,6 +1799,23 @@ class RadioGUI:
             msg_row, text="CQ", font=("Arial", 8),
             command=self._on_compose_cq,
         ).pack(side=tk.LEFT, padx=(0, 2))
+
+        # Row 2b: Base tone frequency
+        tone_row = tk.Frame(self._tx_frame)
+        tone_row.pack(fill=tk.X, padx=5, pady=(4, 0))
+        tk.Label(tone_row, text="Base Tone (Hz):", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._tx_base_tone_var = tk.StringVar(
+            value=f"{self._config.ft8_base_tone_hz:g}"
+        )
+        self._tx_base_tone_entry = tk.Entry(
+            tone_row, textvariable=self._tx_base_tone_var, width=6,
+            font=("Consolas", 9),
+        )
+        self._tx_base_tone_entry.pack(side=tk.LEFT, padx=(2, 4))
+        tk.Label(
+            tone_row, text="(50–3000 Hz, default 1500)",
+            font=("Arial", 8), fg="gray",
+        ).pack(side=tk.LEFT)
 
         # Row 3: CQ Session assist buttons
         session_row = tk.Frame(self._tx_frame)

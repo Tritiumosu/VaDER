@@ -548,6 +548,72 @@ def test_on_arm_tx_invalid_operator():
     gui._tx_coord.arm.assert_not_called()
 
 
+def test_on_arm_tx_passes_f0_hz_to_txjob():
+    """_on_arm_tx reads the base tone field and passes f0_hz to TxJob.arm()."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    gui._tx_base_tone_var.get.return_value = "750"
+    gui.tx_radio_out_device_index = 0
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_called_once()
+    job = gui._tx_coord.arm.call_args[0][0]
+    assert job.f0_hz == 750.0, f"Expected f0_hz=750.0, got {job.f0_hz}"
+
+
+def test_on_arm_tx_invalid_tone_non_numeric():
+    """_on_arm_tx shows an error when the base tone field is not a number."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    gui._tx_base_tone_var.get.return_value = "abc"
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_on_arm_tx_invalid_tone_out_of_range_low():
+    """_on_arm_tx shows an error when the base tone is below 50 Hz."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    gui._tx_base_tone_var.get.return_value = "10"
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_on_arm_tx_invalid_tone_out_of_range_high():
+    """_on_arm_tx shows an error when the base tone is above 3000 Hz."""
+    gui = mock.MagicMock()
+    gui._tx_msg_var.get.return_value = "CQ W4ABC EN52"
+    gui._tx_callsign_var.get.return_value = "W4ABC"
+    gui._tx_grid_var.get.return_value = "EN52"
+    gui._tx_base_tone_var.get.return_value = "9999"
+    main.RadioGUI._on_arm_tx(gui)
+    gui._tx_coord.arm.assert_not_called()
+
+
+def test_appconfig_ft8_base_tone_hz_default():
+    """AppConfig.ft8_base_tone_hz defaults to 1500.0."""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = main.AppConfig(path=os.path.join(tmpdir, "vader.cfg"))
+        assert cfg.ft8_base_tone_hz == 1500.0
+
+
+def test_appconfig_save_ft8_base_tone_hz():
+    """save_ft8_base_tone_hz persists the value and reloads correctly."""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "vader.cfg")
+        cfg = main.AppConfig(path=path)
+        cfg.save_ft8_base_tone_hz(800.0)
+        cfg2 = main.AppConfig(path=path)
+        assert cfg2.ft8_base_tone_hz == 800.0
+
+
 def test_on_cancel_tx_accepted():
     """_on_cancel_tx calls coord.cancel() and updates status when accepted."""
     gui = mock.MagicMock()
@@ -922,6 +988,12 @@ if __name__ == "__main__":
     run("32. _prefill_reply — RR73",                test_prefill_reply_rr73)
     run("33. _on_arm_tx — empty message",           test_on_arm_tx_empty_message)
     run("34. _on_arm_tx — invalid operator",        test_on_arm_tx_invalid_operator)
+    run("34b. _on_arm_tx — passes f0_hz to TxJob", test_on_arm_tx_passes_f0_hz_to_txjob)
+    run("34c. _on_arm_tx — invalid tone non-numeric", test_on_arm_tx_invalid_tone_non_numeric)
+    run("34d. _on_arm_tx — tone below 50 Hz",       test_on_arm_tx_invalid_tone_out_of_range_low)
+    run("34e. _on_arm_tx — tone above 3000 Hz",     test_on_arm_tx_invalid_tone_out_of_range_high)
+    run("34f. AppConfig.ft8_base_tone_hz — default", test_appconfig_ft8_base_tone_hz_default)
+    run("34g. AppConfig.save_ft8_base_tone_hz — persists", test_appconfig_save_ft8_base_tone_hz)
     run("35. _on_cancel_tx — accepted",             test_on_cancel_tx_accepted)
     run("36. _on_cancel_tx — not accepted",         test_on_cancel_tx_not_accepted)
     run("37. _on_start_cq_session — valid operator",       test_on_start_cq_session_valid_operator)
