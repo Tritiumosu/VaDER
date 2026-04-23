@@ -62,7 +62,7 @@ The project is currently **hardware-specific** (Yaesu FT-991A), but the CAT laye
 | GUI TX panel (arm/cancel/status/countdown) | ✅ Working (`main.py`) |
 | Select-and-reply from decoded messages | ✅ Working (`main.py`) |
 | CAT PTT key/unkey around FT8 TX window | ✅ Working (`ft8_tx.py`) |
-| CQ-initiated QSO assist (auto-prefill, no auto-TX) | ✅ Working (`main.py`, `ft8_qso.py`) |
+| CQ-initiated QSO assist with auto-arm / auto-sequence | ✅ Working (`main.py`, `ft8_qso.py`) |
 | Unattended full QSO automation | 🚫 Not permitted by project safety policy |
 | Contact / QSO logging to file | 🔲 Partial (`QsoRecord` struct ready, no file write yet) |
 | Support for radios other than FT-991A | 🔲 Planned |
@@ -311,7 +311,7 @@ Live hardware scripts/checks are post-test validation, not a CI gate.
 
 ## Known Limitations
 
-- **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains manual-assisted and operator-controlled.
+- **Unattended full QSO automation is intentionally not implemented** — By project policy, TX remains operator-initiated (the CQ session must be started manually). The **Auto-arm** / auto-sequence feature mirrors WSJT-X behaviour within a supervised, operator-started session, and a real-time abort path is always present.
 - **QSO/contact logging is incomplete** — `QsoRecord` (in `ft8_qso.py`) captures completed QSO data, but writing to ADIF or another log format is deferred to Milestone 5.
 - **Decode depth vs. WSJT-X** — VaDER's FT8 decoder now implements iterative interference cancellation ("deep search"), callsign-aware AP passes, adaptive LDPC iterations, soft Costas-energy LLR scaling, parallel candidate decode, and all Milestone 6 enhancements.  Decode depth on a busy band should approach WSJT-X levels.
 - **Yaesu FT-991A only** — The CAT library is specific to this radio model. Other radios are a future goal.
@@ -347,7 +347,7 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] RMS level metering in GUI
 - [x] Audio device selection with persistence
 
-### 🔄 Milestone 4 — FT8 Transmit & Basic QSO (In Progress)
+### ✅ Milestone 4 — FT8 Transmit & Basic QSO (Complete)
 - [x] FT8 message packing (callsign, grid, SNR, special tokens → 77 bits)
 - [x] CRC-14 generation (polynomial 0x2757, matching WSJT-X / ft8_lib)
 - [x] LDPC (174, 91) encoding via GF(2) matrix factorisation
@@ -366,7 +366,7 @@ Progress is tracked here as features move from planned to implemented. Items are
 - [x] **Select-and-reply assist** — double-click any decoded FT8 line to pre-populate the TX message with the recommended reply; manual confirmation (Arm TX) still required before any transmission
 - [x] **CAT PTT integration** — `Ft8TxCoordinator` keys and unkeys CAT PTT around the FT8 audio window with configurable pre-key and post-key guard intervals
 - [x] TX guardrails: blocks arm if CAT disconnected, invalid callsign/grid, empty message, negative audio device, or another TX already active/armed
-- [x] **CQ-initiated QSO assist** — operator clicks **▶ Start CQ Session** to begin a tracked exchange; after sending CQ the system watches decoded traffic, recognises replies addressed to the operator, and pre-fills the next standard exchange message; the operator reviews the suggestion then presses **Arm TX** to transmit; the assist watcher continues through the full exchange (CQ → exchange → 73); **never transmits autonomously**
+- [x] **CQ-initiated QSO assist with auto-arm / auto-sequence** — operator clicks **▶ Start CQ Session** to begin a tracked exchange; after sending CQ the system watches decoded traffic, recognises replies addressed to the operator, and pre-fills the next standard exchange message; when the **Auto-arm** checkbox is enabled (default), each exchange step is armed automatically for the next slot without requiring a manual button press — mirroring WSJT-X auto-sequence behaviour; if no reply is received after a CQ slot, CQ is re-armed and re-sent automatically until a response arrives or the operator clicks **Cancel TX** or **■ Stop QSO**; the auto-arm checkbox can be unticked at any time for manual-confirm mode; the session is always operator-initiated and the full abort path (Cancel TX / Stop QSO) is always available
 - [x] `QsoRecord` dataclass added to `ft8_qso.py` with ADIF helpers (`adif_date()`, `adif_time()`) — foundation for Milestone 5 contact logging
 
 #### Milestone 4 Usage Notes
@@ -380,20 +380,22 @@ Progress is tracked here as features move from planned to implemented. Items are
 5. The coordinator automatically keys PTT, plays the FT8 tones, then unkeys PTT.
 6. Click **Cancel TX** at any time before the slot fires to abort without transmitting.
 
-**CQ Session assist (operator-confirmed)**
+**CQ Session assist (auto-arm / auto-sequence)**
 
 1. Enter your callsign and grid, click **Save**.
 2. Click **▶ Start CQ Session** — the TX message is filled with `CQ MYCALL MYGRID` and the assist watcher is activated.
-3. Click **Arm TX (next slot)** to send the CQ.
-4. After the CQ transmits, decoded replies addressed to your callsign are automatically detected and the appropriate exchange response is pre-filled in the TX field.
-5. Review the suggested message (edit if needed), then click **Arm TX** again to respond.
-6. The watcher continues through the exchange:  CQ → exchange reply → 73 confirmation.
-7. Click **■ Stop QSO** at any time to end the session and clear the assist state.
+3. Click **Arm TX (next slot)** to send the first CQ.  (With **Auto-arm** ticked, subsequent steps arm automatically — see below.)
+4. After the CQ transmits, decoded replies addressed to your callsign are automatically detected and the appropriate exchange response is pre-filled in the TX field.  If **Auto-arm** is enabled, the response is armed immediately for the next slot without any button press.
+5. If no reply is received after a CQ slot, **Auto-arm** will re-arm and re-send CQ in the following slot automatically — continuing until a response arrives or you abort.
+6. The watcher continues through the exchange: CQ → exchange reply → 73 confirmation, auto-arming each step.
+7. Click **■ Stop QSO** at any time to end the session and clear the assist state, or **Cancel TX** to abort the current armed slot without ending the session.
+8. Untick **Auto-arm** at any time to return to manual-confirm mode; re-tick it to resume auto-sequence.
 
 **Guard behaviour (CQ assist)**
-- The assist watcher **never calls Arm TX** — operator confirmation is always required.
-- Prefill is suppressed while a TX job is ARMED, in TX_PREP, or TX_ACTIVE.
+- **Auto-arm** (checkbox, default on): when enabled, `_on_arm_tx()` is called automatically after each exchange pre-fill, and CQ is re-sent if no reply arrives; when disabled, the operator must press **Arm TX** manually for each step.
+- Prefill and auto-arm are suppressed while a TX job is ARMED, in TX_PREP, or TX_ACTIVE.
 - A duplicate decode of the same message for the current QSO step is silently ignored (dedup guard).
+- Any incoming DX reply cancels the pending CQ-retry timer immediately.
 - Switching to VOICE mode automatically stops any active CQ session.
 - Messages from stations other than the first valid responder are ignored after lock-in.
 

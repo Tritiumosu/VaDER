@@ -488,6 +488,11 @@ class FT8SymbolEnergyExtractor:
         self.sym_n = int(round(FT8_SYMBOL_DURATION_S * self.fs))  # 1920 @ 12 kHz
         # {f0_hz: basis (8, sym_n) complex128} — insertion-ordered for LRU eviction.
         self._basis_cache: OrderedDict[float, np.ndarray] = OrderedDict()
+        # Milestone 6 parallel decode: guard cache mutations so that concurrent
+        # _decode_one_candidate calls sharing this extractor don't corrupt the
+        # LRU ordering or trigger double-eviction when numpy releases the GIL
+        # between cache.get() and cache.__setitem__().
+        self._cache_lock = threading.Lock()
 
     def _get_basis(self, f0_hz: float) -> np.ndarray:
         """Return (cached) DFT basis matrix for the given base frequency.
@@ -495,22 +500,42 @@ class FT8SymbolEnergyExtractor:
         Uses a true LRU eviction policy backed by :class:`collections.OrderedDict`:
         a cache hit moves the entry to *most-recently-used* position, and an
         eviction removes the *least-recently-used* (first) entry.
+
+        Thread-safe: a lock guards all cache mutations so that parallel
+        :meth:`_decode_one_candidate` calls sharing this extractor do not race
+        on the :class:`collections.OrderedDict` during numpy computation
+        (which releases the GIL between ``get()`` and ``__setitem__()``).
+        The expensive basis computation is performed *outside* the lock so
+        that threads can compute different frequencies concurrently.
         """
-        basis = self._basis_cache.get(f0_hz)
-        if basis is None:
-            phase_inc = 2.0 * math.pi * np.array(
-                [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
-            ) / float(self.fs)
-            t_sym = np.arange(self.sym_n, dtype=np.float64)
-            basis = np.exp(-1j * np.outer(phase_inc, t_sym))  # (8, sym_n)
+        # Fast path: check cache under lock and return immediately on hit.
+        with self._cache_lock:
+            basis = self._basis_cache.get(f0_hz)
+            if basis is not None:
+                self._basis_cache.move_to_end(f0_hz)
+                return basis
+
+        # Cache miss: compute outside the lock (numpy releases GIL; concurrent
+        # threads computing different f0 values can run in parallel).
+        phase_inc = 2.0 * math.pi * np.array(
+            [f0_hz + k * FT8_TONE_SPACING_HZ for k in range(8)]
+        ) / float(self.fs)
+        t_sym = np.arange(self.sym_n, dtype=np.float64)
+        basis_new = np.exp(-1j * np.outer(phase_inc, t_sym))  # (8, sym_n)
+
+        # Re-acquire lock to store.  Another thread may have stored this key
+        # while we were computing — in that case return the already-cached
+        # entry to preserve object identity (tests rely on `b1 is b2`).
+        with self._cache_lock:
+            if f0_hz in self._basis_cache:
+                # Another thread won the race; use its entry and promote to MRU.
+                self._basis_cache.move_to_end(f0_hz)
+                return self._basis_cache[f0_hz]
             if len(self._basis_cache) >= self._CACHE_MAXSIZE:
                 # Evict the least-recently-used entry.
                 self._basis_cache.popitem(last=False)
-            self._basis_cache[f0_hz] = basis
-        else:
-            # Move to most-recently-used position.
-            self._basis_cache.move_to_end(f0_hz)
-        return basis
+            self._basis_cache[f0_hz] = basis_new
+        return basis_new
 
     def extract_all_79(
         self,
@@ -1965,6 +1990,74 @@ class FT8ConsoleDecoder:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+
+    def reset_framer(self) -> None:
+        """
+        Reset the UTC slot framer and drain the audio queue for a clean restart.
+
+        **Must be called before starting a new audio stream** — for example,
+        every time the GUI's "Start Audio" button begins a new
+        :class:`~digi_input.SoundCardAudioSource` session — to prevent the
+        framer from treating new audio as a continuation of a previous (now
+        stale) stream.
+
+        Why this is necessary
+        ---------------------
+        The decoder runs as a long-lived background thread; its
+        :class:`UTC15sFramer` accumulates audio and emits UTC-aligned 15-second
+        frames.  When the audio stream is stopped and restarted the framer
+        retains:
+
+        * ``_t0_utc`` — a past epoch timestamp from the *previous* stream
+        * ``_buf``    — leftover audio samples from the same
+        * ``_first_frame_emitted`` — True, so the next frame won't be
+          marked partial and skipped
+
+        New audio chunks carry fresh ``t0_monotonic`` values (current time)
+        but ``_t0_utc`` is only initialised on the very *first* push call
+        (when it is ``None``).  Because ``_t0_utc`` is not ``None`` after a
+        stop/start cycle, the framer thinks the new audio is a seamless
+        continuation of the old stream and assembles frames whose slot
+        boundaries are offset from the actual current UTC position.  FT8
+        signals in the new audio appear at incorrect time offsets inside those
+        frames and the Costas sync search misses them.
+
+        What this method does
+        ----------------------
+        1. Replaces ``_framer`` with a fresh :class:`UTC15sFramer` instance
+           (``_t0_utc = None``, empty buffer, ``_first_frame_emitted = False``).
+           The assignment is atomic in CPython; the worker thread picks up the
+           new framer on its next iteration.
+        2. Drains all queued audio chunks that pre-date this reset.  Old
+           chunks would re-initialise ``_t0_utc`` to a stale value, defeating
+           the purpose of the framer replacement.
+        3. Resets ``_resampler`` to ``None`` so it re-creates on the first
+           new chunk (harmless when the sample rate has not changed, avoids
+           any edge case if it has).
+
+        After calling this method the first frame emitted by the new stream
+        will be marked ``is_partial=True`` and skipped by the worker, which is
+        the correct behaviour for any mid-slot stream start.
+        """
+        # 1. Replace framer atomically (CPython pointer write is atomic).
+        self._framer = UTC15sFramer(self.fs_proc)
+        # 2. Drain stale queued audio.  Old chunks have timestamps from before
+        #    the stop and would set _t0_utc to the wrong epoch on their first
+        #    push() into the new framer.
+        drained = 0
+        while True:
+            try:
+                self._q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if self._debug and drained:
+            print(
+                f"[FT8] reset_framer: drained {drained} stale chunk(s) from queue",
+                flush=True,
+            )
+        # 3. Reset resampler so it re-initialises cleanly on the next chunk.
+        self._resampler = None
 
     def feed(self, *, fs: int, samples: np.ndarray, t0_monotonic: float) -> None:
         try:

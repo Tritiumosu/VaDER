@@ -877,8 +877,8 @@ def test_maybe_assist_prefill_inactive_when_session_off():
     gui._tx_msg_var.set.assert_not_called()
 
 
-def test_maybe_assist_prefill_no_auto_arm():
-    """_maybe_assist_prefill must NEVER call _on_arm_tx (safety guard)."""
+def test_maybe_assist_prefill_no_auto_arm_when_disabled():
+    """_maybe_assist_prefill must NOT call _on_arm_tx when auto-arm is disabled."""
     from ft8_qso import Ft8QsoManager, OperatorConfig
     import unittest.mock as _mock
     from ft8_ntp import Ft8SlotTimer
@@ -895,11 +895,39 @@ def test_maybe_assist_prefill_no_auto_arm():
     gui._qso_mgr = mgr
     gui._qso_assist_prefilled = ""
     gui._tx_coord.state = TxState.IDLE
+    # Simulate auto-arm checkbox unchecked
+    gui._auto_arm_var.get.return_value = False
 
     main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
-    # _on_arm_tx must never be called — operator approval is mandatory
+    # With auto-arm off, _on_arm_tx must not be called
     gui._on_arm_tx.assert_not_called()
     gui._tx_coord.arm.assert_not_called()
+
+
+def test_maybe_assist_prefill_auto_arms_when_enabled():
+    """_maybe_assist_prefill calls _on_arm_tx automatically when auto-arm is on."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 0.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+    # Simulate auto-arm checkbox checked
+    gui._auto_arm_var.get.return_value = True
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    # With auto-arm on, _on_arm_tx must be called once
+    gui._on_arm_tx.assert_called_once()
 
 
 def test_apply_tx_state_update_clears_dedup_on_complete():
@@ -994,6 +1022,141 @@ def test_maybe_assist_prefill_rr73_completion_hint():
     gui._tx_msg_var.set.assert_called_once()
     status_arg = gui._tx_status_var.set.call_args[0][0]
     assert "RR73" in status_arg
+
+
+# ---------------------------------------------------------------------------
+# Auto-arm CQ retry tests
+# ---------------------------------------------------------------------------
+
+def test_apply_tx_state_complete_schedules_cq_retry_when_auto_arm_on():
+    """COMPLETE with CQ_SENT state and auto-arm on must schedule a CQ retry."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState
+    from ft8_tx import TxState
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    timer.seconds_to_next_slot.return_value = 2.0
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()  # state = CQ_SENT
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = "anything"
+    gui._auto_arm_var.get.return_value = True
+
+    main.RadioGUI._apply_tx_state_update(gui, TxState.COMPLETE, "TX complete")
+
+    assert gui._qso_assist_prefilled == ""
+    gui._schedule_cq_retry.assert_called_once()
+
+
+def test_apply_tx_state_complete_no_cq_retry_when_auto_arm_off():
+    """COMPLETE with auto-arm off must not schedule a CQ retry."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    from ft8_tx import TxState
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._auto_arm_var.get.return_value = False
+
+    main.RadioGUI._apply_tx_state_update(gui, TxState.COMPLETE, "TX complete")
+    gui._schedule_cq_retry.assert_not_called()
+
+
+def test_apply_tx_state_canceled_cancels_retry():
+    """CANCELED state must call _cancel_cq_retry."""
+    from ft8_tx import TxState
+
+    gui = mock.MagicMock()
+    gui._qso_assist_prefilled = ""
+    main.RadioGUI._apply_tx_state_update(gui, TxState.CANCELED, "TX canceled")
+    gui._cancel_cq_retry.assert_called_once()
+
+
+def test_check_and_rearm_cq_rearms_when_still_cq_sent():
+    """_check_and_rearm_cq should re-compose CQ and call _on_arm_tx."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState
+    from ft8_tx import TxState
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._auto_arm_var.get.return_value = True
+    gui._tx_coord.state = TxState.IDLE
+    gui._cq_retry_after = None
+
+    main.RadioGUI._check_and_rearm_cq(gui)
+
+    gui._tx_msg_var.set.assert_called_once_with("CQ W4ABC EN52")
+    gui._on_arm_tx.assert_called_once()
+
+
+def test_check_and_rearm_cq_skips_when_dx_replied():
+    """_check_and_rearm_cq must not re-arm if QSO has already advanced."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState
+    from ft8_tx import TxState
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+    mgr.advance("W4ABC K9XYZ -05")  # state now EXCHANGE_SENT
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._auto_arm_var.get.return_value = True
+    gui._tx_coord.state = TxState.IDLE
+    gui._cq_retry_after = None
+
+    main.RadioGUI._check_and_rearm_cq(gui)
+    gui._on_arm_tx.assert_not_called()
+
+
+def test_maybe_assist_prefill_cancels_cq_retry_on_response():
+    """_maybe_assist_prefill must cancel the pending CQ retry when a reply arrives."""
+    from ft8_qso import Ft8QsoManager, OperatorConfig
+    import unittest.mock as _mock
+    from ft8_ntp import Ft8SlotTimer
+    from ft8_tx import TxState
+
+    timer = _mock.MagicMock(spec=Ft8SlotTimer)
+    op = OperatorConfig(callsign="W4ABC", grid="EN52")
+    mgr = Ft8QsoManager(operator=op, slot_timer=timer)
+    mgr.start_cq()
+
+    gui = mock.MagicMock()
+    gui._qso_assist_active = True
+    gui._qso_mgr = mgr
+    gui._qso_assist_prefilled = ""
+    gui._tx_coord.state = TxState.IDLE
+    gui._auto_arm_var.get.return_value = False  # auto-arm off so arm doesn't fire
+
+    main.RadioGUI._maybe_assist_prefill(gui, "W4ABC K9XYZ -05", -5.0)
+    # Even with auto-arm off, the pending retry must be cancelled on any reply
+    gui._cancel_cq_retry.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

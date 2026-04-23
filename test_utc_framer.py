@@ -261,6 +261,171 @@ run("6. FT8ConsoleDecoder verbose logging attributes present", t_decoder_debug_a
 
 
 # ---------------------------------------------------------------------------
+# Test 7: FT8ConsoleDecoder.reset_framer() exists and resets state
+# ---------------------------------------------------------------------------
+
+def t_reset_framer_exists() -> str:
+    """FT8ConsoleDecoder must have a reset_framer() method."""
+    from ft8_decode import FT8ConsoleDecoder
+    dec = FT8ConsoleDecoder()
+    assert hasattr(dec, "reset_framer"), "Missing reset_framer() method"
+    assert callable(dec.reset_framer), "reset_framer must be callable"
+    return "reset_framer() is present and callable"
+
+
+run("7. FT8ConsoleDecoder.reset_framer() exists and is callable", t_reset_framer_exists)
+
+
+# ---------------------------------------------------------------------------
+# Test 8: reset_framer() creates a fresh framer with _t0_utc = None
+# ---------------------------------------------------------------------------
+
+def t_reset_framer_clears_t0_utc() -> str:
+    """After reset_framer(), the framer's _t0_utc must be None."""
+    from ft8_decode import FT8ConsoleDecoder, UTC15sFramer
+    dec = FT8ConsoleDecoder()
+
+    # Prime the framer by feeding a small audio chunk so _t0_utc gets set.
+    framer = dec._framer
+    silence = np.zeros(int(0.1 * FT8_FS), dtype=np.float32)
+    framer.push(silence, t0_monotonic=1000.0)   # arbitrary non-zero mono timestamp
+    assert framer._t0_utc is not None, "Expected _t0_utc to be set after push()"
+
+    # Now reset and verify the new framer has a clean slate.
+    dec.reset_framer()
+    new_framer = dec._framer
+
+    assert new_framer is not framer, "reset_framer() must replace the framer instance"
+    assert new_framer._t0_utc is None, (
+        f"Fresh framer should have _t0_utc=None, got {new_framer._t0_utc}"
+    )
+    assert len(new_framer._buf) == 0, (
+        f"Fresh framer should have an empty buffer, got {len(new_framer._buf)} samples"
+    )
+    assert not new_framer._first_frame_emitted, (
+        "Fresh framer should have _first_frame_emitted=False"
+    )
+    return "reset_framer() replaced framer with _t0_utc=None and empty buffer"
+
+
+run("8. reset_framer() clears _t0_utc and buffer state", t_reset_framer_clears_t0_utc)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: reset_framer() drains the audio queue
+# ---------------------------------------------------------------------------
+
+def t_reset_framer_drains_queue() -> str:
+    """After reset_framer(), the internal audio queue must be empty."""
+    from ft8_decode import FT8ConsoleDecoder
+    import queue as _queue_module
+
+    dec = FT8ConsoleDecoder()
+    # Manually put stale items into the queue (simulating pre-stop audio).
+    fake_samples = np.zeros(100, dtype=np.float32)
+    for _ in range(5):
+        dec._q.put_nowait((FT8_FS, fake_samples, 1234.0))
+
+    assert not dec._q.empty(), "Queue should have items before reset"
+
+    dec.reset_framer()
+
+    assert dec._q.empty(), (
+        f"Queue should be empty after reset_framer(); "
+        f"got {dec._q.qsize()} item(s) remaining"
+    )
+    return "reset_framer() successfully drained all queued chunks"
+
+
+run("9. reset_framer() drains all stale chunks from the audio queue",
+    t_reset_framer_drains_queue)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Stop/Restart sync — new audio aligns to current UTC slot
+# ---------------------------------------------------------------------------
+
+def t_stop_restart_resync() -> str:
+    """
+    Simulate stop/restart: after reset_framer(), the new audio stream must
+    synchronise to the *new* UTC position, not continue from the old one.
+
+    Scenario:
+      1. Framer runs for a while and accumulates a stale _t0_utc (e.g. UTC=7s).
+      2. Audio stops for 45 seconds (3 FT8 slots' worth).
+      3. reset_framer() is called (simulating "Start Audio" button).
+      4. New audio arrives with a current t0_monotonic reflecting UTC=52s.
+      5. The framer should align to the current UTC slot (boundary at 60s),
+         NOT attempt to continue from the old UTC=7s slot sequence.
+    """
+    from ft8_decode import FT8ConsoleDecoder, UTC15sFramer
+
+    dec = FT8ConsoleDecoder()
+
+    # --- Phase 1: simulate running audio stream at UTC epoch=7s ---
+    # Patch the framer's clock so it believes we're 7 seconds into a slot.
+    framer_old = dec._framer
+    framer_old._utc_minus_mono = 7.0   # UTC = mono + 7
+    framer_old._alpha = 0.0             # freeze EWMA
+
+    # Feed 10 seconds of audio so _t0_utc gets set to ~7.
+    chunk_s = 0.1
+    n_chunk = int(round(chunk_s * FT8_FS))
+    silence = np.zeros(n_chunk, dtype=np.float32)
+    mono = 0.0
+    for _ in range(int(10.0 / chunk_s)):
+        framer_old.push(silence, t0_monotonic=mono)
+        mono += chunk_s
+
+    assert framer_old._t0_utc is not None and framer_old._t0_utc > 0, (
+        f"Expected _t0_utc to be set, got {framer_old._t0_utc}"
+    )
+    old_t0 = framer_old._t0_utc
+
+    # --- Phase 2: 45-second pause (stop audio) ---
+    pause_s = 45.0
+
+    # --- Phase 3: reset_framer() ---
+    dec.reset_framer()
+    framer_new = dec._framer
+    assert framer_new._t0_utc is None, "New framer must start with _t0_utc=None"
+
+    # --- Phase 4: new audio arrives at UTC = 7 + 10 + 45 = 62s (mono = 55s) ---
+    restart_mono = mono + pause_s       # monotonic clock continued ticking
+    restart_utc  = restart_mono + 7.0  # UTC = mono + 7 (same offset as before)
+
+    # Configure new framer's clock to match the restart UTC.
+    framer_new._utc_minus_mono = 7.0
+    framer_new._alpha = 0.0
+
+    # Push just enough audio to initialise _t0_utc (but not a full frame).
+    one_chunk = np.zeros(n_chunk, dtype=np.float32)
+    framer_new.push(one_chunk, t0_monotonic=restart_mono)
+
+    assert framer_new._t0_utc is not None, "New framer should have _t0_utc set now"
+
+    # The new _t0_utc should be close to restart_utc, NOT close to old_t0.
+    new_t0 = framer_new._t0_utc
+    assert abs(new_t0 - restart_utc) < 1.0, (
+        f"New framer _t0_utc={new_t0:.2f}s should be close to "
+        f"restart_utc={restart_utc:.2f}s (pause={pause_s}s)"
+    )
+    # Specifically, it must NOT be anywhere near the old stale timestamp.
+    assert abs(new_t0 - old_t0) > 30.0, (
+        f"New framer _t0_utc={new_t0:.2f}s must not be near "
+        f"old stale _t0_utc={old_t0:.2f}s"
+    )
+    return (
+        f"After {pause_s}s pause + reset, new _t0_utc={new_t0:.2f}s "
+        f"(≈{restart_utc:.2f}s), old was {old_t0:.2f}s — correctly re-synced"
+    )
+
+
+run("10. Stop/restart: reset_framer() re-synchronises to current UTC slot",
+    t_stop_restart_resync)
+
+
+# ---------------------------------------------------------------------------
 print()
 passed = sum(1 for _, ok, _ in results if ok)
 failed = sum(1 for _, ok, _ in results if not ok)

@@ -541,7 +541,7 @@ class SettingsDialog:
         ).pack(side=tk.LEFT, padx=4)
 
         # -- TX Microphone row ---------------------------------------------
-        txmic_frame = tk.LabelFrame(self._win, text="TX Microphone (Computer Mic → Radio)")
+        txmic_frame = tk.LabelFrame(self._win, text="TX Microphone (Computer Mic → Radio TX)")
         txmic_frame.pack(padx=16, pady=6, fill=tk.X)
 
         tk.Label(txmic_frame, text="Device:").pack(side=tk.LEFT, padx=6)
@@ -563,7 +563,7 @@ class SettingsDialog:
         ).pack(side=tk.LEFT, padx=4)
 
         # -- TX Radio Output row -------------------------------------------
-        txout_frame = tk.LabelFrame(self._win, text="TX Radio Output (Computer → Radio Audio Input)")
+        txout_frame = tk.LabelFrame(self._win, text="TX Radio Output (Computer TX → Radio TX)")
         txout_frame.pack(padx=16, pady=6, fill=tk.X)
 
         tk.Label(txout_frame, text="Device:").pack(side=tk.LEFT, padx=6)
@@ -816,8 +816,11 @@ class RadioGUI:
         self._tx_countdown_after: str | None = None
 
         # CQ QSO assist — operator-confirmed reply pre-fill (Milestone 4)
-        # Never auto-transmits; only pre-fills the TX message field and shows
-        # a hint so the operator can review and press Arm TX manually.
+        # When _auto_arm_var is True, the assist also auto-arms TX after
+        # pre-filling so the operator does not need to press Arm TX manually
+        # for each exchange step.  Auto-arm can be disabled at any time via
+        # the checkbox in the TX panel; the Cancel TX / Stop QSO buttons
+        # remain the primary real-time abort path.
         self._qso_mgr: "Ft8QsoManager | None" = None
         self._qso_assist_active: bool = False
         # Dedup guard: last message we pre-filled via the assist path.
@@ -826,9 +829,13 @@ class RadioGUI:
         # (meaning the message was sent); preserved on ERROR/CANCELED so the
         # operator's last suggestion remains visible.
         self._qso_assist_prefilled: str = ""
+        # Auto-arm toggle (BooleanVar created here so it exists before setup_ui)
+        self._auto_arm_var: tk.BooleanVar = tk.BooleanVar(value=True)
+        # Handle for the pending CQ-retry after() call (so it can be cancelled)
+        self._cq_retry_after: "str | None" = None
 
-        self.root.title("FT-991A Command Center")
-        self.root.geometry("500x900")
+        self.root.title("VaDER Command Center")
+        self.root.geometry("550x950")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.setup_ui()
@@ -884,6 +891,13 @@ class RadioGUI:
     def _start_audio_stream(self, device_index: int) -> None:
         self._stop_audio_stream()
         self._audio_stop.clear()
+        # Reset the FT8 decoder's UTC framer before opening the new audio stream.
+        # Without this, a Stop/Start cycle leaves the framer referencing a stale
+        # epoch timestamp from the previous stream.  New audio is then assembled
+        # into frames whose slot boundaries are offset from the actual current
+        # UTC time, causing Costas-sync misses and total decode failure until
+        # the framer's internal clock catches up (which can take many slots).
+        self._ft8.reset_framer()
         self._audio_src = SoundCardAudioSource(device=device_index)
         self._audio_src.start()
         self._audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
@@ -1178,8 +1192,9 @@ class RadioGUI:
         # Update button states
         self._cq_session_btn.config(state=tk.DISABLED)
         self._stop_session_btn.config(state=tk.NORMAL)
+        auto_hint = "auto-arm active" if self._auto_arm_var.get() else "Arm TX to transmit"
         self._tx_status_var.set(
-            f"CQ Session: {cq_msg} — Arm TX, then watch for replies"
+            f"CQ Session: {cq_msg} — {auto_hint}"
         )
 
     def _on_stop_cq_session(self) -> None:
@@ -1187,8 +1202,10 @@ class RadioGUI:
         Stop the active CQ session and reset all QSO assist state.
 
         Safe to call at any time; clears assist flags, aborts the QSO
-        manager (if present), and restores the session button states.
+        manager (if present), cancels any pending CQ-retry timer, and
+        restores the session button states.
         """
+        self._cancel_cq_retry()
         if self._qso_mgr is not None:
             self._qso_mgr.abort()
         self._qso_mgr              = None
@@ -1207,8 +1224,10 @@ class RadioGUI:
 
         Called on the Tkinter thread (via the UI queue), so it may safely
         update :class:`tkinter.StringVar` instances and button states.
-        **It never calls** :meth:`_on_arm_tx` — the operator must press
-        Arm TX to transmit.
+        When ``_auto_arm_var`` is True this method also calls
+        :meth:`_on_arm_tx` so the exchange reply is armed automatically
+        (mirroring WSJT-X "auto-sequence" behaviour).  The operator can
+        abort at any time via the **Cancel TX** or **Stop QSO** buttons.
 
         Guards
         ------
@@ -1246,6 +1265,9 @@ class RadioGUI:
         if next_msg == self._qso_assist_prefilled:
             return
 
+        # Cancel any pending CQ-retry — we got a response
+        self._cancel_cq_retry()
+
         # Pre-fill the TX message field
         self._tx_msg_var.set(next_msg)
         self._qso_assist_prefilled = next_msg
@@ -1255,7 +1277,7 @@ class RadioGUI:
         dx  = rx.call2 if rx.call2 else "?"
         qso_state = self._qso_mgr.state
         if qso_state == QsoState.EXCHANGE_SENT:
-            hint = f"Reply from {dx} — review exchange, then Arm TX"
+            hint = f"Reply from {dx} — exchange armed" if self._auto_arm_var.get() else f"Reply from {dx} — review exchange, then Arm TX"
         elif qso_state == QsoState.COMPLETE:
             if rx.is_rrr:
                 completion_text = "RRR"
@@ -1263,11 +1285,15 @@ class RadioGUI:
                 completion_text = "RR73"
             else:
                 completion_text = "Completion reply"
-            hint = f"{completion_text} from {dx} — 73 pre-filled, Arm TX to close QSO"
+            hint = f"{completion_text} from {dx} — 73 armed" if self._auto_arm_var.get() else f"{completion_text} from {dx} — 73 pre-filled, Arm TX to close QSO"
         else:
-            hint = f"Next reply from {dx} — review then Arm TX"
+            hint = f"Next reply from {dx} — armed" if self._auto_arm_var.get() else f"Next reply from {dx} — review then Arm TX"
 
         self._tx_status_var.set(f"CQ Assist: {hint}")
+
+        # Auto-arm: arm the TX coordinator for the next slot automatically
+        if self._auto_arm_var.get():
+            self._on_arm_tx()
 
     def _on_arm_tx(self) -> None:
         """Arm the TX coordinator for the next FT8 slot."""
@@ -1365,6 +1391,17 @@ class RadioGUI:
             # assist prefill for the subsequent QSO step.
             if state == TxState.COMPLETE:
                 self._qso_assist_prefilled = ""
+                # Auto-retry CQ if no DX partner replied yet and auto-arm is on
+                if (
+                    self._qso_assist_active
+                    and self._qso_mgr is not None
+                    and self._qso_mgr.state == QsoState.CQ_SENT
+                    and self._auto_arm_var.get()
+                ):
+                    self._schedule_cq_retry()
+            elif state == TxState.CANCELED:
+                # Operator cancelled — also cancel any pending retry
+                self._cancel_cq_retry()
             # Auto-reset coordinator to IDLE so next arm() works immediately
             self._tx_coord.reset()
         elif state == TxState.ARMED:
@@ -1390,6 +1427,72 @@ class RadioGUI:
             self._tx_countdown_after = self.root.after(250, self._update_tx_countdown)
         else:
             self._tx_countdown_after = None
+
+    # -- CQ retry helpers --------------------------------------------------
+
+    def _schedule_cq_retry(self) -> None:
+        """
+        Schedule a CQ re-arm after the current RX slot expires.
+
+        Called when a CQ TX slot completes without a reply.  Waits through
+        most of the following RX slot (slot boundary + 13 s buffer for
+        late decodes) before checking whether to re-arm CQ.
+        The timer is cancelled immediately if:
+          - A DX reply is decoded and auto-armed (``_cancel_cq_retry``).
+          - The operator clicks Stop QSO or Cancel TX.
+          - The app is closed.
+        """
+        self._cancel_cq_retry()
+        try:
+            # After a TX slot ends the next slot boundary is ~2-3 s away
+            # (start of RX slot).  Add 13 s to let most decodes arrive.
+            delay_s = self._slot_timer.seconds_to_next_slot() + 13.0
+        except Exception:
+            delay_s = 16.0
+        delay_ms = max(1000, int(delay_s * 1000))
+        self._cq_retry_after = self.root.after(delay_ms, self._check_and_rearm_cq)
+        self._tx_status_var.set(
+            f"CQ Retry: no response — re-arming in {delay_s:.0f} s  (Cancel TX or Stop QSO to abort)"
+        )
+
+    def _cancel_cq_retry(self) -> None:
+        """Cancel any pending CQ-retry after() timer."""
+        handle = self._cq_retry_after
+        self._cq_retry_after = None
+        if handle is not None:
+            try:
+                self.root.after_cancel(handle)
+            except Exception:
+                pass
+
+    def _check_and_rearm_cq(self) -> None:
+        """
+        Fired by the CQ-retry timer after the RX slot expires.
+
+        Re-arms CQ only if:
+          - A CQ session is still active.
+          - Auto-arm is still enabled.
+          - The QSO manager is still in CQ_SENT (nobody replied).
+          - The TX coordinator is idle (no competing job).
+        """
+        self._cq_retry_after = None
+        if not self._qso_assist_active or self._qso_mgr is None:
+            return
+        if not self._auto_arm_var.get():
+            return
+        if self._qso_mgr.state != QsoState.CQ_SENT:
+            return  # A reply was already processed — do nothing
+        if self._tx_coord.state != TxState.IDLE:
+            return  # Coordinator busy — do nothing
+        # Re-compose and re-arm CQ
+        try:
+            cq_msg = self._qso_mgr.start_cq()
+        except Exception:
+            return
+        self._tx_msg_var.set(cq_msg)
+        self._qso_assist_prefilled = ""
+        self._tx_status_var.set(f"CQ Retry: re-arming {cq_msg}")
+        self._on_arm_tx()
 
     # -- Operating mode helpers --------------------------------------------
 
@@ -1849,6 +1952,14 @@ class RadioGUI:
         )
         self._stop_session_btn.pack(side=tk.LEFT, padx=(0, 0))
 
+        self._auto_arm_chk = tk.Checkbutton(
+            session_row,
+            text="Auto-arm",
+            variable=self._auto_arm_var,
+            font=("Arial", 8),
+        )
+        self._auto_arm_chk.pack(side=tk.LEFT, padx=(8, 0))
+
         # Row 4: Arm / Cancel buttons + status
         ctrl_row = tk.Frame(self._tx_frame)
         ctrl_row.pack(fill=tk.X, padx=5, pady=(4, 2))
@@ -1940,6 +2051,8 @@ class RadioGUI:
                 self.root.after_cancel(self._tx_countdown_after)
             except Exception:
                 pass
+        # Cancel any pending CQ-retry timer
+        self._cancel_cq_retry()
 
         # Save any pending FT8 messages before exit
         try:

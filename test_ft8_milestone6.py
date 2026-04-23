@@ -62,6 +62,7 @@ from ft8_decode import (
     _subtract_decoded_signal,
     ft8_ldpc_decode,
     ft8_unpack_message,
+    PolyphaseResampler,
 )
 from ft8_encode import ft8_encode_message, ft8_encode_to_symbols, ft8_symbols_to_audio
 
@@ -1223,6 +1224,222 @@ class TestSetDxCallsignIntegration:
         with mock.patch.object(ft8_decode, "ft8_ldpc_decode", side_effect=_spy):
             # Must not raise even though DX callsign is cleared mid-decode
             dec._decode_one_candidate(frame, 0.5, 1500.0, set())
+
+
+ # ═══════════════════════════════════════════════════════════════════════════════
+# 13  reset_framer() — Stop/Start audio re-sync fix (Bug fix regression tests)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestResetFramer:
+    """
+    Regression tests for FT8ConsoleDecoder.reset_framer().
+
+    Background
+    ----------
+    When the user clicks "Stop Audio" and then "Start Audio" in DATA mode the
+    decoder continues running but the internal UTC15sFramer retains stale state:
+
+    * ``_t0_utc`` — still holds the epoch timestamp from the *previous* audio
+      stream, which may be tens of seconds or more in the past.
+    * ``_buf``    — may contain leftover audio samples from before the stop.
+    * ``_first_frame_emitted = True`` — so the first assembled frame after
+      restart is *not* marked partial and is decoded rather than skipped.
+
+    New audio arrives with fresh ``t0_monotonic`` values, but because
+    ``_t0_utc`` is not ``None`` it is never re-initialised.  The framer
+    assembles frames whose slot boundaries are offset from the actual current
+    UTC position; FT8 signals in the new audio appear at wrong time offsets
+    within those frames and the Costas sync search fails.
+
+    ``reset_framer()`` fixes this by replacing the framer with a fresh
+    :class:`~ft8_decode.UTC15sFramer` instance and draining the audio queue.
+    """
+
+    def test_reset_framer_method_exists(self):
+        """FT8ConsoleDecoder must expose reset_framer()."""
+        dec = FT8ConsoleDecoder()
+        assert hasattr(dec, "reset_framer")
+        assert callable(dec.reset_framer)
+
+    def test_reset_framer_replaces_framer_instance(self):
+        """reset_framer() must replace the _framer with a new instance."""
+        from ft8_decode import UTC15sFramer
+        dec = FT8ConsoleDecoder()
+        framer_before = dec._framer
+        dec.reset_framer()
+        assert dec._framer is not framer_before, (
+            "reset_framer() must create a new UTC15sFramer instance"
+        )
+        assert isinstance(dec._framer, UTC15sFramer)
+
+    def test_reset_framer_clears_t0_utc(self):
+        """New framer must start with _t0_utc=None (not the stale old value)."""
+        dec = FT8ConsoleDecoder()
+        # Prime the old framer with a stale timestamp
+        silence = np.zeros(int(0.1 * FT8_FS), dtype=np.float32)
+        dec._framer.push(silence, t0_monotonic=99999.0)
+        assert dec._framer._t0_utc is not None, "Precondition: _t0_utc should be set"
+
+        dec.reset_framer()
+        assert dec._framer._t0_utc is None, (
+            f"After reset_framer(), new framer _t0_utc must be None, "
+            f"got {dec._framer._t0_utc}"
+        )
+
+    def test_reset_framer_clears_buffer(self):
+        """New framer must have an empty sample buffer."""
+        dec = FT8ConsoleDecoder()
+        silence = np.zeros(int(0.5 * FT8_FS), dtype=np.float32)
+        dec._framer.push(silence, t0_monotonic=0.0)
+
+        dec.reset_framer()
+        assert len(dec._framer._buf) == 0, (
+            f"New framer should have empty _buf after reset, "
+            f"got {len(dec._framer._buf)} samples"
+        )
+
+    def test_reset_framer_clears_first_frame_emitted(self):
+        """New framer must have _first_frame_emitted=False so the first frame is partial."""
+        dec = FT8ConsoleDecoder()
+        silence = np.zeros(int(30 * FT8_FS), dtype=np.float32)
+        frames_before = dec._framer.push(silence, t0_monotonic=0.0)
+        # Ensure at least one frame was emitted (making _first_frame_emitted=True)
+        assert any(not p for _, _, p in frames_before) or dec._framer._first_frame_emitted
+
+        dec.reset_framer()
+        assert not dec._framer._first_frame_emitted, (
+            "_first_frame_emitted should be False on fresh framer after reset"
+        )
+
+    def test_reset_framer_drains_queue(self):
+        """reset_framer() must empty the audio queue to discard stale chunks."""
+        dec = FT8ConsoleDecoder()
+        fake = np.zeros(100, dtype=np.float32)
+        for _ in range(8):
+            dec._q.put_nowait((FT8_FS, fake, 1234.0))
+        assert dec._q.qsize() == 8, "Precondition: queue should have 8 items"
+
+        dec.reset_framer()
+        assert dec._q.empty(), (
+            f"Queue must be empty after reset_framer(), "
+            f"got {dec._q.qsize()} item(s)"
+        )
+
+    def test_reset_framer_resets_resampler(self):
+        """reset_framer() must set _resampler to None for clean reinitialisation."""
+        dec = FT8ConsoleDecoder()
+        # Trigger resampler creation
+        dec._resampler = ft8_decode.PolyphaseResampler(fs_in=48000, fs_out=FT8_FS)
+
+        dec.reset_framer()
+        assert dec._resampler is None, (
+            "_resampler should be None after reset_framer() so it re-creates "
+            "cleanly for the new stream's sample rate"
+        )
+
+    def test_reset_framer_new_stream_uses_current_utc(self):
+        """
+        After reset_framer(), the first audio chunk's t0_monotonic must
+        initialise _t0_utc to *approximately* the current time, not to the
+        stale old timestamp.
+        """
+        dec = FT8ConsoleDecoder()
+
+        # Simulate a stale timestamp: prime the old framer with UTC=1000s
+        old_framer = dec._framer
+        old_framer._utc_minus_mono = 1000.0
+        old_framer._alpha = 0.0
+        silence = np.zeros(int(0.1 * FT8_FS), dtype=np.float32)
+        old_framer.push(silence, t0_monotonic=0.0)
+        stale_t0 = old_framer._t0_utc
+        assert stale_t0 is not None and abs(stale_t0 - 1000.0) < 1.0
+
+        # Reset — new stream starts at UTC=5000s (45+ minutes later)
+        dec.reset_framer()
+        new_framer = dec._framer
+        new_framer._utc_minus_mono = 5000.0
+        new_framer._alpha = 0.0
+
+        current_mono = 0.5  # current monotonic time
+        expected_utc = current_mono + 5000.0  # = 5000.5
+
+        new_framer.push(silence, t0_monotonic=current_mono)
+        assert new_framer._t0_utc is not None
+        assert abs(new_framer._t0_utc - expected_utc) < 1.0, (
+            f"New framer _t0_utc={new_framer._t0_utc:.1f}s should be ≈{expected_utc:.1f}s "
+            f"(current UTC), not ≈{stale_t0:.1f}s (stale old value)"
+        )
+
+    def test_reset_framer_idempotent(self):
+        """Calling reset_framer() multiple times must not raise."""
+        dec = FT8ConsoleDecoder()
+        dec.reset_framer()
+        dec.reset_framer()
+        dec.reset_framer()
+        # If we get here without exception, the test passes.
+
+    def test_reset_framer_while_stopped(self):
+        """reset_framer() must work even when the decoder worker is not running."""
+        dec = FT8ConsoleDecoder()
+        # Worker not started — reset_framer() should still work
+        dec.reset_framer()
+        assert dec._framer._t0_utc is None
+
+    def test_reset_framer_does_not_stop_worker(self):
+        """
+        reset_framer() must NOT stop the decoder's background worker thread.
+        The worker must still be alive after the reset so it can process
+        new audio immediately without requiring an explicit start() call.
+        """
+        dec = FT8ConsoleDecoder()
+        dec.start()
+        try:
+            assert dec._thread is not None and dec._thread.is_alive(), (
+                "Precondition: worker thread should be alive after start()"
+            )
+            dec.reset_framer()
+            assert dec._thread is not None and dec._thread.is_alive(), (
+                "Worker thread must still be alive after reset_framer()"
+            )
+        finally:
+            dec.stop()
+
+    @pytest.mark.parametrize("pause_s", [5.0, 15.0, 60.0, 300.0])
+    def test_reset_framer_resync_after_various_pause_lengths(self, pause_s: float):
+        """
+        After pauses of different durations, the new stream must synchronise
+        to the current UTC, not the pre-pause timestamp.
+        """
+        dec = FT8ConsoleDecoder()
+        silence = np.zeros(int(0.1 * FT8_FS), dtype=np.float32)
+
+        # Prime at UTC = 30s
+        dec._framer._utc_minus_mono = 30.0
+        dec._framer._alpha = 0.0
+        dec._framer.push(silence, t0_monotonic=0.0)
+        stale_t0 = dec._framer._t0_utc
+        assert stale_t0 is not None
+
+        # Reset and restart at UTC = 30 + pause_s
+        dec.reset_framer()
+        new_utc_offset = 30.0 + pause_s  # UTC - mono stays constant
+        dec._framer._utc_minus_mono = new_utc_offset
+        dec._framer._alpha = 0.0
+
+        restart_mono = 0.5
+        expected_new_utc = restart_mono + new_utc_offset
+        dec._framer.push(silence, t0_monotonic=restart_mono)
+
+        new_t0 = dec._framer._t0_utc
+        assert new_t0 is not None
+        assert abs(new_t0 - expected_new_utc) < 1.0, (
+            f"pause={pause_s}s: new _t0_utc={new_t0:.2f}s, "
+            f"expected≈{expected_new_utc:.2f}s"
+        )
+        assert abs(new_t0 - stale_t0) > pause_s * 0.8, (
+            f"pause={pause_s}s: new _t0_utc too close to stale value; "
+            f"new={new_t0:.2f}s stale={stale_t0:.2f}s"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
