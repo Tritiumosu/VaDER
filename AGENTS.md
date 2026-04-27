@@ -27,7 +27,7 @@
 
 ## TX legal and safety policy (non-optional)
 - Keep `README.md` section `TX Safety & Compliance` aligned with this policy text to prevent drift.
-- **No unattended or autonomous transmissions.** AI agents must not implement, enable, or test unattended TX loops. TX must remain operator-initiated with a human control operator in the loop.
+- **No unattended or autonomous transmissions.** AI agents must not implement, enable, or test unattended TX loops. TX must remain operator-initiated with a human control operator in the loop with the ability to cancel a TX at any time.
 - **Human pre-transmit approval is required** before any live/bench TX check. Agent output must include a user confirmation step that the station is configured for safe testing.
 - **Safe RF setup is required for live TX validation:** minimum practical power and/or a dummy load (or equivalent non-radiating setup) to avoid unintended on-air transmission during development tests.
 - **Real-time abort path is required** for any TX workflow. The user must be able to stop transmission immediately (for example: UI cancel/PTT release/CAT unkey).
