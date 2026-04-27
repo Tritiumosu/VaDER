@@ -843,7 +843,11 @@ class RadioGUI:
         # Guard: True once a completed FT8 QSO has been logged so we never
         # log the same exchange twice (e.g. once on COMPLETE state and once
         # on TxState.COMPLETE for the final 73 message).
-        self._ft8_qso_logged: bool = False
+        self._ft8_qso_logged: bool    = False
+        # Initiation direction for the current FT8 QSO: "CQ" when we called
+        # CQ, "REPLY" when we answered one.  Set by _on_start_cq_session() and
+        # by the FT8 log double-click reply path.  Used in build_record().
+        self._ft8_qso_initiated: str  = "CQ"
         # Auto-arm toggle (BooleanVar created here so it exists before setup_ui)
         self._auto_arm_var: tk.BooleanVar = tk.BooleanVar(value=True)
         # Handle for the pending CQ-retry after() call (so it can be cancelled)
@@ -1210,6 +1214,7 @@ class RadioGUI:
         self._qso_assist_active    = True
         self._qso_assist_prefilled = ""
         self._ft8_qso_logged       = False  # reset for new session
+        self._ft8_qso_initiated    = "CQ"   # we called CQ
 
         # Update button states
         self._cq_session_btn.config(state=tk.DISABLED)
@@ -1262,24 +1267,11 @@ class RadioGUI:
         try:
             freq  = self._current_freq
             band  = self.infer_band_from_freq(freq) or ""
-            initiated = (
-                "CQ" if self._qso_mgr.dx_call and self._qso_mgr._time_on_utc
-                else "REPLY"
-            )
-            # Determine initiated direction: if we called CQ the manager went
-            # CQ_SENT → EXCHANGE_SENT → COMPLETE; if we answered the manager
-            # went REPLY_SENT → RRR_SENT → COMPLETE.
-            # The simplest heuristic: check whether we are the DX station that
-            # received the CQ or the one that sent it.  The QSO manager tracks
-            # this implicitly via the state sequence — for now we rely on the
-            # FT8 log panel text and manager internals.  A safe default:
-            #  - If _qso_mgr._tx_snr was set during CQ_SENT advance → we called CQ
-            #  - Otherwise we answered one
-            # Use build_record() which already knows the right fields.
             record = self._qso_mgr.build_record(
                 freq_mhz=freq,
                 band=band,
                 my_grid=self._tx_grid_var.get().strip().upper(),
+                initiated=self._ft8_qso_initiated,
             )
         except Exception as exc:
             print(f"[QSO Log] Could not build FT8 contact record: {exc}", flush=True)
@@ -1290,8 +1282,6 @@ class RadioGUI:
             pwr_str = str(self._current_rf_power) if self._current_rf_power > 0 else ""
             contact = qso_record_to_adif_contact(
                 record,
-                my_grid=record.my_grid,
-                dx_grid=record.dx_grid,
                 tx_pwr=pwr_str,
                 comment="FT8 QSO via VaDER",
             )
@@ -2541,11 +2531,13 @@ class RadioGUI:
         print(summary, flush=True)
         self.log_box.insert(tk.END, summary + "\n")
         self.log_box.see(tk.END)
-        # Also append to legacy CSV for backward compatibility
+        # Also append to legacy CSV for backward compatibility.  This may fail
+        # if the radio is disconnected (get_s_meter raises); that is acceptable
+        # — the ADIF record is already written above and is the authoritative log.
         try:
             self.log_to_file(freq, self.radio.get_s_meter(), f"QSO {dx_call}")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[QSO Log] Legacy CSV write skipped: {exc}", flush=True)
         # Clear form fields for next QSO
         self._qso_dx_call_var.set("")
         self._qso_dx_grid_var.set("")

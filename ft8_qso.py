@@ -35,6 +35,10 @@ import numpy as np
 from ft8_encode import validate_callsign, ft8_encode_to_symbols
 from ft8_ntp import Ft8SlotTimer, default_slot_timer
 
+# Maidenhead grid locator pattern: two letters (A-R) followed by two digits.
+# Used to validate the extra field of CQ messages (e.g. ``CQ W4ABC EN52``).
+_GRID_PATTERN = re.compile(r"^[A-R]{2}[0-9]{2}$")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 1  QSO lifecycle states
@@ -454,7 +458,7 @@ class Ft8QsoManager:
             self._rx_snr      = rx.snr_db
             self._time_on_utc = datetime.now(timezone.utc)
             # Capture their grid from the CQ message (extra field), if present
-            self._dx_grid = rx.extra if (rx.extra and re.fullmatch(r"[A-R]{2}[0-9]{2}", rx.extra)) else None
+            self._dx_grid = rx.extra if (rx.extra and _GRID_PATTERN.match(rx.extra)) else None
             msg = compose_reply(rx.call2, self.operator.callsign, snr_db)
             self._tx_snr = snr_db  # SNR we reported in our reply
             self._set_tx(msg)

@@ -222,6 +222,7 @@ def _make_gui(main_mod, adif_path: str):
     gui._qso_assist_active    = False
     gui._qso_assist_prefilled = ""
     gui._ft8_qso_logged       = False
+    gui._ft8_qso_initiated    = "CQ"
     gui._auto_arm_var         = mock.MagicMock()
     gui._auto_arm_var.get.return_value = False
     gui._cq_retry_after = None
@@ -644,10 +645,8 @@ class TestVoiceQsoLogForm(unittest.TestCase):
 
     def test_log_voice_qso_shows_error_when_dx_call_empty(self):
         self.gui._qso_dx_call_var.get.return_value = ""
-        import tkinter.messagebox as mb
-        with mock.patch.object(mb, "showerror") as mock_err:
-            # Also patch the actual showerror in main module
-            self.main.messagebox.showerror = mock_err
+        # Patch the messagebox.showerror in main module (the actual import used)
+        with mock.patch.object(self.main.messagebox, "showerror") as mock_err:
             self.gui._on_log_voice_qso()
             mock_err.assert_called_once()
         self.assertFalse(os.path.exists(self.adif_path), "No ADIF file when DX call empty")
