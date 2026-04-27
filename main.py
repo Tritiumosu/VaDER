@@ -25,7 +25,8 @@ from ft8_decode import FT8ConsoleDecoder, format_ft8_message
 from audio_passthrough import AudioPassthrough, AudioTxCapture
 from ft8_tx import Ft8TxCoordinator, TxJob, TxState, validate_operator
 from ft8_ntp import Ft8SlotTimer, default_slot_timer
-from ft8_qso import Ft8QsoManager, OperatorConfig, QsoState, ReceivedMessage
+from ft8_qso import Ft8QsoManager, OperatorConfig, QsoRecord, QsoState, ReceivedMessage
+from adif_log import AdifContact, append_adif_contact, qso_record_to_adif_contact
 
 _log = logging.getLogger(__name__)
 
@@ -53,7 +54,10 @@ FT8_FREQS = {
 }
 
 # Log file for FT8 decoded messages (append mode)
-FT8_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ft8_messages.log")
+FT8_LOG_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ft8_messages.log")
+
+# ADIF contact log file (all modes — voice and digital)
+ADIF_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qso_log.adi")
 
 # --- Persistent Configuration ---
 # Settings are stored in vader.cfg next to main.py.
@@ -89,6 +93,7 @@ class AppConfig:
         "operator": {
             "callsign": "",   # operator callsign, e.g. W4ABC — used in FT8 messages
             "grid":     "",   # 4-char Maidenhead grid locator, e.g. EN52
+            "name":     "",   # optional operator name for ADIF logging
         },
         "ntp": {
             # Comma-separated list of NTP servers tried in order on startup.
@@ -256,12 +261,18 @@ class AppConfig:
         """4-char Maidenhead grid locator stored in vader.cfg (empty if not set)."""
         return self._cfg.get("operator", "grid", fallback="").strip().upper()
 
-    def save_operator(self, callsign: str, grid: str) -> None:
-        """Persist the operator callsign and grid locator to vader.cfg."""
+    @property
+    def operator_name(self) -> str:
+        """Operator name stored in vader.cfg (empty string if not set)."""
+        return self._cfg.get("operator", "name", fallback="").strip()
+
+    def save_operator(self, callsign: str, grid: str, name: str = "") -> None:
+        """Persist the operator callsign, grid locator, and name to vader.cfg."""
         if not self._cfg.has_section("operator"):
             self._cfg.add_section("operator")
         self._cfg.set("operator", "callsign", callsign.strip().upper())
         self._cfg.set("operator", "grid",     grid.strip().upper())
+        self._cfg.set("operator", "name",     name.strip())
         self._write()
 
     # -- NTP helpers -------------------------------------------------------
@@ -829,10 +840,20 @@ class RadioGUI:
         # (meaning the message was sent); preserved on ERROR/CANCELED so the
         # operator's last suggestion remains visible.
         self._qso_assist_prefilled: str = ""
+        # Guard: True once a completed FT8 QSO has been logged so we never
+        # log the same exchange twice (e.g. once on COMPLETE state and once
+        # on TxState.COMPLETE for the final 73 message).
+        self._ft8_qso_logged: bool = False
         # Auto-arm toggle (BooleanVar created here so it exists before setup_ui)
         self._auto_arm_var: tk.BooleanVar = tk.BooleanVar(value=True)
         # Handle for the pending CQ-retry after() call (so it can be cancelled)
         self._cq_retry_after: "str | None" = None
+
+        # Last-known radio state (updated from poll thread via UI queue) — used
+        # to pre-populate the voice QSO log form and FT8 contact records.
+        self._current_freq:     float = 0.0
+        self._current_mode:     str   = ""
+        self._current_rf_power: int   = 0
 
         self.root.title("VaDER Command Center")
         self.root.geometry("550x950")
@@ -1188,6 +1209,7 @@ class RadioGUI:
         self._tx_msg_var.set(cq_msg)
         self._qso_assist_active    = True
         self._qso_assist_prefilled = ""
+        self._ft8_qso_logged       = False  # reset for new session
 
         # Update button states
         self._cq_session_btn.config(state=tk.DISABLED)
@@ -1211,11 +1233,80 @@ class RadioGUI:
         self._qso_mgr              = None
         self._qso_assist_active    = False
         self._qso_assist_prefilled = ""
+        self._ft8_qso_logged       = False
         # Milestone 6: clear DX callsign AP passes — no more QSO context.
         self._ft8.set_dx_callsign(None)
         self._cq_session_btn.config(state=tk.NORMAL)
         self._stop_session_btn.config(state=tk.DISABLED)
         self._tx_status_var.set("QSO Session stopped")
+
+    def _log_ft8_qso(self) -> None:
+        """
+        Build and append a :class:`~ft8_qso.QsoRecord` to the ADIF log file.
+
+        Called automatically when the FT8 QSO state machine reaches
+        ``QsoState.COMPLETE``.  Uses ``_ft8_qso_logged`` as a dedup guard so
+        the same exchange is never written more than once (e.g. once when the
+        state transitions to COMPLETE and again when ``TxState.COMPLETE``
+        fires for the final 73 message).
+
+        Must be called from the Tkinter thread (no cross-thread widget access).
+        """
+        if self._ft8_qso_logged or self._qso_mgr is None:
+            return
+        if self._qso_mgr.state != QsoState.COMPLETE:
+            return
+
+        self._ft8_qso_logged = True
+
+        try:
+            freq  = self._current_freq
+            band  = self.infer_band_from_freq(freq) or ""
+            initiated = (
+                "CQ" if self._qso_mgr.dx_call and self._qso_mgr._time_on_utc
+                else "REPLY"
+            )
+            # Determine initiated direction: if we called CQ the manager went
+            # CQ_SENT → EXCHANGE_SENT → COMPLETE; if we answered the manager
+            # went REPLY_SENT → RRR_SENT → COMPLETE.
+            # The simplest heuristic: check whether we are the DX station that
+            # received the CQ or the one that sent it.  The QSO manager tracks
+            # this implicitly via the state sequence — for now we rely on the
+            # FT8 log panel text and manager internals.  A safe default:
+            #  - If _qso_mgr._tx_snr was set during CQ_SENT advance → we called CQ
+            #  - Otherwise we answered one
+            # Use build_record() which already knows the right fields.
+            record = self._qso_mgr.build_record(
+                freq_mhz=freq,
+                band=band,
+                my_grid=self._tx_grid_var.get().strip().upper(),
+            )
+        except Exception as exc:
+            print(f"[QSO Log] Could not build FT8 contact record: {exc}", flush=True)
+            return
+
+        # Write to ADIF file
+        try:
+            pwr_str = str(self._current_rf_power) if self._current_rf_power > 0 else ""
+            contact = qso_record_to_adif_contact(
+                record,
+                my_grid=record.my_grid,
+                dx_grid=record.dx_grid,
+                tx_pwr=pwr_str,
+                comment="FT8 QSO via VaDER",
+            )
+            append_adif_contact(ADIF_LOG_PATH, contact)
+            summary = (
+                f"[QSO Logged] {record.dx_call} {record.adif_date()} "
+                f"{record.adif_time()}Z {record.band} FT8 "
+                f"RST:{record.rst_sent}/{record.rst_rcvd}"
+            )
+            print(summary, flush=True)
+            self._tx_status_var.set(f"QSO Logged: {record.dx_call} ({record.band} FT8)")
+            # Also echo to the voice log box if visible (mode may still be data)
+            self._ui_queue.put(("qso_logged", summary))
+        except Exception as exc:
+            print(f"[QSO Log] Could not write ADIF record: {exc}", flush=True)
 
     def _maybe_assist_prefill(self, message: str, snr_db: float) -> None:
         """
@@ -1251,8 +1342,13 @@ class RadioGUI:
         except Exception:
             return  # Defensive: never crash the UI queue drain
 
+        # Milestone 5: Station B COMPLETE path — advance() returns None once
+        # they acknowledge RR73 with a confirming 73.  Log the QSO here since
+        # no further TX will be sent (TxState.COMPLETE already fired for RR73).
         if next_msg is None:
-            return  # Message did not advance QSO state (not addressed to us, etc.)
+            if self._qso_mgr.state == QsoState.COMPLETE:
+                self._log_ft8_qso()
+            return  # Nothing to pre-fill
 
         # Milestone 6: Callsign-aware AP passes — notify the decoder of the
         # active DX partner so it can inject their callsign bits into LDPC AP
@@ -1391,6 +1487,14 @@ class RadioGUI:
             # assist prefill for the subsequent QSO step.
             if state == TxState.COMPLETE:
                 self._qso_assist_prefilled = ""
+                # Milestone 5: Station A COMPLETE path — we just sent the final
+                # 73 message.  If QsoState is COMPLETE, log the contact.
+                if (
+                    self._qso_assist_active
+                    and self._qso_mgr is not None
+                    and self._qso_mgr.state == QsoState.COMPLETE
+                ):
+                    self._log_ft8_qso()
                 # Auto-retry CQ if no DX partner replied yet and auto-arm is on
                 if (
                     self._qso_assist_active
@@ -1804,19 +1908,70 @@ class RadioGUI:
         )
         self.voice_audio_status.pack(padx=5, pady=(0, 4), fill=tk.X)
 
-        # -- Signal Log (voice-only section) -------------------------------
-        self.log_frame = tk.LabelFrame(self.root, text="Signal Log")
+        # -- QSO Log (voice-only section) ----------------------------------
+        self.log_frame = tk.LabelFrame(self.root, text="QSO Log")
 
-        self.note_entry = tk.Entry(self.log_frame)
-        self.note_entry.insert(0, "Enter callsign/note...")
-        self.note_entry.pack(fill=tk.X, padx=5, pady=5)
+        # Row 1: DX Callsign + DX Grid
+        qso_row1 = tk.Frame(self.log_frame)
+        qso_row1.pack(fill=tk.X, padx=5, pady=(4, 0))
+        tk.Label(qso_row1, text="Their Call:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._qso_dx_call_var = tk.StringVar()
+        tk.Entry(
+            qso_row1, textvariable=self._qso_dx_call_var, width=10,
+            font=("Consolas", 9),
+        ).pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(qso_row1, text="Grid:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._qso_dx_grid_var = tk.StringVar()
+        tk.Entry(
+            qso_row1, textvariable=self._qso_dx_grid_var, width=6,
+            font=("Consolas", 9),
+        ).pack(side=tk.LEFT, padx=(2, 0))
 
+        # Row 2: RST Sent / RST Rcvd
+        qso_row2 = tk.Frame(self.log_frame)
+        qso_row2.pack(fill=tk.X, padx=5, pady=(2, 0))
+        tk.Label(qso_row2, text="RST Sent:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._qso_rst_sent_var = tk.StringVar(value="59")
+        tk.Entry(
+            qso_row2, textvariable=self._qso_rst_sent_var, width=5,
+            font=("Consolas", 9),
+        ).pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(qso_row2, text="RST Rcvd:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._qso_rst_rcvd_var = tk.StringVar(value="59")
+        tk.Entry(
+            qso_row2, textvariable=self._qso_rst_rcvd_var, width=5,
+            font=("Consolas", 9),
+        ).pack(side=tk.LEFT, padx=(2, 0))
+
+        # Row 3: Comment
+        qso_row3 = tk.Frame(self.log_frame)
+        qso_row3.pack(fill=tk.X, padx=5, pady=(2, 0))
+        tk.Label(qso_row3, text="Comment:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._qso_comment_var = tk.StringVar()
+        tk.Entry(
+            qso_row3, textvariable=self._qso_comment_var,
+            font=("Consolas", 9),
+        ).pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+
+        # Row 4: Log QSO button + status label
+        qso_btn_row = tk.Frame(self.log_frame)
+        qso_btn_row.pack(fill=tk.X, padx=5, pady=(4, 2))
         tk.Button(
-            self.log_frame, text="MANUAL LOG", command=self.manual_log, bg="lightblue"
-        ).pack(fill=tk.X, padx=5)
+            qso_btn_row, text="Log QSO", bg="lightgreen",
+            font=("Arial", 9, "bold"),
+            command=self._on_log_voice_qso,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        # Legacy manual-log entry kept for quick notes
+        self.note_entry = tk.Entry(qso_btn_row, font=("Consolas", 9))
+        self.note_entry.insert(0, "Quick note...")
+        self.note_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(
+            qso_btn_row, text="Note", command=self.manual_log,
+            bg="lightblue", font=("Arial", 8),
+        ).pack(side=tk.LEFT)
 
-        self.log_box = tk.Text(self.log_frame, height=6, font=("Consolas", 9))
-        self.log_box.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
+        self.log_box = tk.Text(self.log_frame, height=5, font=("Consolas", 9))
+        self.log_box.pack(padx=5, pady=(2, 5), fill=tk.BOTH, expand=True)
 
         # -- Audio Controls (data-only section) ----------------------------
         self._audio_ctrl_frame = tk.LabelFrame(self.root, text="Audio Connection")
@@ -2134,6 +2289,7 @@ class RadioGUI:
                 if kind == "freq":
                     _, f = item
                     self.freq_disp.config(text=f"{f:09.4f}")
+                    self._current_freq = f  # track for QSO log pre-fill
 
                 elif kind == "s_meter":
                     _, s = item
@@ -2165,6 +2321,7 @@ class RadioGUI:
 
                 elif kind == "rf_power":
                     _, p = item
+                    self._current_rf_power = p  # track for QSO log pre-fill
                     try:
                         if str(self.root.focus_get()) != str(self.rf_power_spin):
                             self.rf_power_var.set(p)
@@ -2173,6 +2330,8 @@ class RadioGUI:
 
                 elif kind == "mode":
                     _, m = item
+                    if m:
+                        self._current_mode = m  # track for QSO log pre-fill
                     try:
                         if str(self.root.focus_get()) != str(self.mode_combo):
                             if m:
@@ -2212,6 +2371,15 @@ class RadioGUI:
                 elif kind == "tx_state":
                     _, state, message = item
                     self._apply_tx_state_update(state, message)
+
+                elif kind == "qso_logged":
+                    # Notification that a QSO was successfully written to the log
+                    _, summary = item
+                    try:
+                        self.log_box.insert(tk.END, summary + "\n")
+                        self.log_box.see(tk.END)
+                    except Exception:
+                        pass
 
         except queue.Empty:
             pass
@@ -2307,6 +2475,83 @@ class RadioGUI:
             self.radio.get_s_meter(),
             self.note_entry.get(),
         )
+
+    def _on_log_voice_qso(self) -> None:
+        """
+        Log a voice QSO contact to the ADIF log file using the fields in the
+        voice QSO log form.
+
+        Auto-populates frequency, band, and mode from the last radio poll
+        values tracked in ``_current_freq``, ``_current_mode``, and
+        ``_current_rf_power``.  RST Sent defaults to ``'59'`` if the field is
+        blank.  An error dialog is shown when the DX callsign field is empty.
+        """
+        dx_call = self._qso_dx_call_var.get().strip().upper()
+        if not dx_call:
+            messagebox.showerror(
+                "QSO Log",
+                "Please enter the DX callsign before logging.",
+                parent=self.root,
+            )
+            return
+
+        our_call = self._config.operator_callsign or self._tx_callsign_var.get().strip().upper()
+        our_grid = self._config.operator_grid     or self._tx_grid_var.get().strip().upper()
+        dx_grid  = self._qso_dx_grid_var.get().strip().upper()
+        rst_sent = self._qso_rst_sent_var.get().strip() or "59"
+        rst_rcvd = self._qso_rst_rcvd_var.get().strip() or "59"
+        comment  = self._qso_comment_var.get().strip()
+
+        freq     = self._current_freq
+        band     = self.infer_band_from_freq(freq) or ""
+        mode     = self._current_mode or "SSB"
+        pwr_str  = str(self._current_rf_power) if self._current_rf_power > 0 else ""
+
+        now_utc  = datetime.now(timezone.utc)
+        contact  = AdifContact(
+            call             = dx_call,
+            qso_date         = now_utc.strftime("%Y%m%d"),
+            time_on          = now_utc.strftime("%H%M%S"),
+            freq_mhz         = freq,
+            band             = band,
+            mode             = mode,
+            rst_sent         = rst_sent,
+            rst_rcvd         = rst_rcvd,
+            station_callsign = our_call,
+            my_gridsquare    = our_grid,
+            gridsquare       = dx_grid,
+            tx_pwr           = pwr_str,
+            comment          = comment,
+        )
+        try:
+            append_adif_contact(ADIF_LOG_PATH, contact)
+        except Exception as exc:
+            messagebox.showerror(
+                "QSO Log",
+                f"Could not write to log file:\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        summary = (
+            f"[Voice QSO] {dx_call} {now_utc.strftime('%Y%m%d')} "
+            f"{now_utc.strftime('%H%M%S')}Z {band} {mode} "
+            f"RST:{rst_sent}/{rst_rcvd}"
+        )
+        print(summary, flush=True)
+        self.log_box.insert(tk.END, summary + "\n")
+        self.log_box.see(tk.END)
+        # Also append to legacy CSV for backward compatibility
+        try:
+            self.log_to_file(freq, self.radio.get_s_meter(), f"QSO {dx_call}")
+        except Exception:
+            pass
+        # Clear form fields for next QSO
+        self._qso_dx_call_var.set("")
+        self._qso_dx_grid_var.set("")
+        self._qso_rst_sent_var.set("59")
+        self._qso_rst_rcvd_var.set("59")
+        self._qso_comment_var.set("")
 
     def infer_band_from_freq(self, mhz: float):
         """Return band name if mhz is inside a defined band plan, else None."""
