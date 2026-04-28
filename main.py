@@ -266,13 +266,19 @@ class AppConfig:
         """Operator name stored in vader.cfg (empty string if not set)."""
         return self._cfg.get("operator", "name", fallback="").strip()
 
-    def save_operator(self, callsign: str, grid: str, name: str = "") -> None:
-        """Persist the operator callsign, grid locator, and name to vader.cfg."""
+    def save_operator(self, callsign: str, grid: str, name: str | None = None) -> None:
+        """Persist the operator callsign and grid locator, and update name when provided.
+
+        When *name* is ``None`` (the default), any previously-saved name is
+        preserved.  Pass an explicit string (including ``''``) only when the
+        caller wants to update or clear the stored name.
+        """
         if not self._cfg.has_section("operator"):
             self._cfg.add_section("operator")
         self._cfg.set("operator", "callsign", callsign.strip().upper())
         self._cfg.set("operator", "grid",     grid.strip().upper())
-        self._cfg.set("operator", "name",     name.strip())
+        if name is not None:
+            self._cfg.set("operator", "name", name.strip())
         self._write()
 
     # -- NTP helpers -------------------------------------------------------
@@ -1262,8 +1268,6 @@ class RadioGUI:
         if self._qso_mgr.state != QsoState.COMPLETE:
             return
 
-        self._ft8_qso_logged = True
-
         try:
             freq  = self._current_freq
             band  = self.infer_band_from_freq(freq) or ""
@@ -1277,7 +1281,8 @@ class RadioGUI:
             print(f"[QSO Log] Could not build FT8 contact record: {exc}", flush=True)
             return
 
-        # Write to ADIF file
+        # Write to ADIF file — only set the dedup guard after a successful write
+        # so a transient I/O error doesn't permanently suppress logging.
         try:
             pwr_str = str(self._current_rf_power) if self._current_rf_power > 0 else ""
             contact = qso_record_to_adif_contact(
@@ -1286,6 +1291,7 @@ class RadioGUI:
                 comment="FT8 QSO via VaDER",
             )
             append_adif_contact(ADIF_LOG_PATH, contact)
+            self._ft8_qso_logged = True  # set only after successful write
             summary = (
                 f"[QSO Logged] {record.dx_call} {record.adif_date()} "
                 f"{record.adif_time()}Z {record.band} FT8 "

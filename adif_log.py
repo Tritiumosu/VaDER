@@ -192,15 +192,23 @@ def qso_record_to_adif_contact(
     This helper bridges the FT8 QSO state machine (which produces
     ``QsoRecord`` objects) and the ADIF file writer.
 
+    Grid squares default to the values stored on the *record* itself
+    (``record.my_grid`` / ``record.dx_grid``); the *my_grid* and *dx_grid*
+    kwargs only need to be supplied when the caller wants to override those.
+
     Parameters
     ----------
     record        : QsoRecord  — Completed QSO record from ``Ft8QsoManager``.
     my_grid       : str        — Our Maidenhead grid (MY_GRIDSQUARE).
+                                 Defaults to ``record.my_grid`` when blank.
     dx_grid       : str        — Their grid, if decoded from their CQ message.
+                                 Defaults to ``record.dx_grid`` when blank.
     tx_pwr        : str        — TX power in watts (string, e.g. ``'10'``).
     comment       : str        — Optional free-form comment.
     operator_name : str        — Their operator name, if known.
     """
+    resolved_my_grid = my_grid or getattr(record, "my_grid", "")
+    resolved_dx_grid = dx_grid or getattr(record, "dx_grid", "")
     return AdifContact(
         call=record.dx_call,
         qso_date=record.adif_date(),
@@ -211,8 +219,8 @@ def qso_record_to_adif_contact(
         rst_sent=record.rst_sent,
         rst_rcvd=record.rst_rcvd,
         station_callsign=record.our_call,
-        my_gridsquare=my_grid,
-        gridsquare=dx_grid,
+        my_gridsquare=resolved_my_grid,
+        gridsquare=resolved_dx_grid,
         tx_pwr=tx_pwr,
         comment=comment,
         name=operator_name,

@@ -44,6 +44,8 @@ Tests cover:
    33.  _log_ft8_qso — _ft8_qso_logged guard prevents double-write
    34.  _maybe_assist_prefill — logs QSO when advance returns None+COMPLETE (Station B)
    35.  _apply_tx_state_update — logs QSO on TxState.COMPLETE + QsoState.COMPLETE (Station A)
+   36.  _log_ft8_qso — guard NOT set when write fails (retry allowed)
+   37.  _log_ft8_qso — QsoRecord grids (my_grid/dx_grid) appear in ADIF output
 
 Run:  pytest test_qso_logging.py -v
 """
@@ -408,7 +410,7 @@ class TestAppendAdifContact(unittest.TestCase):
 
 class TestQsoRecordToAdifContact(unittest.TestCase):
 
-    def _make_record(self) -> QsoRecord:
+    def _make_record(self, my_grid: str = "", dx_grid: str = "") -> QsoRecord:
         return QsoRecord(
             our_call="W4ABC",
             dx_call="K9XYZ",
@@ -418,6 +420,8 @@ class TestQsoRecordToAdifContact(unittest.TestCase):
             time_on=datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc),
             rst_sent="-05",
             rst_rcvd="+07",
+            my_grid=my_grid,
+            dx_grid=dx_grid,
         )
 
     def test_basic_fields_mapped(self):
@@ -446,6 +450,20 @@ class TestQsoRecordToAdifContact(unittest.TestCase):
         self.assertEqual(contact.gridsquare, "FN20")
         self.assertEqual(contact.tx_pwr, "10")
         self.assertEqual(contact.comment, "Contest")
+
+    def test_grids_default_to_record_fields(self):
+        """When kwargs are blank, grids should come from the QsoRecord fields."""
+        rec = self._make_record(my_grid="EN52", dx_grid="FN20")
+        contact = qso_record_to_adif_contact(rec)
+        self.assertEqual(contact.my_gridsquare, "EN52")
+        self.assertEqual(contact.gridsquare, "FN20")
+
+    def test_kwargs_override_record_fields(self):
+        """Explicit kwargs should override grid values already on the record."""
+        rec = self._make_record(my_grid="EN52", dx_grid="FN20")
+        contact = qso_record_to_adif_contact(rec, my_grid="DM79", dx_grid="EM72")
+        self.assertEqual(contact.my_gridsquare, "DM79")
+        self.assertEqual(contact.gridsquare, "EM72")
 
 
 # =============================================================================
@@ -599,15 +617,18 @@ class TestAppConfigOperatorName(unittest.TestCase):
                 os.unlink(path)
 
     def test_save_operator_name_has_safe_default(self):
-        """save_operator(call, grid) without name= must not raise."""
+        """save_operator(call, grid) without name= must not overwrite an existing name."""
         with tempfile.NamedTemporaryFile(suffix=".cfg", delete=False) as tf:
             path = tf.name
         try:
             m = _import_main_no_gui()
             cfg = m.AppConfig(path=path)
-            cfg.save_operator("W4ABC", "EN52")  # name defaults to ""
+            cfg.save_operator("W4ABC", "EN52", name="John")
+            # Update callsign without passing name — stored name must be preserved
+            cfg.save_operator("W4ABC", "EN52")
             cfg2 = m.AppConfig(path=path)
-            self.assertEqual(cfg2.operator_name, "")
+            self.assertEqual(cfg2.operator_name, "John",
+                             "Existing name must not be erased when name= is omitted")
         finally:
             if os.path.exists(path):
                 os.unlink(path)
@@ -791,6 +812,60 @@ class TestFt8AutoLogging(unittest.TestCase):
         with open(self.adif_path, encoding="utf-8") as fh:
             content = fh.read()
         self.assertIn("<CALL:5>K9XYZ", content)
+
+    def test_log_ft8_qso_guard_not_set_on_write_failure(self):
+        """
+        If the ADIF write fails, _ft8_qso_logged must NOT be set so a
+        subsequent retry can succeed.
+        """
+        self._complete_ft8_qso()
+
+        # main.py uses `from adif_log import append_adif_contact`, so we must
+        # patch the name in main's namespace, not the one in adif_log.
+        call_count = {"n": 0}
+        original = adif_log.append_adif_contact
+
+        def patched(path, contact):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError("simulated write failure")
+            return original(path, contact)
+
+        with mock.patch.object(self.main, "append_adif_contact", side_effect=patched):
+            self.gui._log_ft8_qso()  # first call — write fails
+            self.assertFalse(self.gui._ft8_qso_logged,
+                             "_ft8_qso_logged must remain False after a write failure")
+            self.gui._log_ft8_qso()  # second call — should succeed
+            self.assertTrue(self.gui._ft8_qso_logged,
+                            "_ft8_qso_logged must be True after a successful write")
+
+        self.assertTrue(os.path.exists(self.adif_path), "ADIF file must exist after retry")
+        with open(self.adif_path, encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertEqual(content.count("<EOR>"), 1,
+                         "Exactly one record must be written even after a retry")
+
+    def test_log_ft8_qso_grids_included_from_record(self):
+        """
+        Grids stored on the QsoRecord (my_grid, dx_grid) must appear in the
+        written ADIF output even when no explicit override kwargs are passed.
+        """
+        # Use Station B flow which captures DX grid from CQ message
+        op  = OperatorConfig(callsign="W4ABC", grid="EN52")
+        mgr = Ft8QsoManager(operator=op, slot_timer=_make_timer())
+        mgr.start_from_received("CQ K9XYZ FN20", snr_db=-5)   # _dx_grid = "FN20"
+        mgr.advance("W4ABC K9XYZ R-05")
+        mgr.advance("W4ABC K9XYZ 73")   # → COMPLETE
+
+        self.gui._qso_mgr           = mgr
+        self.gui._qso_assist_active = True
+        self.gui._log_ft8_qso()
+
+        self.assertTrue(os.path.exists(self.adif_path))
+        with open(self.adif_path, encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("FN20", content, "DX grid FN20 must appear in ADIF output")
+        self.assertIn("EN52", content, "Our grid EN52 must appear in ADIF output")
 
 
 if __name__ == "__main__":
