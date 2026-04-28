@@ -35,6 +35,10 @@ import numpy as np
 from ft8_encode import validate_callsign, ft8_encode_to_symbols
 from ft8_ntp import Ft8SlotTimer, default_slot_timer
 
+# Maidenhead grid locator pattern: two letters (A-R) followed by two digits.
+# Used to validate the extra field of CQ messages (e.g. ``CQ W4ABC EN52``).
+_GRID_PATTERN = re.compile(r"^[A-R]{2}[0-9]{2}$")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 1  QSO lifecycle states
@@ -58,15 +62,13 @@ class QsoState(Enum):
 @dataclass(frozen=True)
 class QsoRecord:
     """
-    Immutable snapshot of a completed FT8 QSO for contact logging.
+    Immutable snapshot of a completed QSO for contact logging (Milestone 5).
 
-    Populated by ``Ft8QsoManager.build_record()`` after the exchange
-    reaches ``QsoState.COMPLETE``.  Intended for ADIF logging in
-    Milestone 5; stored here so the state machine and logging layer
-    share a common data contract.
-
-    The dataclass is ``frozen=True`` so instances are truly immutable
-    once created — safe to cache, hash, or pass across thread boundaries.
+    Populated by ``Ft8QsoManager.build_record()`` after the exchange reaches
+    ``QsoState.COMPLETE``, or constructed directly for voice-mode contacts.
+    Intended for ADIF logging.  The dataclass is ``frozen=True`` so instances
+    are truly immutable once created — safe to cache, hash, or pass across
+    thread boundaries.
 
     Attributes
     ----------
@@ -74,13 +76,15 @@ class QsoRecord:
     dx_call     : str              — DX station callsign (e.g. 'K9XYZ')
     freq_mhz    : float            — Operating frequency in MHz (0.0 if unknown)
     band        : str              — Band label (e.g. '20m') or '' if not resolved
-    mode        : str              — Always 'FT8' for this module
-    time_on     : datetime         — UTC start time (captured when the QSO session
-                                    began, i.e. when start_cq() / start_from_received()
-                                    was called)
-    rst_sent    : str              — RST/signal report sent (e.g. '+00', '-07')
-    rst_rcvd    : str              — RST/signal report received (e.g. '-05')
-    initiated   : str              — 'CQ' if we called CQ, 'REPLY' if we answered one
+    mode        : str              — Operating mode, e.g. 'FT8' or 'SSB'
+    time_on     : datetime         — UTC start time
+    rst_sent    : str              — RST/signal report sent (e.g. '+00', '-07', '59')
+    rst_rcvd    : str              — RST/signal report received (e.g. '-05', '59')
+    initiated   : str              — 'CQ' if we called CQ, 'REPLY' if we answered
+    dx_grid     : str              — DX station Maidenhead grid (may be empty)
+    my_grid     : str              — Our Maidenhead grid locator (may be empty)
+    tx_pwr_w    : float            — TX power in watts (0.0 if unknown)
+    comment     : str              — Optional free-form comment
     """
     our_call:  str
     dx_call:   str
@@ -90,7 +94,11 @@ class QsoRecord:
     time_on:   datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     rst_sent:  str   = "+00"
     rst_rcvd:  str   = "+00"
-    initiated: str   = "CQ"  # 'CQ' or 'REPLY'
+    initiated: str   = "CQ"      # 'CQ' or 'REPLY'
+    dx_grid:   str   = ""        # DX station's Maidenhead grid (from CQ message)
+    my_grid:   str   = ""        # Our Maidenhead grid
+    tx_pwr_w:  float = 0.0       # TX power in watts
+    comment:   str   = ""        # Optional comment
 
     def adif_date(self) -> str:
         """Return the QSO date formatted for ADIF: YYYYMMDD."""
@@ -360,8 +368,14 @@ class Ft8QsoManager:
         self.state: QsoState = QsoState.IDLE
         self._queued_tx: Optional[str] = None
         self._dx_call:   Optional[str] = None
-        # SNR reported to us by the DX station (used if we want to echo it)
+        # SNR reported to us by the DX station (e.g. their measurement of our
+        # signal, included in their reply/exchange message).
         self._rx_snr:    Optional[int] = None
+        # SNR we reported to the DX station in our most recent exchange message
+        # (our measurement of their signal).  Used as rst_sent in build_record().
+        self._tx_snr:    Optional[int] = None
+        # Maidenhead grid extracted from the DX station's CQ message, if present.
+        self._dx_grid:   Optional[str] = None
         # UTC timestamp captured when the QSO session starts (start_cq /
         # start_from_received).  Used as QSO time_on in build_record() so the
         # logged start time matches when the exchange actually began rather
@@ -443,7 +457,10 @@ class Ft8QsoManager:
             self._dx_call     = rx.call2
             self._rx_snr      = rx.snr_db
             self._time_on_utc = datetime.now(timezone.utc)
+            # Capture their grid from the CQ message (extra field), if present
+            self._dx_grid = rx.extra if (rx.extra and _GRID_PATTERN.match(rx.extra)) else None
             msg = compose_reply(rx.call2, self.operator.callsign, snr_db)
+            self._tx_snr = snr_db  # SNR we reported in our reply
             self._set_tx(msg)
             self.state = QsoState.REPLY_SENT
             return msg
@@ -483,6 +500,7 @@ class Ft8QsoManager:
                 self._dx_call = rx.call2
                 self._rx_snr  = rx.snr_db
                 msg = compose_exchange(rx.call2, self.operator.callsign, snr_db)
+                self._tx_snr  = snr_db  # SNR we reported to the DX station
                 self._set_tx(msg)
                 self.state = QsoState.EXCHANGE_SENT
 
@@ -547,6 +565,8 @@ class Ft8QsoManager:
         self._queued_tx    = None
         self._dx_call      = None
         self._rx_snr       = None
+        self._tx_snr       = None
+        self._dx_grid      = None
         self._time_on_utc  = None
 
     def reset(self) -> None:
@@ -555,6 +575,8 @@ class Ft8QsoManager:
         self._queued_tx    = None
         self._dx_call      = None
         self._rx_snr       = None
+        self._tx_snr       = None
+        self._dx_grid      = None
         self._time_on_utc  = None
 
     @property
@@ -569,14 +591,25 @@ class Ft8QsoManager:
         """Callsign of the DX station we are working, or None."""
         return self._dx_call
 
+    @property
+    def dx_grid(self) -> Optional[str]:
+        """
+        Maidenhead grid of the DX station, or ``None`` if not yet known.
+
+        Populated from the ``extra`` field of a received CQ message when the
+        DX station includes their grid (standard FT8 CQ format: ``CQ CALL GRID``).
+        """
+        return self._dx_grid
+
     def build_record(
         self,
         *,
         freq_mhz: float = 0.0,
         band: str = "",
-        snr_sent: int = 0,
+        snr_sent: Optional[int] = None,
         initiated: str = "CQ",
-    ) -> QsoRecord:
+        my_grid: str = "",
+    ) -> "QsoRecord":
         """
         Build a :class:`QsoRecord` snapshot from the current QSO state.
 
@@ -585,10 +618,13 @@ class Ft8QsoManager:
 
         Parameters
         ----------
-        freq_mhz : float  — Operating frequency in MHz (pass from radio poll).
-        band     : str    — Band label (e.g. '20m'); caller resolves from freq.
-        snr_sent : int    — Signal report we sent to the DX station (dB).
-        initiated: str    — 'CQ' if we called CQ, 'REPLY' if we answered one.
+        freq_mhz : float        — Operating frequency in MHz (pass from radio poll).
+        band     : str          — Band label (e.g. '20m'); caller resolves from freq.
+        snr_sent : int | None   — Signal report we sent to the DX station (dB).
+                                  When *None* (default), the value tracked internally
+                                  by the state machine (``_tx_snr``) is used.
+        initiated: str          — ``'CQ'`` if we called CQ, ``'REPLY'`` if we answered.
+        my_grid  : str          — Our Maidenhead grid locator (MY_GRIDSQUARE).
         """
         if self.state not in (QsoState.COMPLETE,):
             raise RuntimeError(
@@ -598,7 +634,10 @@ class Ft8QsoManager:
         if not self._dx_call:
             raise RuntimeError("No DX callsign recorded; cannot build a contact record.")
         rst_rcvd = f"{self._rx_snr:+03d}" if self._rx_snr is not None else "+00"
-        rst_sent = f"{snr_sent:+03d}"
+        # Use caller-supplied snr_sent if provided; fall back to the value the
+        # state machine tracked from compose_exchange / compose_reply.
+        effective_sent = snr_sent if snr_sent is not None else (self._tx_snr or 0)
+        rst_sent = f"{effective_sent:+03d}"
         # Use the timestamp captured when the session started (start_cq /
         # start_from_received), falling back to now() only as a safety net.
         time_on = self._time_on_utc if self._time_on_utc is not None else datetime.now(timezone.utc)
@@ -611,6 +650,8 @@ class Ft8QsoManager:
             rst_sent  = rst_sent,
             rst_rcvd  = rst_rcvd,
             initiated = initiated,
+            dx_grid   = self._dx_grid or "",
+            my_grid   = my_grid,
         )
 
     # ── Timeslot helpers ──────────────────────────────────────────────────
